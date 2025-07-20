@@ -8,10 +8,10 @@ from torch.nn.functional import normalize, scaled_dot_product_attention, silu
 from typing import Optional, Tuple
 
 class TransformerBlock(Module):
-    def __init__(self, dim: int, dim_heads: int = 64, **kwargs):
+    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: int = 1, **kwargs):
         super().__init__()
-        self.att_norm = ConditionalLayerNorm(dim)
-        self.ffn_norm = ConditionalLayerNorm(dim)
+        self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
+        self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.att = Attention(dim, dim_heads)
         self.ffn = GatedFFN(dim)
 
@@ -30,13 +30,14 @@ class TransformerBlock(Module):
         return q
 
 class ConditionalLayerNorm(Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, dim_ctx: int):
         super().__init__()
-        self.to_out = Linear(dim, dim * 2, bias=True)
+        self.dim_ctx = dim_ctx
+        self.to_out = Linear(dim_ctx, dim * 2, bias=True)
 
     def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
         if ctx is None: # default to zero means using learned bias only
-            ctx = x.new_zeros(x.size(-1))
+            ctx = x.new_zeros(self.dim_ctx)
         scale, shift = self.to_out(ctx).chunk(2, dim = -1)
         x = (1. + scale) * normalize(x, dim=-1) + shift
         return x
@@ -74,16 +75,16 @@ class Attention(Module):
         return out
 
 class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: int = 1):
         """
         dim: block dimension
         num_blocks: number of latent transformer blocks
         dim_heads: dimension of heads in attention
         """
         super().__init__()
-        self.read = TransformerBlock(dim, dim_heads=dim_heads)
-        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads)
+        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
+        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
+        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
 
     def forward(self, data: Tensor, latent: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """
