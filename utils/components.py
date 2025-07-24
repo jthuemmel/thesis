@@ -86,15 +86,15 @@ class Interface(Module):
         self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
         self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
 
-    def forward(self, data: Tensor, latent: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, z: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """
-        data: tensor of shape (B, *, N, D)
-        latent: tensor of shape (B, *, M, D)
+        x: tensor of shape (B, *, N, D)
+        z: tensor of shape (B, *, M, D)
         ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (data, latent) 
+        returns tuple of (x, z) 
         """
-        latent = self.read(q = latent, kv = data, ctx = ctx)
+        z = self.read(q = z, kv = x, ctx = ctx)
         for block in self.compute:
-            latent = block(latent, ctx = ctx)
-        data = self.write(q = data, kv = latent, ctx = ctx)
-        return data, latent
+            z = block(z, ctx = ctx)
+        x = self.write(q = x, kv = z, ctx = ctx)
+        return x, z
