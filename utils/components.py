@@ -33,12 +33,12 @@ class ConditionalLayerNorm(Module):
     def __init__(self, dim: int, dim_ctx: int):
         super().__init__()
         self.dim_ctx = dim_ctx
-        self.to_out = Linear(dim_ctx, dim * 2, bias=True)
+        self.linear = Linear(dim_ctx, dim * 2, bias=True)
 
     def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
         if ctx is None: # default to zero means using learned bias only
             ctx = x.new_zeros(self.dim_ctx)
-        scale, shift = self.to_out(ctx).chunk(2, dim = -1)
+        scale, shift = self.linear(ctx).chunk(2, dim = -1)
         x = (1. + scale) * normalize(x, dim=-1) + shift
         return x
     
