@@ -74,27 +74,3 @@ class Attention(Module):
         out = self.to_out(out)
         return out
 
-class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: int = 1):
-        """
-        dim: block dimension
-        num_blocks: number of latent transformer blocks
-        dim_heads: dimension of heads in attention
-        """
-        super().__init__()
-        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-
-    def forward(self, x: Tensor, z: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """
-        x: tensor of shape (B, *, N, D)
-        z: tensor of shape (B, *, M, D)
-        ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (x, z) 
-        """
-        z = self.read(q = z, kv = x, ctx = ctx)
-        for block in self.compute:
-            z = block(z, ctx = ctx)
-        x = self.write(q = x, kv = z, ctx = ctx)
-        return x, z
