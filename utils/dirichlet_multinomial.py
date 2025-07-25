@@ -48,17 +48,4 @@ class DirichletMultinomial:
             tgt = torch.multinomial(tgt_prior, num_samples=R_tgt, replacement=False, generator=self.generator)
         return src, tgt
     
-    @staticmethod
-    def apply_masking(x: torch.Tensor, mask: torch.LongTensor):
-        """
-        Gather the input tensor x using the provided mask.
-        Args:
-            x: Input tensor of shape (B, N, D)
-            mask: Mask tensor of shape (B, M)
-        Returns:
-            masked: Masked tensor of shape (B, M, D)
-        """
-        expanded_mask = repeat(mask, 'b n -> b n d', d = x.size(-1))
-        masked = x.gather(1, expanded_mask)
-        return masked
         

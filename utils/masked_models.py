@@ -12,7 +12,7 @@ ARCHITECTURES = {
 }
 
 ####
-class MAE(torch.nn.Module):
+class MAE(Module):
     def __init__(self, encoder_cfg: dataclass, decoder_cfg: dataclass):
         super().__init__()
         self.queries = Embedding(1, decoder_cfg.dim)

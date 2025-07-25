@@ -2,7 +2,7 @@ from torch.nn import Embedding, Linear, Module, ModuleList
 from torch import cat, split, Tensor, LongTensor, einsum
 from dataclasses import dataclass
 from einops import repeat, rearrange
-from utils.components import TransformerBlock, ConditionalLayerNorm, GatedFFN
+from utils.components import TransformerBlock, ConditionalLayerNorm, GatedFFN, Interface
 from typing import Tuple, Optional
 
 class ViT(Module):
@@ -20,10 +20,10 @@ class ViT(Module):
         super().__init__()
         self.positions = Embedding(cfg.num_tokens, cfg.dim)
         self.cls_token = Embedding(cfg.num_cls, cfg.dim)
-        self.norm_in = ConditionalLayerNorm(cfg.dim, cfg.dim_ctx)
+        self.norm_in = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
         self.proj_in = Linear(cfg.dim_in, cfg.dim)
         self.proj_out = Linear(cfg.dim, cfg.dim_out)
-        self.blocks = ModuleList([TransformerBlock(cfg.dim, dim_ctx=cfg.dim_ctx) for _ in range(cfg.num_layers)])
+        self.blocks = ModuleList([TransformerBlock(cfg.dim, dim_ctx=cfg.dim_noise) for _ in range(cfg.num_layers)])
 
     def forward(self, x: Tensor, pos: LongTensor, ctx: Optional[Tensor] = None) -> Tensor:
         """
@@ -44,31 +44,6 @@ class ViT(Module):
         cls, x = split(x, [cls.size(1), N], dim = 1)
         x = self.proj_out(x)
         return x
-    
-class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: int = 1):
-        """
-        dim: block dimension
-        num_blocks: number of latent transformer blocks
-        dim_heads: dimension of heads in attention
-        """
-        super().__init__()
-        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-
-    def forward(self, x: Tensor, z: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """
-        x: tensor of shape (B, *, N, D)
-        z: tensor of shape (B, *, M, D)
-        ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (x, z) 
-        """
-        z = self.read(q = z, kv = x, ctx = ctx)
-        for block in self.compute:
-            z = block(z, ctx = ctx)
-        x = self.write(q = x, kv = z, ctx = ctx)
-        return x, z
 
 class InterfaceNetwork(Module):
     def __init__(self, cfg: dataclass):
@@ -83,7 +58,7 @@ class InterfaceNetwork(Module):
 
         # Interfaces
         self.network = ModuleList([
-            Interface(cfg.dim, cfg.num_compute_blocks, dim_ctx= cfg.dim_ctx, dim_heads= cfg.dim_heads) for _ in range(cfg.num_layers)
+            Interface(cfg.dim, cfg.num_compute_blocks, dim_ctx= cfg.dim_noise, dim_heads= cfg.dim_heads) for _ in range(cfg.num_layers)
         ])
 
     def forward(self, x: Tensor, pos: LongTensor, ctx: Optional[Tensor] = None):  
@@ -104,8 +79,8 @@ class ModalEncoder(Module):
         self.in_projection = Embedding(cfg.num_features, cfg.dim * cfg.dim_in)
         self.feature_bias = Embedding(cfg.num_features, cfg.dim)
         self.queries = Embedding(1, cfg.dim)       
-        self.kv_norm = ConditionalLayerNorm(cfg.dim, cfg.dim_ctx)
-        self.cross_attn = TransformerBlock(cfg.dim, dim_ctx=cfg.dim_ctx)
+        self.kv_norm = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
+        self.cross_attn = TransformerBlock(cfg.dim, dim_ctx=cfg.dim_noise)
 
     def forward(self, x: Tensor, idx: LongTensor, ctx: Optional[Tensor] = None):
         # ensure correct shapes
@@ -117,10 +92,11 @@ class ModalEncoder(Module):
         b = rearrange(b, "... f d -> ... () f d")
         # linear projection
         kv = einsum('b n f i, ... f d i -> b n f d', x, w)
+        # expand query and context vectors
+        q = repeat(self.queries.weight, 'q d -> b n q d', b = B, n = N)
+        ctx = rearrange(ctx, 'b 1 d -> b 1 1 d') if ctx is not None else None
         # normalize and add feature-bias
         kv = self.kv_norm(kv, ctx) + b
-        # expand query vectors
-        q = repeat(self.queries.weight, 'q d -> b n q d', b = B, n = N)
         # cross attend
         q = self.cross_attn(q = q, kv = kv, ctx = ctx).squeeze(2)
         return q
@@ -128,7 +104,7 @@ class ModalEncoder(Module):
 class ModalDecoder(Module):
     def __init__(self, cfg: dataclass):
         super().__init__()
-        self.norm = ConditionalLayerNorm(cfg.dim, cfg.dim_ctx)
+        self.norm = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
         self.ffn = GatedFFN(cfg.dim)
         self.out_projection = Embedding(cfg.num_features, cfg.dim * cfg.dim_out)
 

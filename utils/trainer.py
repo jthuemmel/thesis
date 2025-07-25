@@ -228,7 +228,8 @@ class DistributedTrainer(TrainerInterface):
 
     def setup_model(self):
         model = self.create_model().to(self.device)
-        self.model = DistributedDataParallel(model, 
+        compiled = torch.compile(model, dynamic = True, disable = not self.cfg.use_compile)
+        self.model = DistributedDataParallel(compiled, 
                                              device_ids=[self.local_rank], 
                                              output_device=self.local_rank, 
                                              find_unused_parameters=hasattr(model, 'stage') # need to set this for multi-stage models
