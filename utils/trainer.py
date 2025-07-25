@@ -206,7 +206,7 @@ class DistributedTrainer(TrainerInterface):
     def setup_wandb(self):
         if not self.cfg.use_wandb:
             return
-        
+        login = wandb.login()
         wandb_set_startup_timeout(600)
         wandb.init(
             project=self.cfg.wb_project,
@@ -486,8 +486,8 @@ class DistributedTrainer(TrainerInterface):
         torch.save(self.state_dict(), self.ckpt_path)
         if self.is_best_epoch():
             torch.save(self.state_dict(), self.best_path)
-            if exists(wandb.run):
-                wandb.save(str(self.best_path), policy='now', base_path=str(self.model_dir))
+            #if exists(wandb.run):
+            #    wandb.save(str(self.best_path), policy='now', base_path=str(self.model_dir))
 
         self.train_metrics.scalars_to_csv(self.model_dir / 'train_metrics.csv')
         self.val_metrics.scalars_to_csv(self.model_dir / 'val_metrics.csv')

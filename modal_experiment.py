@@ -115,14 +115,12 @@ class MTMTrainer(DistributedTrainer):
     @property
     def land_sea_mask(self):
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
-        B, T, V = self.batch_size, self.data_cfg.sequence_length // self.world_cfg.patch_size["tt"], len(self.data_cfg.variables)
+        B, V, T, _ = self.get_flatland_shape()
         return repeat(lsm, "1 (h hh) (w ww) -> b (t h w) v (tt hh ww)", b = B, t = T, v = V, **self.world_cfg.patch_size)
 
     @property
     def per_variable_weights(self):
-        if not hasattr(self.data_cfg, "weights") or not exists(self.data_cfg.weights):
-            return 1.
-        w = self.data_cfg.weights
+        w = self.data_cfg.weights if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
         w = torch.tensor(w, device = self.device)
         return w
 
@@ -137,6 +135,7 @@ class MTMTrainer(DistributedTrainer):
 
     def create_model(self):
         model = ModalTailMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)       
+        #model = ModalFuncMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)  
         self.misc_metrics.log_python_object("num_params", sum(p.numel() for p in model.parameters()))
         return model
     
@@ -294,7 +293,7 @@ class MTMTrainer(DistributedTrainer):
         B, V, _, _ = self.get_flatland_shape()
         src_var = torch.multinomial(torch.ones((B, V), device = self.device), 
                                     F_src, generator = self.generator, replacement = False)
-        tgt_var =  torch.multinomial(torch.ones((B, V) * w, device = self.device), 
+        tgt_var =  torch.multinomial(w * torch.ones((B, V), device = self.device), 
                                     F_tgt, generator = self.generator, replacement = False)
         return src_var, tgt_var
     
@@ -326,20 +325,17 @@ class MTMTrainer(DistributedTrainer):
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask, src_var, tgt_var):
-        D = tokens.size(-1) 
+        _, N, _, D = tokens.size()
         # feature masks
-        expanded_src_var = repeat(src_var, "b f -> b n f d", n = src_mask.size(-1), d = D)
-        expanded_tgt_var = repeat(tgt_var, "b f -> b n f d", n = tgt_mask.size(-1), d = D)
-        src = tokens.gather(2, expanded_src_var)
-        tgt = tokens.gather(2, expanded_tgt_var)
-        lsm = self.land_sea_mask.gather(2, expanded_tgt_var)
-        
+        expanded_src_var = repeat(src_var, "b f -> b n f d", n = N, d = D)
+        expanded_tgt_var = repeat(tgt_var, "b f -> b n f d", n = N, d = D)
         # grid masks
         expanded_src_mask = repeat(src_mask, 'b n -> b n f d', d = D, f = src_var.size(-1))
         expanded_tgt_mask = repeat(tgt_mask, 'b n -> b n f d', d = D, f = tgt_var.size(-1))
-        src = src.gather(1, expanded_src_mask)
-        tgt = tgt.gather(1, expanded_tgt_mask)
-        lsm = lsm.gather(1, expanded_tgt_mask)
+        # apply
+        src = tokens.gather(2, expanded_src_var).gather(1, expanded_src_mask)
+        tgt = tokens.gather(2, expanded_tgt_var).gather(1, expanded_tgt_mask)
+        lsm = self.land_sea_mask.gather(2, expanded_tgt_var).gather(1, expanded_tgt_mask)
         return src, tgt, lsm
 
     ### Functional noise
@@ -373,7 +369,7 @@ class MTMTrainer(DistributedTrainer):
         
         # masking
         src_mask, tgt_mask = self.sample_masks() if task == "train" else self.forecast_mask()
-        src_var, tgt_var = self.sample_vars() if task == "train" else self.forecast_vars()
+        src_var, tgt_var = self.sample_vars() if task == "train" else self.forecast_vars()        
         src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask, src_var, tgt_var)
 
         # forward
