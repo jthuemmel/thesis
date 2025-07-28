@@ -1,7 +1,7 @@
 from torch.nn import Embedding, Linear, Module, ModuleList
 from torch import cat, split, Tensor, LongTensor, einsum
 from dataclasses import dataclass
-from einops import repeat, rearrange
+from einops import repeat, rearrange, reduce
 from utils.components import TransformerBlock, ConditionalLayerNorm, GatedFFN, Interface
 from typing import Tuple, Optional
 
@@ -78,40 +78,45 @@ class ModalEncoder(Module):
         super().__init__()
         self.in_projection = Embedding(cfg.num_features, cfg.dim * cfg.dim_in)
         self.feature_bias = Embedding(cfg.num_features, cfg.dim)
-        self.queries = Embedding(1, cfg.dim)       
-        self.kv_norm = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
-        self.cross_attn = TransformerBlock(cfg.dim, dim_ctx=cfg.dim_noise)
+        #self.queries = Embedding(1, cfg.dim)       
+        #self.kv_norm = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
+        #self.cross_attn = TransformerBlock(cfg.dim, dim_ctx=cfg.dim_noise)
 
     def forward(self, x: Tensor, idx: LongTensor, ctx: Optional[Tensor] = None):
         # ensure correct shapes
         B, N, _, I = x.size()
         # get dynamic weights 
         w = self.in_projection(idx)
-        w = rearrange(w, '... f (d i) -> ... f d i', i = I)
+        w = rearrange(w, 'b f (d i) -> b f d i', i = I)
         b = self.feature_bias(idx)
-        b = rearrange(b, "... f d -> ... () f d")
+        b = rearrange(b, "b f d -> b () f d")
         # linear projection
-        kv = einsum('b n f i, ... f d i -> b n f d', x, w)
+        kv = einsum('b n f i, b f d i -> b n f d', x, w) + b
+        q = reduce(kv, 'b n f d -> b n d', "sum")
         # expand query and context vectors
-        q = repeat(self.queries.weight, 'q d -> b n q d', b = B, n = N)
-        ctx = rearrange(ctx, 'b 1 d -> b 1 1 d') if ctx is not None else None
+        #q = repeat(self.queries.weight, 'q d -> b n q d', b = B, n = N)
+        #ctx = rearrange(ctx, 'b 1 d -> b 1 1 d') if ctx is not None else None
         # normalize and add feature-bias
-        kv = self.kv_norm(kv, ctx) + b
+        #kv = self.kv_norm(kv, ctx) + b
         # cross attend
-        q = self.cross_attn(q = q, kv = kv, ctx = ctx).squeeze(2)
+        #q = self.cross_attn(q = q, kv = kv, ctx = ctx).squeeze(2)
         return q
     
 class ModalDecoder(Module):
     def __init__(self, cfg: dataclass):
         super().__init__()
-        self.norm = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
-        self.ffn = GatedFFN(cfg.dim)
+        #self.norm = ConditionalLayerNorm(cfg.dim, cfg.dim_noise)
+        #self.ffn = GatedFFN(cfg.dim)
+        self.feature_bias = Embedding(cfg.num_features, cfg.dim)
         self.out_projection = Embedding(cfg.num_features, cfg.dim * cfg.dim_out)
 
     def forward(self, x: Tensor, idx: LongTensor, ctx: Optional[Tensor] = None):
         _, _, D = x.size()
-        x = self.ffn(self.norm(x, ctx))
+        #x = self.ffn(self.norm(x, ctx))
         w = self.out_projection(idx)
-        w = rearrange(w, "... f (d o) -> ... f d o", d = D)
-        out = einsum("b n d, ... f d o -> b n f o", x, w)
+        w = rearrange(w, "b f (d o) -> b f d o", d = D)
+        x = rearrange(x, 'b n d -> b n 1 d')
+        b = self.feature_bias(idx)
+        b = rearrange(b, 'b f d -> b 1 f d')
+        out = einsum("b n f d, b f d o -> b n f o", x + b, w)
         return out

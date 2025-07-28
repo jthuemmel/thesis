@@ -14,7 +14,7 @@ class ModalMTM(Module):
         self.processor = MTM(mtm_cfg)
         # Init
         self.apply(self.base_init)
-        self.apply(self.zero_init)
+        #self.apply(self.zero_init)
 
     @staticmethod
     def base_init(m):
@@ -46,13 +46,14 @@ class ModalMTM(Module):
                 pos_tgt: torch.LongTensor, 
                 var_src: torch.LongTensor, 
                 var_tgt: torch.LongTensor,
+                noise: torch.Tensor = None,
                 ):
         #encoder
-        src = self.encoder(src, var_src, ctx = None)
+        src = self.encoder(src, var_src)
         # masked token model
         src, tgt = self.processor(src, pos_src, pos_tgt, ctx = None)
         # decoder
-        tgt = self.decoder(tgt, var_tgt, ctx = None)
+        tgt = self.decoder(tgt, var_tgt)
         return tgt
     
 class ModalTailMTM(ModalMTM):
@@ -98,16 +99,16 @@ class ModalFuncMTM(ModalMTM):
                 noise: torch.Tensor
                 ):
         # noise perturbation
-        K = noise.size(0) // src.size(0) if noise is not None else 1
-        args = src, pos_src, pos_tgt, var_src, var_tgt
-        args, ctx = self.apply_noise(*args, ctx = noise)
-        src, pos_src, pos_tgt, var_src, var_tgt = args
+        K = noise.size(0) // src.size(0) if noise is not None else 1        
         #encoder
-        src = self.encoder(src, var_src, ctx = ctx)
+        src = self.encoder(src, var_src)
         # masked token model
-        src, tgt = self.processor(src, pos_src, pos_tgt, ctx = ctx)
+        args = src, pos_src, pos_tgt, var_tgt
+        args, ctx = self.apply_noise(*args, ctx = noise)
+        src, pos_src, pos_tgt, var_tgt = args
+        _, tgt = self.processor(src, pos_src, pos_tgt, ctx = ctx)
         # decoder
-        tgt = self.decoder(tgt, var_tgt, ctx = ctx)
+        tgt = self.decoder(tgt, var_tgt)
         #split ensemble dim
         tgt = rearrange(tgt, "(b k) ... -> b ... k", k = K)
         return tgt

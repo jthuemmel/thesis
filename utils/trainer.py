@@ -433,10 +433,17 @@ class DistributedTrainer(TrainerInterface):
         self.misc_metrics = MetricSaver(state_dict['misc_metrics'])
         self.model.load_state_dict(state_dict['model_state'])
         self.optimizer.load_state_dict(state_dict['optimizer_state'])
-        self.generator.set_state(state_dict['generator_state'])
+
+        gen_state = state_dict['generator_state']
+        if not isinstance(gen_state, torch.ByteTensor):
+            gen_state = torch.tensor(gen_state, dtype=torch.uint8)
+
+        self.generator.set_state(gen_state)
+
         if exists(self.scheduler):
             self.scheduler.load_state_dict(state_dict['scheduler_state'])
         self.grad_scaler.load_state_dict(state_dict['scaler_state'])
+
         if hasattr(self, 'ema_model'):
             self.ema_model.load_state_dict(state_dict['ema_model_state'])
 

@@ -120,7 +120,8 @@ class MTMTrainer(DistributedTrainer):
 
     @property
     def per_variable_weights(self):
-        w = self.data_cfg.weights if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
+        _, V, _, _ = self.get_flatland_shape()
+        w = self.data_cfg.weights[:V] if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
         w = torch.tensor(w, device = self.device)
         return w
 
@@ -134,9 +135,12 @@ class MTMTrainer(DistributedTrainer):
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
 
     def create_model(self):
-        model = ModalTailMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)       
-        #model = ModalFuncMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)  
-        self.misc_metrics.log_python_object("num_params", sum(p.numel() for p in model.parameters()))
+        #model = ModalTailMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)       
+        model = ModalFuncMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)  
+        #model = ModalMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)
+        count = count_parameters(model)
+        print(f'Created model with {count:,} parameters')
+        self.misc_metrics.log_python_object("num_params", count)
         return model
     
     def create_loss(self):
@@ -344,7 +348,9 @@ class MTMTrainer(DistributedTrainer):
         K = self.world_cfg.num_ens
         D = self.model_cfg.mtm.dim_noise
         if K > 1:
-            return torch.randn((B * K, 1, D), device = self.device, generator = self.generator)
+            noise = torch.randn((B * K, 1, D), device = self.device, generator = self.generator)
+            #noise = repeat(noise, 'k 1 d -> (b k) 1 d', b = B)
+            return noise
         else:
             return None
         
@@ -371,11 +377,12 @@ class MTMTrainer(DistributedTrainer):
         src_mask, tgt_mask = self.sample_masks() if task == "train" else self.forecast_mask()
         src_var, tgt_var = self.sample_vars() if task == "train" else self.forecast_vars()        
         src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask, src_var, tgt_var)
+        noise = self.sample_noise()
 
         # forward
         with sdpa_kernel(self.backend):
-            noise = self.sample_noise()
             tgt_pred = self.model(src, src_mask, tgt_mask, src_var, tgt_var, noise)
+            tgt_pred = rearrange(tgt_pred, '...(c k) e -> ... c (e k)', c = tokens.size(-1))
             
         # compute loss
         loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
