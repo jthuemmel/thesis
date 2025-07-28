@@ -161,8 +161,7 @@ class MTMTrainer(DistributedTrainer):
 
     def create_scheduler(self, optimizer):
         return None
-    
-    
+     
     # METRICS
     @staticmethod
     def compute_acc(pred, obs):
@@ -343,8 +342,8 @@ class MTMTrainer(DistributedTrainer):
         K = self.world_cfg.num_ens
         D = self.model_cfg.decoder.dim_noise
         if K > 1:
-            noise = torch.randn((B * K, 1, 1, D), device = self.device, generator = self.generator)
-            #noise = repeat(noise, 'k 1 d -> (b k) 1 d', b = B)
+            noise = torch.randn((B * K, D), device = self.device, generator = self.generator)
+            noise = repeat(noise, '(b k) d -> (b k) 1 1 d', b = B)
             return noise
         else:
             return None

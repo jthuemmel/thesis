@@ -59,7 +59,6 @@ class ModalTail(Module):
         return out
 
 ####
-
 class ModalMTM(Module):
     def __init__(self, modal_cfg: dataclass, decoder_cfg: dataclass, encoder_cfg: Optional[dataclass] = None):
         super().__init__()

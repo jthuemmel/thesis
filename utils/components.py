@@ -55,7 +55,7 @@ class TransformerBlock(Module):
         return q
 
 class ConditionalLayerNorm(Module):
-    def __init__(self, dim: int, dim_ctx: int):
+    def __init__(self, dim: int, dim_ctx: int = 1):
         super().__init__()
         self.dim_ctx = dim_ctx
         self.linear = Linear(dim_ctx, dim * 2, bias=True)
