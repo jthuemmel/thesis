@@ -99,8 +99,9 @@ class WorldConfig:
 
 @dataclass
 class ModelConfig:
-    mtm: Optional[NetworkConfig] = None
+    decoder: Optional[NetworkConfig] = None
     modal: Optional[NetworkConfig] = None
+    encoder: Optional[NetworkConfig] = None
 
 @dataclass
 class TrainerConfig:
@@ -154,7 +155,8 @@ class MTMConfig:
             trainer=TrainerConfig(**cfg.trainer),
             data=DatasetConfig(**cfg.data),
             model = ModelConfig(
-                mtm = NetworkConfig(**cfg.model.mtm) if exists(cfg.model.mtm) else None,
+                decoder = NetworkConfig(**cfg.model.decoder) if exists(cfg.model.decoder) else None,
+                encoder = NetworkConfig(**cfg.model.encoder) if exists(cfg.model.encoder) else None,
                 modal = NetworkConfig(**cfg.model.modal) if exists(cfg.model.modal) else None
             ),
             optim =OptimConfig(**cfg.optim),
