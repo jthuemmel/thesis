@@ -109,7 +109,6 @@ class MTMTrainer(DistributedTrainer):
             pin_memory=True,
             drop_last=True,
         )
-
         return train_dl, val_dl
 
     @property
@@ -135,9 +134,7 @@ class MTMTrainer(DistributedTrainer):
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
 
     def create_model(self):
-        #model = ModalTailMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)       
-        model = ModalFuncMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)  
-        #model = ModalMTM(modal_cfg=self.model_cfg.modal, mtm_cfg=self.model_cfg.mtm)
+        model = ModalTailMTM(modal_cfg=self.model_cfg.modal, decoder_cfg=self.model_cfg.decoder, encoder_cfg=self.model_cfg.encoder)       
         count = count_parameters(model)
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
@@ -154,19 +151,17 @@ class MTMTrainer(DistributedTrainer):
         return nino_loss
 
     def create_optimizer(self, named_params):
-        return torch.optim.AdamW(
+        return torch.optim.RAdam(
             named_params,
             lr=self.optim_cfg.lr,
             weight_decay=self.optim_cfg.weight_decay,
             betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+            decoupled_weight_decay=True,
         )
 
     def create_scheduler(self, optimizer):
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.optim_cfg.num_epochs,
-            eta_min=self.optim_cfg.eta_min,
-        )
+        return None
+    
     
     # METRICS
     @staticmethod
@@ -346,9 +341,9 @@ class MTMTrainer(DistributedTrainer):
     def sample_noise(self):
         B = self.batch_size
         K = self.world_cfg.num_ens
-        D = self.model_cfg.mtm.dim_noise
+        D = self.model_cfg.decoder.dim_noise
         if K > 1:
-            noise = torch.randn((B * K, 1, D), device = self.device, generator = self.generator)
+            noise = torch.randn((B * K, 1, 1, D), device = self.device, generator = self.generator)
             #noise = repeat(noise, 'k 1 d -> (b k) 1 d', b = B)
             return noise
         else:
