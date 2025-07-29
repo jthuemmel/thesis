@@ -287,7 +287,12 @@ class DistributedTrainer(TrainerInterface):
     
     def create_process_group(self):
         if not dist.is_initialized():
-            dist.init_process_group("nccl", init_method="env://", rank=self.rank, world_size=self.world_size)
+            dist.init_process_group(
+                "nccl", 
+                init_method="env://", 
+                rank=self.rank, 
+                world_size=self.world_size,
+                device_id=self.device.index)
         else:
             raise ValueError("Process group already initialized. Call destroy_process_group() first.")
         if self.is_root: 
@@ -521,3 +526,11 @@ class DistributedTrainer(TrainerInterface):
         print(f"Epoch {self.current_epoch}/{self.cfg.epochs} | Time per epoch [min]: {stats['time_per_epoch[s]'] / 60} ETA [min]: {stats['eta[min]']:.2f}", flush=True)
         print(f"Train Loss: {self.train_metrics.last['loss']:.2e} | Val Loss: {self.val_metrics.last['loss']:.2e}", flush=True)
         print(f"Peak VRAM: {stats['peak_vram[gb]']}GB | ms per batch: {stats['time_per_batch[ms]']}", flush = True)
+
+    def synced_flag(self, prob: float) -> bool:
+        if self.is_root:
+            flag = torch.rand(1, device=self.device, generator=self.generator) < prob
+        else:
+            flag = torch.empty(1, device=self.device, dtype=torch.bool)
+        dist.broadcast(flag, src=0)
+        return flag.item()
