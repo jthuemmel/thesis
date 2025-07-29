@@ -57,6 +57,7 @@ class NetworkConfig:
     dim_out: Optional[int] = None
     dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
+    dim_coords: Optional[int] = 32
     drop_prob: Optional[float] = 0.
     expansion_factor: Optional[int] = 2
     architecture: str = "vit"
@@ -93,7 +94,7 @@ class WorldConfig:
     var_rates_tgt: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
     tau: Optional[int] = None
     num_ens: Optional[int] = None
-    alpha: float = 0.5
+    alpha: float | list = 0.5
     num_tokens: int = 768
     patch_size: dict = field(default_factory=lambda: {"tt": 2, "hh": 4, "ww": 4})
 

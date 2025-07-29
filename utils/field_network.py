@@ -27,16 +27,20 @@ class NeuralWeatherField(Module):
         self.norm_in = ConditionalLayerNorm(cfg.dim)
         self.proj_out = Linear(cfg.dim, cfg.dim_out)
 
+        # Noise conditioning
+        self.proj_noise = Linear(cfg.dim_noise, cfg.dim_noise, bias = True) # bias here introduces a shared ctx for all CLN layers in the network
+        self.noise_dim = cfg.dim_noise
+
         # Interface Network
         self.network = ModuleList([
-            Interface(cfg.dim, cfg.num_compute_blocks, dim_heads= cfg.dim_heads) 
+            Interface(cfg.dim, cfg.num_compute_blocks, dim_heads= cfg.dim_heads, dim_ctx=cfg.dim_noise) 
             for _ in range(cfg.num_layers)
         ])
 
         # Latents
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
-        self.norm_ctx = ConditionalLayerNorm(cfg.dim)
-        self.ffn_ctx = GatedFFN(cfg.dim)
+        self.norm_latents = ConditionalLayerNorm(cfg.dim)
+        self.ffn_latent = GatedFFN(cfg.dim)
 
         # Initialization
         self.apply(self.base_init)
@@ -58,30 +62,34 @@ class NeuralWeatherField(Module):
         if isinstance(m, ConditionalLayerNorm):
             torch.nn.init.zeros_(m.linear.weight)
 
-    def initialize_data(self, src: torch.Tensor, src_coords: torch.Tensor, tgt_coords: torch.Tensor):
-        src = self.proj_in(src)
-        src = self.norm_in(src) + self.coordinates(src_coords)
-        query = self.coordinates(tgt_coords)
-        query = query + self.ffn_query(query)
-        x = torch.cat([src, query], dim = 1)
-        return x
-
-    def initialize_latents(self, ctx: torch.Tensor):
-        z = repeat(self.latents.weight, "z d -> b z d", b = ctx.size(0))
-        ctx = ctx + self.ffn_ctx(ctx.detach())
-        z = z + self.norm_ctx(ctx)
-        return z
-
     def forward(self, 
                 src: torch.Tensor, 
                 src_coords: torch.Tensor, 
                 tgt_coords: torch.Tensor, 
-                ctx: torch.Tensor):
-        x = self.initialize_data(src, src_coords, tgt_coords)
-        z = self.initialize_latents(ctx)
+                latents: Optional[torch.Tensor] = None,
+                noise: Optional[torch.Tensor] = None
+                ):
+        # Encoder
+        src = self.proj_in(src)
+        src = self.norm_in(src) + self.coordinates(src_coords)
+        # Query embedding
+        query = self.coordinates(tgt_coords)
+        query = query + self.ffn_query(query)
+        # Latent with self-conditioning
+        z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
+        latents = latents if latents is not None else torch.zeros_like(z)
+        latents = latents + self.ffn_latent(latents)
+        z = z + self.norm_latents(latents)
+        # Shared noise encoder
+        noise = noise if noise is not None else src.new_zeros(self.noise_dim)
+        noise = self.proj_noise(noise)
+        # Interface network computation
+        x = torch.cat([src, query], dim = 1)
         for block in self.network:
-            x, z = block(x, z)
-        x = self.proj_out(x)
-        return x, z
+            x, z = block(x, z, noise)
+        # Split target and project to out dim
+        _, tgt = x.split([src.size(1), query.size(1)], dim = 1)
+        tgt = self.proj_out(tgt)
+        return tgt, z
 
         
