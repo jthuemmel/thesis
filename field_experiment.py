@@ -145,7 +145,7 @@ class MTMTrainer(DistributedTrainer):
     def create_loss(self):
         def nino_loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
             # pointwise crps -> [B, N, V, D]
-            loss = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
+            loss = f_kernel_crps(observation=obs, ensemble=pred, fair= False)
             # apply land-sea mask -> [B * N * V * D]
             loss = loss[lsm]
             # reduce to scalar
@@ -337,18 +337,17 @@ class MTMTrainer(DistributedTrainer):
         # masking
         src_mask, tgt_mask = self.sample_masks() if task == "train" else self.forecast_mask()
         src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask)
+        
+        # functional noise
         noise = self.sample_noise()
         src, src_mask, tgt_mask = (repeat(var, 'b ... -> (b k) ...', k = self.world_cfg.num_ens) for var in (src, src_mask, tgt_mask))
+        
         # forward
         with sdpa_kernel(self.backend):
-            latent = None
-            tgt_pred, latent = self.model(src, src_mask, tgt_mask, latent, noise)
-
             # with self-conditioning:
-            if self.synced_flag(0.8):
-                latent = latent.detach()
-                tgt_pred, _ = self.model(src, src_mask, tgt_mask, latent, noise)
-        
+            latent = None       
+            tgt_pred, _ = self.model(src, src_mask, tgt_mask, latent, noise)
+
         tgt_pred = rearrange(tgt_pred, '(b e) ... (c k) -> b ... c (e k)', c = tokens.size(-1), b = tokens.size(0))
             
         # compute loss

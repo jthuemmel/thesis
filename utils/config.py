@@ -1,6 +1,6 @@
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Sequence
 from omegaconf import OmegaConf
 from math import prod
 
@@ -69,8 +69,8 @@ class OptimConfig:
     lr: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.99
-    weight_decay: float = 0.01
-    eta_min: float = 1e-5
+    weight_decay: Optional[float] = 0.01
+    eta_min: Optional[float] = 1e-5
 
 @dataclass
 class DatasetConfig:
@@ -90,11 +90,11 @@ class DatasetConfig:
 class WorldConfig:
     mask_rates_src: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
     mask_rates_tgt: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    var_rates_src: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    var_rates_tgt: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
+    var_rates_src: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
+    var_rates_tgt: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
     tau: Optional[int] = None
     num_ens: Optional[int] = None
-    alpha: float | list = 0.5
+    alpha: Sequence = field(default_factory=lambda: [0.5, 1., 1.])
     num_tokens: int = 768
     patch_size: dict = field(default_factory=lambda: {"tt": 2, "hh": 4, "ww": 4})
 

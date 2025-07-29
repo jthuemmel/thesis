@@ -292,7 +292,7 @@ class DistributedTrainer(TrainerInterface):
                 init_method="env://", 
                 rank=self.rank, 
                 world_size=self.world_size,
-                device_id=self.device.index)
+                device_id=self.device)
         else:
             raise ValueError("Process group already initialized. Call destroy_process_group() first.")
         if self.is_root: 

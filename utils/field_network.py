@@ -44,7 +44,7 @@ class NeuralWeatherField(Module):
 
         # Initialization
         self.apply(self.base_init)
-        self.apply(self.zero_init)
+        #self.apply(self.zero_init)
 
     @staticmethod
     def base_init(m):
