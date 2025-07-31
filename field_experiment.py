@@ -48,7 +48,7 @@ class MTMTrainer(DistributedTrainer):
 
     @property
     def model_cfg(self):
-        return self._cfg.model.decoder
+        return self._cfg.model
     
     @property
     def world_cfg(self):
@@ -136,7 +136,7 @@ class MTMTrainer(DistributedTrainer):
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
 
     def create_model(self):
-        model = NeuralWeatherField(self.model_cfg)       
+        model = NeuralWeatherField(decoder_cfg=self.model_cfg.decoder, encoder_cfg=self.model_cfg.encoder)       
         count = count_parameters(model)
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
@@ -153,12 +153,12 @@ class MTMTrainer(DistributedTrainer):
         return nino_loss
 
     def create_optimizer(self, named_params):
-        return torch.optim.RAdam(
+        return torch.optim.AdamW(
             named_params,
             lr=self.optim_cfg.lr,
             weight_decay=self.optim_cfg.weight_decay,
             betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
-            decoupled_weight_decay=True,
+            #decoupled_weight_decay=True,
         )
 
     def create_scheduler(self, optimizer):
@@ -302,12 +302,51 @@ class MTMTrainer(DistributedTrainer):
         tgt = tokens.gather(1, expanded_tgt_mask)
         lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
         return src, tgt, lsm
+    
+    def index_to_coords(self, idx_flat: torch.LongTensor):
+        """
+        Converts a flat index to coordinates in the grid.
+        Args:
+            idx_flat (torch.LongTensor): Flat index tensor of shape (B, N).
+        Returns:
+            torch.Tensor: Coordinates tensor of shape (B, N, C), where C is the number of coordinates.
+        """
+        _, V, T, S = self.get_flatland_shape()
+        # now peel off dims
+        # stride for t
+        tvs = V * S
+        # stride for v
+        vs = S
+        # gridsize for h, w
+        W = self.world_cfg.grid_size["lon"] // self.world_cfg.patch_size["ww"] 
+        H = self.world_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
+
+        # time coordinate
+        t = idx_flat.div(tvs, rounding_mode='floor')              # (B, N)
+        rem  = idx_flat.fmod(tvs)                                 # (B, N)
+
+        # variable coordinate
+        v = rem.div(vs, rounding_mode='floor')                    # (B, N)
+        rem  = rem.fmod(vs)                                       # (B, N)
+
+        # spatial h, w
+        h = rem.div(W, rounding_mode='floor')                     # (B, N)
+        w = rem.fmod(W)                                           # (B, N)
+
+        # stack into (B, N, 4)
+        coords = torch.stack([t, v, h, w], dim=-1)
+
+        # normalize by full sizes T, V, H, W → range [0,1)
+        norm_div = torch.tensor([T, V, H, W], device=coords.device, dtype=coords.dtype)
+        coords = coords / norm_div
+        return coords
+    
 
     ### Functional noise
     def sample_noise(self):
         B = self.batch_size
         K = self.world_cfg.num_ens
-        D = self.model_cfg.dim_noise
+        D = self.model_cfg.decoder.dim_noise
         if K > 1:
             noise = torch.randn((B * K, D), device = self.device, generator = self.generator)
             noise = repeat(noise, '(b k) d -> (b k) 1 d', b = B)
@@ -338,15 +377,13 @@ class MTMTrainer(DistributedTrainer):
         src_mask, tgt_mask = self.sample_masks() if task == "train" else self.forecast_mask()
         src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask)
         
-        # functional noise
-        noise = self.sample_noise()
-        src, src_mask, tgt_mask = (repeat(var, 'b ... -> (b k) ...', k = self.world_cfg.num_ens) for var in (src, src_mask, tgt_mask))
+        # convert flat indices to coordinates
+        src_coords = self.index_to_coords(src_mask)
+        tgt_coords = self.index_to_coords(tgt_mask)
         
         # forward
         with sdpa_kernel(self.backend):
-            # with self-conditioning:
-            latent = None       
-            tgt_pred, _ = self.model(src, src_mask, tgt_mask, latent, noise)
+            tgt_pred, _ = self.model(src, src_coords, tgt_coords)
 
         tgt_pred = rearrange(tgt_pred, '(b e) ... (c k) -> b ... c (e k)', c = tokens.size(-1), b = tokens.size(0))
             

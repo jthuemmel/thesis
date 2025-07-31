@@ -55,7 +55,7 @@ class NetworkConfig:
     num_cls: Optional[int] = None
     dim_in: Optional[int] = None
     dim_out: Optional[int] = None
-    dim_noise: Optional[int] = None
+    dim_noise: Optional[int] = 1
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
     drop_prob: Optional[float] = 0.
@@ -82,6 +82,7 @@ class DatasetConfig:
     lon_slice: Optional[dict] = None
     stats: Optional[dict] = None
     frcst_tasks: Optional[dict] = None
+    grid_size: dict = field(default_factory=lambda: {"lat": 64, "lon": 120})
     return_type: str = "tensor"
     eval_data: str = "picontrol"
     max_dirs: int = 100
