@@ -28,7 +28,7 @@ class NeuralWeatherField(Module):
         self.norm_in = ConditionalLayerNorm(D)
         self.proj_out = Linear(D, O)
 
-        # Interface Network
+        # Interface Networks
         self.decoder = ModuleList([
             Interface(D, decoder_cfg.num_compute_blocks, dim_heads= decoder_cfg.dim_heads, dim_ctx=decoder_cfg.dim_noise) 
             for _ in range(decoder_cfg.num_layers)
@@ -73,15 +73,16 @@ class NeuralWeatherField(Module):
         # Encoder
         src = self.proj_in(src)
         src = self.norm_in(src) + self.src_coords(src_coords)
+
         if self.encoder is not None:
             for block in self.encoder:
                 src, z = block(src, z, None)
-                
+
         # Query embedding
         tgt = self.tgt_coords(tgt_coords)
-
-        # Interface network computation
         x = torch.cat([src, tgt], dim = 1)
+        
+        # Interface network computation
         for block in self.decoder:
             x, z = block(x, z, None)
 

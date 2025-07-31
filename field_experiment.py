@@ -121,8 +121,7 @@ class MTMTrainer(DistributedTrainer):
 
     @property
     def per_variable_weights(self):
-        _, T, V, _ = self.get_flatland_shape()
-        w = self.data_cfg.weights[:V] if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
+        w = self.data_cfg.weights if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
         w = torch.tensor(w, device = self.device)
         return w
 
@@ -235,7 +234,7 @@ class MTMTrainer(DistributedTrainer):
             return slice(None)
 
     def select_field_subset(self, x: torch.Tensor, var_idx: slice | int, time_idx: slice | int):
-        B, T , V, S = self.get_flatland_shape()
+        _, _ , V, S = self.get_flatland_shape()
         # extract time from flatland format and variables from token dimension
         x = rearrange(x, "b (t v s) (tt hh ww) ... -> v (t tt) b s (hh ww) ...", **self.world_cfg.patch_size, s = S, v = V)
         return x[var_idx, time_idx]
@@ -251,7 +250,8 @@ class MTMTrainer(DistributedTrainer):
 
     ### MASKING
     def setup_misc(self):
-        self.masking_prior = HierarchicalDirichletMultinomial(self.world_cfg.alpha, device=self.device, generator=self.generator)
+        #self.masking_prior = HierarchicalDirichletMultinomial(self.world_cfg.alpha, device=self.device, generator=self.generator)
+        self.masking_prior = DirichletMultinomial(self.world_cfg.alpha[0], device=self.device, generator=self.generator)
 
     def sample_masking_rates(self):
         N = self.world_cfg.num_tokens
@@ -288,8 +288,8 @@ class MTMTrainer(DistributedTrainer):
 
     def sample_masks(self):
         M_src, M_tgt = self.sample_masking_rates()
-        shape = self.get_flatland_shape()
-        src_mask, tgt_mask = self.masking_prior(shape, M_src, M_tgt) #(batch, time, var, space) -> (batch, M)
+        B, V, T, S = self.get_flatland_shape()
+        src_mask, tgt_mask = self.masking_prior((B, T, V * S), M_src, M_tgt) #(batch, time, var, space) -> (batch, M)
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
@@ -312,15 +312,15 @@ class MTMTrainer(DistributedTrainer):
             torch.Tensor: Coordinates tensor of shape (B, N, C), where C is the number of coordinates.
         """
         _, V, T, S = self.get_flatland_shape()
-        # now peel off dims
         # stride for t
         tvs = V * S
         # stride for v
         vs = S
         # gridsize for h, w
-        W = self.world_cfg.grid_size["lon"] // self.world_cfg.patch_size["ww"] 
-        H = self.world_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
-
+        W = self.data_cfg.grid_size["lon"] // self.world_cfg.patch_size["ww"] 
+        H = self.data_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
+        
+        # now peel off dims
         # time coordinate
         t = idx_flat.div(tvs, rounding_mode='floor')              # (B, N)
         rem  = idx_flat.fmod(tvs)                                 # (B, N)
