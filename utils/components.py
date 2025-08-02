@@ -1,14 +1,14 @@
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
-from torch import Tensor
-from torch.nn import Linear, Module, ModuleList
+from torch import Tensor, zeros_like
+from torch.nn import Linear, Module, ModuleList, init, LayerNorm
 from torch.nn.functional import normalize, scaled_dot_product_attention, silu
 
 from typing import Optional, Tuple
 
 class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: int = 1):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
         """
         dim: block dimension
         num_blocks: number of latent transformer blocks
@@ -33,7 +33,7 @@ class Interface(Module):
         return x, z
 
 class TransformerBlock(Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: int = 1, **kwargs):
+    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
@@ -54,20 +54,6 @@ class TransformerBlock(Module):
         q = q + self.ffn(self.ffn_norm(q, ctx))
         return q
 
-class ConditionalLayerNorm(Module):
-    def __init__(self, dim: int, dim_ctx: int = 1):
-        super().__init__()
-        self.dim_ctx = dim_ctx
-        self.linear = Linear(dim_ctx, dim * 2, bias=True)
-
-    def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
-        if ctx is None: # default to zero means using learned bias only
-            ctx = x.new_zeros(self.dim_ctx)
-        
-        scale, shift = self.linear(ctx).chunk(2, dim = -1)
-        x = (1. + scale) * normalize(x, dim=-1) + shift
-        return x
-    
 class GatedFFN(Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
@@ -100,3 +86,34 @@ class Attention(Module):
         out = self.to_out(out)
         return out
 
+class ConditionalLayerNorm(Module):
+    def __init__(self, dim: int, dim_ctx: Optional[int] = None):
+        super().__init__()
+        has_ctx = dim_ctx is not None
+        self.norm = LayerNorm(dim, elementwise_affine= not has_ctx)
+        if has_ctx:
+            self.linear = Linear(dim_ctx, dim * 2, bias=True)
+        else:
+            self.linear = None
+
+    def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
+        if self.linear is None: 
+            return self.norm(x)
+        scale, shift = self.linear(ctx).chunk(2, dim = -1)
+        x = (1. + scale) * self.norm(x) + shift
+        return x
+    
+class ConditioningNetwork(Module):
+    '''Self-conditioning network from Jabri et al. 2023'''
+    def __init__(self, dim: int):
+        super().__init__()
+        self.ffn = GatedFFN(dim)
+        self.norm = LayerNorm(dim, elementwise_affine=True)
+
+        # Initialization
+        init.zeros_(self.norm.weight)
+        init.zeros_(self.norm.bias)
+
+    def forward(self, initial: Tensor, previous: Tensor):
+        previous = zeros_like(initial) if previous is None else previous.detach()
+        return self.norm(previous + self.ffn(previous)) + initial

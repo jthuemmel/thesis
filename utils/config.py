@@ -55,7 +55,7 @@ class NetworkConfig:
     num_cls: Optional[int] = None
     dim_in: Optional[int] = None
     dim_out: Optional[int] = None
-    dim_noise: Optional[int] = 1
+    dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
     drop_prob: Optional[float] = 0.
