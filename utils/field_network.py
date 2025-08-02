@@ -1,46 +1,34 @@
 import torch
-from torch.nn import Embedding, Module, ModuleList, Linear, init
+from torch.nn import Embedding, Module, ModuleList, Linear, init, Identity
 from einops import rearrange, repeat, reduce
 from dataclasses import dataclass
 from utils.networks import Interface
 from utils.cpe import ContinuousPositionalEmbedding
 from utils.components import Attention, GatedFFN, ConditionalLayerNorm
-from typing import Optional
 
 class NeuralWeatherField(Module):
-    def __init__(self, decoder_cfg: dataclass, encoder_cfg: Optional[dataclass] = None):
+    def __init__(self, cfg: dataclass):
         super().__init__()
-        D = decoder_cfg.dim
-        L = decoder_cfg.num_latents
-        I = decoder_cfg.dim_in
-        O = decoder_cfg.dim_out
-        C = decoder_cfg.dim_coords
-        
         # Latents
-        self.latent_embedding = Embedding(L, D)
+        self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
 
         # Coordinates
-        self.src_coords = ContinuousPositionalEmbedding(model_dim=D, dim_per_coord=C, n_coords=4, learnable=True)
-        self.tgt_coords = ContinuousPositionalEmbedding(model_dim=D, dim_per_coord=C, n_coords=4, learnable=True)
+        self.coordinates = ContinuousPositionalEmbedding(dim_per_coord=cfg.dim_coords, max_positions=[6, cfg.num_features, 16, 30], model_dim=cfg.dim)        
+        
+        # Query
+        self.query = GatedFFN(cfg.dim)
 
         # I/O
-        self.proj_in = Linear(I, D)
-        self.norm_in = ConditionalLayerNorm(D)
-        self.proj_out = Linear(D, O)
-
-        # Interface Networks
-        self.decoder = ModuleList([
-            Interface(D, decoder_cfg.num_compute_blocks, dim_heads= decoder_cfg.dim_heads, dim_ctx=decoder_cfg.dim_noise) 
-            for _ in range(decoder_cfg.num_layers)
+        self.proj_in = Linear(cfg.dim_in, cfg.dim)
+        self.norm_in = ConditionalLayerNorm(cfg.dim)
+        self.proj_out = Linear(cfg.dim, cfg.dim_out)
+        self.proj_noise = Linear(cfg.dim_noise, cfg.dim_noise) if cfg.dim_noise > 1 else Identity()
+        
+        # Interface Network
+        self.network = ModuleList([
+            Interface(cfg.dim, cfg.num_compute_blocks, dim_heads= cfg.dim_heads, dim_ctx=cfg.dim_noise) 
+            for _ in range(cfg.num_layers)
         ])
-
-        if encoder_cfg is None:
-            self.encoder = None
-        else:
-            self.encoder = ModuleList([
-                Interface(D, encoder_cfg.num_compute_blocks, dim_heads=encoder_cfg.dim_heads, dim_ctx=encoder_cfg.dim_noise) 
-                for _ in range(encoder_cfg.num_layers)
-            ])
 
         # Initialization
         self.apply(self.base_init)
@@ -65,30 +53,27 @@ class NeuralWeatherField(Module):
     def forward(self, 
                 src: torch.Tensor, 
                 src_coords: torch.Tensor, 
-                tgt_coords: torch.Tensor, 
+                tgt_coords: torch.Tensor,
+                noise: torch.Tensor = None
                 ):
         # Latent
         z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
-
-        # Encoder
-        src = self.proj_in(src)
-        src = self.norm_in(src) + self.src_coords(src_coords)
-
-        if self.encoder is not None:
-            for block in self.encoder:
-                src, z = block(src, z, None)
-
-        # Query embedding
-        tgt = self.tgt_coords(tgt_coords)
-        x = torch.cat([src, tgt], dim = 1)
         
-        # Interface network computation
-        for block in self.decoder:
-            x, z = block(x, z, None)
+        # Encode src
+        src = self.proj_in(src)
+        src = self.norm_in(src) + self.coordinates(src_coords)
 
-        # Split target and project to out dim
+        # Query tgt 
+        tgt = self.coordinates(tgt_coords)
+        tgt = tgt + self.query(tgt)
+
+        # Interface network computation over src and tgt
+        x = torch.cat([src, tgt], dim = 1)
+        noise = self.proj_noise(noise) if noise is not None else None
+        for block in self.network:
+            x, z = block(x, z, noise)
+        
+        # Decode tgt only
         _, tgt = x.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
         tgt = self.proj_out(tgt)
         return tgt, z
-
-        
