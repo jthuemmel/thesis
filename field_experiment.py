@@ -14,9 +14,9 @@ from omegaconf import OmegaConf
 import utils.config as cfg
 
 from utils.loss_fn import *
-from utils.dirichlet_multinomial import DirichletMultinomial, HierarchicalDirichletMultinomial
+from utils.dirichlet_multinomial import DirichletMultinomial
 
-from utils.field_network import NeuralWeatherField
+from utils.field_network import StochasticWeatherField
 
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
@@ -135,7 +135,7 @@ class MTMTrainer(DistributedTrainer):
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
 
     def create_model(self):
-        model = NeuralWeatherField(self.model_cfg)       
+        model = StochasticWeatherField(self.model_cfg)       
         count = count_parameters(model)
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
@@ -385,11 +385,16 @@ class MTMTrainer(DistributedTrainer):
         # functional noise
         noise = self.sample_noise()
         src, src_coords, tgt_coords = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) 
-                                       for x in (src, src_coords, tgt_coords))
-
+                                       for x in (src, src_coords, tgt_coords)
+                                       )
         # forward
         with sdpa_kernel(self.backend):
-            tgt_pred, _ = self.model(src, src_coords, tgt_coords, noise)
+            tgt_pred, q, z = self.model(src, src_coords, tgt_coords, None, None, noise)
+            if self.synced_flag(0.8) or self.mode == 'eval':
+                # q and z are only used for self conditioning, so we detach them to avoid backprop through the self conditioning
+                q = q.detach()
+                z = z.detach()
+                tgt_pred, _, _ = self.model(src, src_coords, tgt_coords, q, z, noise)
 
         # split out ensemble dimension(s) if necessary
         tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
