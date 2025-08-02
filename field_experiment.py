@@ -343,17 +343,6 @@ class MTMTrainer(DistributedTrainer):
         coords = torch.stack([t, v, h, w], dim=-1)
         
         return coords
-    
-    ### Functional noise
-    def sample_noise(self):
-        B = self.batch_size
-        K = self.world_cfg.num_ens
-        D = self.model_cfg.dim_noise
-        if K > 1:
-            noise = torch.randn((B * K, 1, D), device = self.device, generator = self.generator)
-            return noise
-        else:
-            return None
 
     ### FORWARD
     def forward_step(self, batch_idx, batch):
@@ -383,18 +372,13 @@ class MTMTrainer(DistributedTrainer):
         tgt_coords = self.index_to_coords(tgt_mask)
         
         # functional noise
-        noise = self.sample_noise()
         src, src_coords, tgt_coords = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) 
                                        for x in (src, src_coords, tgt_coords)
                                        )
         # forward
         with sdpa_kernel(self.backend):
-            tgt_pred, q, z = self.model(src, src_coords, tgt_coords, None, None, noise)
-            if self.synced_flag(0.8) or self.mode == 'eval':
-                # q and z are only used for self conditioning, so we detach them to avoid backprop through the self conditioning
-                q = q.detach()
-                z = z.detach()
-                tgt_pred, _, _ = self.model(src, src_coords, tgt_coords, q, z, noise)
+            num_steps = 1 if torch.rand(1, device=self.device, generator = self.generator) < 0.2 else 2
+            tgt_pred = self.model(src, src_coords, tgt_coords, num_steps=num_steps)
 
         # split out ensemble dimension(s) if necessary
         tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))

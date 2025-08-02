@@ -26,6 +26,7 @@ class StochasticWeatherField(Module):
 
         # Noise projection
         self.proj_noise = Linear(cfg.dim_noise, cfg.dim_noise) if cfg.dim_noise is not None else Identity()
+        self.dim_noise = cfg.dim_noise
 
         # Interface Network
         self.network = ModuleList([
@@ -54,6 +55,23 @@ class StochasticWeatherField(Module):
             torch.nn.init.zeros_(m.linear.weight)
 
     def forward(self, 
+            src: torch.Tensor, 
+            src_coords: torch.Tensor, 
+            tgt_coords: torch.Tensor,
+            num_steps: int = 1,
+            ):
+        q, z, noise = None, None, None
+        if self.dim_noise is not None:
+            noise = torch.randn(src.size(0), 1, self.dim_noise, device=src.device, dtype=src.dtype) 
+            
+        for _ in range(num_steps):
+            # Step through the model
+            pred, q, z = self.step(src, src_coords, tgt_coords, q_prev=q, z_prev=z, noise=noise)
+            q = q.detach()  # Detach query to avoid backprop across steps
+            z = z.detach()
+        return pred
+
+    def step(self, 
             src: torch.Tensor, 
             src_coords: torch.Tensor, 
             tgt_coords: torch.Tensor,
