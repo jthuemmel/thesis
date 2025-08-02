@@ -4,9 +4,9 @@ from einops import rearrange, repeat, reduce
 from dataclasses import dataclass
 from utils.networks import Interface
 from utils.cpe import ContinuousPositionalEmbedding
-from utils.components import Attention, GatedFFN, ConditionalLayerNorm
+from utils.components import Attention, GatedFFN, ConditionalLayerNorm, ConditioningNetwork
 
-class NeuralWeatherField(Module):
+class StochasticWeatherField(Module):
     def __init__(self, cfg: dataclass):
         super().__init__()
         # Latents
@@ -14,16 +14,19 @@ class NeuralWeatherField(Module):
 
         # Coordinates
         self.coordinates = ContinuousPositionalEmbedding(dim_per_coord=cfg.dim_coords, max_positions=[6, cfg.num_features, 16, 30], model_dim=cfg.dim)        
-        
-        # Query
-        self.query = GatedFFN(cfg.dim)
 
         # I/O
         self.proj_in = Linear(cfg.dim_in, cfg.dim)
         self.norm_in = ConditionalLayerNorm(cfg.dim)
         self.proj_out = Linear(cfg.dim, cfg.dim_out)
-        self.proj_noise = Linear(cfg.dim_noise, cfg.dim_noise) if cfg.dim_noise > 1 else Identity()
-        
+
+         # Self-conditioning networks
+        self.query_network = ConditioningNetwork(cfg.dim)
+        self.latent_network = ConditioningNetwork(cfg.dim)
+
+        # Noise projection
+        self.proj_noise = Linear(cfg.dim_noise, cfg.dim_noise) if cfg.dim_noise is not None else Identity()
+
         # Interface Network
         self.network = ModuleList([
             Interface(cfg.dim, cfg.num_compute_blocks, dim_heads= cfg.dim_heads, dim_ctx=cfg.dim_noise) 
@@ -47,33 +50,35 @@ class NeuralWeatherField(Module):
             torch.nn.init.zeros_(m.to_out.weight)
         if isinstance(m, GatedFFN):
             torch.nn.init.zeros_(m.to_out.weight)
-        if isinstance(m, ConditionalLayerNorm):
+        if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.zeros_(m.linear.weight)
 
     def forward(self, 
-                src: torch.Tensor, 
-                src_coords: torch.Tensor, 
-                tgt_coords: torch.Tensor,
-                noise: torch.Tensor = None
-                ):
-        # Latent
-        z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
-        
-        # Encode src
+            src: torch.Tensor, 
+            src_coords: torch.Tensor, 
+            tgt_coords: torch.Tensor,
+            q_prev: torch.Tensor = None,
+            z_prev: torch.Tensor = None,
+            noise: torch.Tensor = None
+            ):
+        # Initialize src tokens and add positional embeddings
         src = self.proj_in(src)
         src = self.norm_in(src) + self.coordinates(src_coords)
-
-        # Query tgt 
-        tgt = self.coordinates(tgt_coords)
-        tgt = tgt + self.query(tgt)
-
-        # Interface network computation over src and tgt
-        x = torch.cat([src, tgt], dim = 1)
+        # Initialize latent tokens with self conditioning
+        z_init = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
+        z = self.latent_network(z_init, z_prev) 
+        # Initialize query tokens with self conditioning
+        q_init = self.coordinates(tgt_coords)
+        q = self.query_network(q_init, q_prev)
+        # Shared noise projection
         noise = self.proj_noise(noise) if noise is not None else None
+        # Interface network computation over src and query
+        x = torch.cat([src, q], dim = 1)
         for block in self.network:
             x, z = block(x, z, noise)
-        
-        # Decode tgt only
-        _, tgt = x.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
-        tgt = self.proj_out(tgt)
-        return tgt, z
+        _, q = x.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
+        # Decode query only
+        pred = self.proj_out(q)
+        # Return prediction, query, and latent states
+        return pred, q, z
+

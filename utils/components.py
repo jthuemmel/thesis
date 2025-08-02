@@ -89,12 +89,11 @@ class Attention(Module):
 class ConditionalLayerNorm(Module):
     def __init__(self, dim: int, dim_ctx: Optional[int] = None):
         super().__init__()
-        has_ctx = dim_ctx is not None
-        self.norm = LayerNorm(dim, elementwise_affine= not has_ctx)
-        if has_ctx:
-            self.linear = Linear(dim_ctx, dim * 2, bias=True)
-        else:
+        self.norm = LayerNorm(dim, elementwise_affine= dim_ctx is None)
+        if dim_ctx is None:
             self.linear = None
+        else:
+            self.linear = Linear(dim_ctx, dim * 2, bias=True)
 
     def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
         if self.linear is None: 
@@ -115,5 +114,5 @@ class ConditioningNetwork(Module):
         init.zeros_(self.norm.bias)
 
     def forward(self, initial: Tensor, previous: Tensor):
-        previous = zeros_like(initial) if previous is None else previous.detach()
+        previous = zeros_like(initial) if previous is None else previous
         return self.norm(previous + self.ffn(previous)) + initial
