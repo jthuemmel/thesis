@@ -48,7 +48,7 @@ class MTMTrainer(DistributedTrainer):
 
     @property
     def model_cfg(self):
-        return self._cfg.model
+        return self._cfg.model.decoder
     
     @property
     def world_cfg(self):
@@ -135,7 +135,7 @@ class MTMTrainer(DistributedTrainer):
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
 
     def create_model(self):
-        model = NeuralWeatherField(decoder_cfg=self.model_cfg.decoder, encoder_cfg=self.model_cfg.encoder)       
+        model = NeuralWeatherField(self.model_cfg)       
         count = count_parameters(model)
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
@@ -144,7 +144,7 @@ class MTMTrainer(DistributedTrainer):
     def create_loss(self):
         def nino_loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
             # pointwise crps -> [B, N, V, D]
-            loss = f_kernel_crps(observation=obs, ensemble=pred, fair= False)
+            loss = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
             # apply land-sea mask -> [B * N * V * D]
             loss = loss[lsm]
             # reduce to scalar
@@ -161,7 +161,12 @@ class MTMTrainer(DistributedTrainer):
         )
 
     def create_scheduler(self, optimizer):
-        return None
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.optim_cfg.num_epochs,
+            eta_min=self.optim_cfg.eta_min,
+            last_epoch=-1,
+        )
      
     # METRICS
     @staticmethod
@@ -250,11 +255,10 @@ class MTMTrainer(DistributedTrainer):
 
     ### MASKING
     def setup_misc(self):
-        #self.masking_prior = HierarchicalDirichletMultinomial(self.world_cfg.alpha, device=self.device, generator=self.generator)
         self.masking_prior = DirichletMultinomial(self.world_cfg.alpha[0], device=self.device, generator=self.generator)
 
     def sample_masking_rates(self):
-        N = self.world_cfg.num_tokens
+        N = self.world_cfg.num_tokens 
         R_src, R_tgt = torch.empty((2,), device = self.device)
 
         if self.world_cfg.mask_rates_src["std"] > 0:
@@ -275,7 +279,9 @@ class MTMTrainer(DistributedTrainer):
         B = self.batch_size
         V = len(self.data_cfg.variables)
         T = self.data_cfg.sequence_length // self.world_cfg.patch_size["tt"]
-        S = self.world_cfg.num_tokens // (T * V)
+        H = self.data_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
+        W = self.data_cfg.grid_size["lon"] // self.world_cfg.patch_size["ww"]
+        S = H * W
         return B, T, V, S
 
     def forecast_mask(self):
@@ -289,7 +295,7 @@ class MTMTrainer(DistributedTrainer):
     def sample_masks(self):
         M_src, M_tgt = self.sample_masking_rates()
         B, V, T, S = self.get_flatland_shape()
-        src_mask, tgt_mask = self.masking_prior((B, T, V * S), M_src, M_tgt) #(batch, time, var, space) -> (batch, M)
+        src_mask, tgt_mask = self.masking_prior((B, T, V* S), M_src, M_tgt) #(batch, time, var, space) -> (batch, M)
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
@@ -335,21 +341,16 @@ class MTMTrainer(DistributedTrainer):
 
         # stack into (B, N, 4)
         coords = torch.stack([t, v, h, w], dim=-1)
-
-        # normalize by full sizes T, V, H, W → range [0,1)
-        norm_div = torch.tensor([T, V, H, W], device=coords.device, dtype=coords.dtype)
-        coords = coords / norm_div
+        
         return coords
     
-
     ### Functional noise
     def sample_noise(self):
         B = self.batch_size
         K = self.world_cfg.num_ens
-        D = self.model_cfg.decoder.dim_noise
+        D = self.model_cfg.dim_noise
         if K > 1:
-            noise = torch.randn((B * K, D), device = self.device, generator = self.generator)
-            noise = repeat(noise, '(b k) d -> (b k) 1 d', b = B)
+            noise = torch.randn((B * K, 1, D), device = self.device, generator = self.generator)
             return noise
         else:
             return None
@@ -381,11 +382,17 @@ class MTMTrainer(DistributedTrainer):
         src_coords = self.index_to_coords(src_mask)
         tgt_coords = self.index_to_coords(tgt_mask)
         
+        # functional noise
+        noise = self.sample_noise()
+        src, src_coords, tgt_coords = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) 
+                                       for x in (src, src_coords, tgt_coords))
+
         # forward
         with sdpa_kernel(self.backend):
-            tgt_pred, _ = self.model(src, src_coords, tgt_coords)
+            tgt_pred, _ = self.model(src, src_coords, tgt_coords, noise)
 
-        tgt_pred = rearrange(tgt_pred, '(b e) ... (c k) -> b ... c (e k)', c = tokens.size(-1), b = tokens.size(0))
+        # split out ensemble dimension(s) if necessary
+        tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
             
         # compute loss
         loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
