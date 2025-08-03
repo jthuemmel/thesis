@@ -371,7 +371,7 @@ class MTMTrainer(DistributedTrainer):
         src_coords = self.index_to_coords(src_mask)
         tgt_coords = self.index_to_coords(tgt_mask)
         
-        # functional noise
+        # expand src, tgt, lsm for ensemble
         src, src_coords, tgt_coords = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) 
                                        for x in (src, src_coords, tgt_coords)
                                        )

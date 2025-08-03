@@ -7,6 +7,10 @@ from torch.nn.functional import normalize, scaled_dot_product_attention, silu
 
 from typing import Optional, Tuple
 
+
+def get_weight_std(weight: Tensor):
+    return 1 / weight.size(-1)**0.5
+
 class Interface(Module):
     def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
         """

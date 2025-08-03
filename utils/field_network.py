@@ -1,10 +1,10 @@
 import torch
-from torch.nn import Embedding, Module, ModuleList, Linear, init, Identity
+from torch.nn import Embedding, Module, ModuleList, Linear, init, Identity, LayerNorm
 from einops import rearrange, repeat, reduce
 from dataclasses import dataclass
 from utils.networks import Interface
 from utils.cpe import ContinuousPositionalEmbedding
-from utils.components import Attention, GatedFFN, ConditionalLayerNorm, ConditioningNetwork
+from utils.components import *
 
 class StochasticWeatherField(Module):
     def __init__(self, cfg: dataclass):
@@ -36,23 +36,37 @@ class StochasticWeatherField(Module):
 
         # Initialization
         self.apply(self.base_init)
-        self.apply(self.zero_init)
+        self.apply(self.zero_init)    
 
     @staticmethod
     def base_init(m):
         if isinstance(m, Linear):
-            init.trunc_normal_(m.weight, std = 0.02)
+            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+            if m.bias is not None:
+                init.zeros_(m.bias)
+
         if isinstance(m, Embedding):
-            init.trunc_normal_(m.weight, std = 0.02)
+            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+
+        if isinstance(m, LayerNorm):
+            if m.bias is not None:
+                init.zeros_(m.bias)
+            if m.weight is not None:
+                init.ones_(m.weight)
 
     @staticmethod
     def zero_init(m):
         if isinstance(m, Attention):
-            torch.nn.init.zeros_(m.to_out.weight)
+            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
         if isinstance(m, GatedFFN):
-            torch.nn.init.zeros_(m.to_out.weight)
+            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
-            torch.nn.init.zeros_(m.linear.weight)
+            torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
+
+    def noise_like(self, src: torch.Tensor):
+        if self.dim_noise is not None:
+            return torch.randn(src.size(0), 1, self.dim_noise, device=src.device, dtype=src.dtype)
+        return None
 
     def forward(self, 
             src: torch.Tensor, 
@@ -60,14 +74,11 @@ class StochasticWeatherField(Module):
             tgt_coords: torch.Tensor,
             num_steps: int = 1,
             ):
-        q, z, noise = None, None, None
-        if self.dim_noise is not None:
-            noise = torch.randn(src.size(0), 1, self.dim_noise, device=src.device, dtype=src.dtype) 
-            
+        q, z = None, None
         for _ in range(num_steps):
-            # Step through the model
+            noise = self.noise_like(src)
             pred, q, z = self.step(src, src_coords, tgt_coords, q_prev=q, z_prev=z, noise=noise)
-            q = q.detach()  # Detach query to avoid backprop across steps
+            q = q.detach()
             z = z.detach()
         return pred
 
@@ -82,21 +93,27 @@ class StochasticWeatherField(Module):
         # Initialize src tokens and add positional embeddings
         src = self.proj_in(src)
         src = self.norm_in(src) + self.coordinates(src_coords)
+
         # Initialize latent tokens with self conditioning
         z_init = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
         z = self.latent_network(z_init, z_prev) 
+
         # Initialize query tokens with self conditioning
         q_init = self.coordinates(tgt_coords)
         q = self.query_network(q_init, q_prev)
+
         # Shared noise projection
         noise = self.proj_noise(noise) if noise is not None else None
+
         # Interface network computation over src and query
         x = torch.cat([src, q], dim = 1)
         for block in self.network:
             x, z = block(x, z, noise)
         _, q = x.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
+
         # Decode query only
         pred = self.proj_out(q)
+
         # Return prediction, query, and latent states
         return pred, q, z
 
