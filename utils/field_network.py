@@ -3,7 +3,7 @@ from torch.nn import Embedding, Module, ModuleList, Linear, init, LayerNorm
 from einops import rearrange, repeat, reduce
 from dataclasses import dataclass
 from utils.networks import Interface
-from utils.cpe import ContinuousPositionalEmbedding
+#from utils.cpe import ContinuousPositionalEmbedding
 from utils.components import *
 
 class StochasticWeatherField(Module):
@@ -13,9 +13,13 @@ class StochasticWeatherField(Module):
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
 
         # Coordinates
-        self.src_positions = ContinuousPositionalEmbedding(dim_per_coord=cfg.dim_coords, max_positions=[6, cfg.num_features, 16, 30], model_dim=cfg.dim)        
-        self.tgt_positions = ContinuousPositionalEmbedding(dim_per_coord=cfg.dim_coords, max_positions=[6, cfg.num_features, 16, 30], model_dim=cfg.dim)
+        #self.src_positions = ContinuousPositionalEmbedding(dim_per_coord=cfg.dim_coords, max_positions=[6, cfg.num_features, 16, 30], model_dim=cfg.dim)        
+        #self.tgt_positions = ContinuousPositionalEmbedding(dim_per_coord=cfg.dim_coords, max_positions=[6, cfg.num_features, 16, 30], model_dim=cfg.dim)
         
+        self.coords = Embedding(cfg.num_tokens, cfg.dim_coords)
+        self.to_src_coords = Linear(cfg.dim_coords, cfg.dim)
+        self.to_tgt_coords = Linear(cfg.dim_coords, cfg.dim)
+
         # I/O
         self.proj_in = Linear(cfg.dim_in, cfg.dim)
         self.norm_in = ConditionalLayerNorm(cfg.dim)
@@ -94,16 +98,20 @@ class StochasticWeatherField(Module):
             z_prev: torch.Tensor = None,
             noise: torch.Tensor = None
             ):
+        # Embed the coords
+        src_coords = self.coords(src_coords)
+        tgt_coords = self.coords(tgt_coords)
+
         # Initialize src tokens and add positional embeddings
         src = self.proj_in(src)
-        src = self.norm_in(src) + self.src_positions(src_coords)
+        src = self.norm_in(src) + self.to_src_coords(src_coords)
 
         # Initialize latent tokens with self conditioning
         z_init = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
         z = self.latent_conditioning(z_init, z_prev) 
 
         # Initialize query tokens with self conditioning
-        q_init = self.tgt_positions(tgt_coords)
+        q_init = self.to_tgt_coords(tgt_coords)
         q = self.query_conditioning(q_init, q_prev)
 
         # Shared noise projection
