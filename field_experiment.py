@@ -162,14 +162,12 @@ class MTMTrainer(DistributedTrainer):
     # LOSS
     def create_loss(self):
         def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
-            # spectral crps
-            spectral_crps = self.spectral_crps(pred = pred, obs = obs)
             # pointwise crps
             point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
-            return point_crps.nanmean() + spectral_crps.nanmean() * 0.01
+            return point_crps.nanmean()
         return loss
     
     def spectral_crps(self, pred, obs):
@@ -475,11 +473,9 @@ class MTMTrainer(DistributedTrainer):
         tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
             
         # compute loss
-        loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
-        
-        if tgt_mask is None:
-            spectral_crps = self.spectral_crps(pred= tgt_pred, obs = tgt).nanmean()
-            self.current_metrics.log_metric(f'{task}_spectral', spectral_crps.item())
+        pointwise_crps = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
+        spectral_crps = self.spectral_crps(pred= tgt_pred, obs = tgt).nanmean()
+        loss = pointwise_crps + 0.01 * spectral_crps
 
         # metrics
         if task == "train":
@@ -487,7 +483,8 @@ class MTMTrainer(DistributedTrainer):
             self.compute_metrics(pred = tgt_pred, obs = tgt, lsm = lsm, label = None)
         elif task == "frcst":
             self.get_frcst_metrics(pred = tgt_pred, obs = tgt, lsm = lsm)                   
-
+        self.current_metrics.log_metric(f'{task}_spectral', spectral_crps.item())
+        
         return loss
 
 def main():
