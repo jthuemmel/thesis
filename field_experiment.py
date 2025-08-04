@@ -13,9 +13,8 @@ from omegaconf import OmegaConf
 
 import utils.config as cfg
 
-from utils.loss_fn import *
+from utils.loss_fn import f_kernel_crps, f_gaussian_ignorance
 from utils.dirichlet_multinomial import DirichletMultinomial
-
 from utils.field_network import StochasticWeatherField
 
 from utils.dataset import NinoData, MultifileNinoDataset
@@ -134,6 +133,7 @@ class MTMTrainer(DistributedTrainer):
         self.job_name = f"{base_name}"
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
 
+    # MODEL
     def create_model(self):
         model = StochasticWeatherField(self.model_cfg)       
         count = count_parameters(model)
@@ -141,16 +141,7 @@ class MTMTrainer(DistributedTrainer):
         self.misc_metrics.log_python_object("num_params", count)
         return model
     
-    def create_loss(self):
-        def nino_loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
-            # pointwise crps -> [B, N, V, D]
-            loss = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
-            # apply land-sea mask -> [B * N * V * D]
-            loss = loss[lsm]
-            # reduce to scalar
-            return loss.nanmean()
-        return nino_loss
-
+    # OPTIMIZATION
     def create_optimizer(self, named_params):
         return torch.optim.AdamW(
             named_params,
@@ -168,6 +159,39 @@ class MTMTrainer(DistributedTrainer):
             last_epoch=-1,
         )
      
+    # LOSS
+    def create_loss(self):
+        def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
+            # spectral crps
+            spectral_crps = self.spectral_crps(pred = pred, obs = obs)
+            # pointwise crps
+            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
+            # apply land-sea mask
+            point_crps = point_crps[lsm]
+            # reduce to scalar
+            return point_crps.nanmean() + spectral_crps.nanmean() * 0.01
+        return loss
+    
+    def spectral_crps(self, pred, obs):
+            """
+            Compute CRPS between RAPSDs of predictions and observations.
+            """
+            E = pred.shape[-1]  # number of ensemble members
+
+            # ensure correct shapes
+            obs = self.tokens_to_field(obs)
+            pred = self.tokens_to_field(pred)
+
+            # compute rapsd of fields
+            with torch.autocast(device_type = self.device_type, enabled = False):
+                obs_psd = self.rapsd(obs.float())
+                pred_psd = self.rapsd(pred.float())
+
+            # CRPS expects [B, ..., E], observation [B, ...]
+            pred_psd = rearrange(pred_psd, "(e bb) ... -> bb ... e", e = E)
+            crps = f_kernel_crps(observation=obs_psd, ensemble=pred_psd, fair=True)
+            return crps
+
     # METRICS
     @staticmethod
     def compute_acc(pred, obs):
@@ -199,7 +223,53 @@ class MTMTrainer(DistributedTrainer):
         spread = pred.var(-1).mean().sqrt()
         skill = (obs - mean).pow(2).mean().sqrt()
         return correction * (spread / skill)
+
+    @staticmethod
+    def rapsd(x: torch.Tensor) -> torch.Tensor:
+        '''
+        Compute the radial average of a batched 2D tensor.
+
+        Args:
+            psd (torch.Tensor): Tensor of shape (B, H, W)
+        Returns:
+            Tensor of shape (B, L) — where L is the number of radial bins
+        '''
+        B, H, W = x.size()
+        device = x.device
+
+         # compute spectrum using FFT
+        spectrum = torch.fft.fft2(x)
+
+        # take absolute value and square to get power spectral density
+        psd = spectrum.abs().pow(2)
+
+        # Compute frequency grid (accounting for 1° spacing in H, 2° in W)
+        ky = torch.fft.fftfreq(H, d=1.0).to(device)   # shape: (H,)
+        kx = torch.fft.fftfreq(W, d=2.0).to(device)   # shape: (W,)
+
+        # Get 2D radial wavenumber magnitude grid
+        kx = rearrange(kx, 'w -> 1 w')  # (1, W)
+        ky = rearrange(ky, 'h -> h 1')  # (H, 1)
+        radial_freq = torch.sqrt(kx ** 2 + ky ** 2).round()  # Integer radial frequencies
+        radial_freq = radial_freq / radial_freq.max()
+
+        # Bin the radial frequencies
+        num_bins = min(H, W)
+        bin_edges = torch.linspace(0, 1, num_bins + 1, device=device)
+        bin_indices = torch.bucketize(radial_freq.flatten(), bin_edges, right=False) - 1  # [H*W]
+        bin_indices = bin_indices.clamp(min=0, max=num_bins - 1)
+
+         # Count elements per bin
+        bin_counts = torch.bincount(bin_indices, minlength=num_bins).clamp(min=1)
+
+        # Bin average using scatter_add
+        binned = torch.zeros(B, num_bins, device=device)
+        binned.scatter_add_(dim=1, index=bin_indices.expand(B, -1), src=psd.view(B, -1))
+        binned = binned / bin_counts
+
+        return binned
     
+    ### METRICS LOGGING
     def ensemble_metrics(self, ens_pred: torch.Tensor, obs: torch.Tensor, label: str = None):
         crps = self.compute_crps(pred = ens_pred, obs = obs)
         ssr = self.compute_spread_skill(pred = ens_pred, obs = obs)
@@ -209,7 +279,7 @@ class MTMTrainer(DistributedTrainer):
         self.current_metrics.log_metric(f"{label}_ssr" if exists(label) else "ssr", ssr.item())
         self.current_metrics.log_metric(f"{label}_ign" if exists(label) else "ign", ign.item())
         self.current_metrics.log_metric(f"{label}_spread" if exists(label) else "spread", spread.item())
-
+    
     def deterministic_metrics(self, pred: torch.Tensor, obs: torch.Tensor, label: str = None):
         acc = self.compute_acc(pred = pred, obs = obs)
         rmse = self.compute_rmse(pred = pred, obs = obs)
@@ -253,6 +323,16 @@ class MTMTrainer(DistributedTrainer):
             p, o, l = (self.select_field_subset(x, vi, ti) for x in (pred, obs, lsm)) # select the task-specific subset
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
+    def tokens_to_field(self, tokens):
+        V = len(self.data_cfg.variables)
+        H = self.data_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
+        W = self.data_cfg.grid_size["lon"] // self.world_cfg.patch_size["ww"]
+        return rearrange(tokens, "b (t v h w) (tt hh ww) ... -> (... b t tt v) (h hh) (w ww)", 
+                        v = V, h = H, w = W, **self.world_cfg.patch_size)
+
+    def field_to_tokens(self, field):
+        return rearrange(field, "b v (t tt) (h hh) (w ww) -> b (t v h w) (tt hh ww)", **self.world_cfg.patch_size)
+
     ### MASKING
     def setup_misc(self):
         self.masking_prior = DirichletMultinomial(self.world_cfg.alpha[0], device=self.device, generator=self.generator)
@@ -295,18 +375,22 @@ class MTMTrainer(DistributedTrainer):
     def sample_masks(self):
         M_src, M_tgt = self.sample_masking_rates()
         B, V, T, S = self.get_flatland_shape()
-        src_mask, tgt_mask = self.masking_prior((B, T, V* S), M_src, M_tgt) #(batch, time, var, space) -> (batch, M)
+        src_mask, tgt_mask = self.masking_prior((B, T, V* S), M_src, None) #(batch, time, var, space) -> (batch, M)
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
         _, _, D = tokens.size()
-        # grid masks
+        # src masks
         expanded_src_mask = repeat(src_mask, 'b n -> b n d', d = D)
-        expanded_tgt_mask = repeat(tgt_mask, 'b n -> b n d', d = D)
-        # apply
         src = tokens.gather(1, expanded_src_mask)
-        tgt = tokens.gather(1, expanded_tgt_mask)
-        lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
+        # optional tgt masks
+        if tgt_mask is not None:
+            expanded_tgt_mask = repeat(tgt_mask, 'b n -> b n d', d = D)        
+            tgt = tokens.gather(1, expanded_tgt_mask)
+            lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
+        else:
+            tgt = tokens
+            lsm = self.land_sea_mask
         return src, tgt, lsm
     
     def index_to_coords(self, idx_flat: torch.LongTensor):
@@ -317,11 +401,18 @@ class MTMTrainer(DistributedTrainer):
         Returns:
             torch.Tensor: Coordinates tensor of shape (B, N, C), where C is the number of coordinates.
         """
-        _, V, T, S = self.get_flatland_shape()
+        # get shape
+        B, V, T, S = self.get_flatland_shape()
+
+        # default to full index
+        if idx_flat is None:
+            idx_flat = torch.arange(T * V * S, device = self.device).expand(B, -1)
+
         # stride for t
         tvs = V * S
         # stride for v
         vs = S
+
         # gridsize for h, w
         W = self.data_cfg.grid_size["lon"] // self.world_cfg.patch_size["ww"] 
         H = self.data_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
@@ -343,7 +434,7 @@ class MTMTrainer(DistributedTrainer):
         coords = torch.stack([t, v, h, w], dim=-1)
         
         return coords
-
+    
     ### FORWARD
     def forward_step(self, batch_idx, batch):
         if self.mode == "train":
@@ -358,10 +449,7 @@ class MTMTrainer(DistributedTrainer):
         Performs a forward pass and returns the loss.
         """
         # to device and tokenize
-        tokens = rearrange(batch.to(self.device), 
-                           "b v (t tt) (h hh) (w ww) -> b (t v h w) (tt hh ww)", 
-                           **self.world_cfg.patch_size
-                           )
+        tokens = self.field_to_tokens(batch.to(self.device))
         
         # masking
         src_mask, tgt_mask = self.sample_masks() if task == "train" else self.forecast_mask()
@@ -377,7 +465,10 @@ class MTMTrainer(DistributedTrainer):
                                        )
         # forward
         with sdpa_kernel(self.backend):
-            num_steps = 1 if torch.rand(1, device=self.device, generator = self.generator) < 0.2 else 2
+            if task == "frcst":
+                num_steps = 2
+            else:
+                num_steps = 1 if torch.rand(1, device=self.device, generator = self.generator) < 0.2 else 2
             tgt_pred = self.model(src, src_coords, tgt_coords, num_steps=num_steps)
 
         # split out ensemble dimension(s) if necessary
@@ -386,6 +477,10 @@ class MTMTrainer(DistributedTrainer):
         # compute loss
         loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
         
+        if tgt_mask is None:
+            spectral_crps = self.spectral_crps(pred= tgt_pred, obs = tgt).nanmean()
+            self.current_metrics.log_metric(f'{task}_spectral', spectral_crps.item())
+
         # metrics
         if task == "train":
             self.current_metrics.log_metric(f"loss", loss.item())
