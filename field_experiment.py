@@ -336,6 +336,10 @@ class MTMTrainer(DistributedTrainer):
         return rearrange(field, "b v (t tt) (h hh) (w ww) -> b (t v h w) (tt hh ww)", **self.world_cfg.patch_size)
 
     ### MASKING
+    def get_full_index(self):
+        B, T, V, S = self.get_flatland_shape()
+        return repeat(torch.arange(T * S * V, device = self.device), "i -> b i", b = B)
+
     def get_flatland_shape(self):
         # flatland shape: (batch, variables, time, space) 
         B = self.batch_size
@@ -347,11 +351,11 @@ class MTMTrainer(DistributedTrainer):
         return B, T, V, S
 
     def forecast_mask(self):
-        B, T, V, S = self.get_flatland_shape()
+        _, _, V, S = self.get_flatland_shape()
         tau = self.world_cfg.tau
-        indices = repeat(torch.arange(T * S * V, device = self.device), "i -> b i", b = B)
-        # (batch, (time var space)) -> (batch, (src_time, var, space), (tgt_time, var, space))
-        src_mask, tgt_mask = indices.split([S * V * tau, (T - tau) * V * S], dim = 1) 
+        idx = self.get_full_index()
+        src_mask = idx[:, :S * V * tau]
+        tgt_mask = idx[:, S * V * tau:]
         return src_mask, tgt_mask
 
     def sample_dirichlet(self, shape: tuple, weights: torch.Tensor | float = 1.0, sharpness: float = 1.0) -> torch.Tensor:
@@ -371,7 +375,8 @@ class MTMTrainer(DistributedTrainer):
     
     def sample_multivariate_masks(self):
         B, T, V, S = self.get_flatland_shape()
-        
+        tgt_mask = self.get_full_index()
+
         #src masking rate
         src_rate = self.sample_masking_rates(self.world_cfg.mask_rates_src)
 
@@ -387,21 +392,17 @@ class MTMTrainer(DistributedTrainer):
 
         # multinomial
         src_mask = torch.multinomial(joint, src_rate, replacement = False, generator = self.generator)
-        return src_mask, None
+        return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
         _, _, D = tokens.size()
         # src masks
         expanded_src_mask = repeat(src_mask, 'b n -> b n d', d = D)
         src = tokens.gather(1, expanded_src_mask)
-        # optional tgt masks
-        if tgt_mask is not None:
-            expanded_tgt_mask = repeat(tgt_mask, 'b n -> b n d', d = D)        
-            tgt = tokens.gather(1, expanded_tgt_mask)
-            lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
-        else:
-            tgt = tokens
-            lsm = self.land_sea_mask
+        # tgt masks
+        expanded_tgt_mask = repeat(tgt_mask, 'b n -> b n d', d = D)        
+        tgt = tokens.gather(1, expanded_tgt_mask)
+        lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
         return src, tgt, lsm
     
     def index_to_coords(self, idx_flat: torch.LongTensor):
@@ -417,7 +418,7 @@ class MTMTrainer(DistributedTrainer):
 
         # default to full index
         if idx_flat is None:
-            idx_flat = repeat(torch.arange(T * S * V, device = self.device), "i -> b i", b = B)
+            idx_flat = self.get_full_index()
 
         # stride for t
         tvs = V * S
