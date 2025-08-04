@@ -14,7 +14,6 @@ from omegaconf import OmegaConf
 import utils.config as cfg
 
 from utils.loss_fn import f_kernel_crps, f_gaussian_ignorance
-from utils.dirichlet_multinomial import DirichletMultinomial
 from utils.field_network import StochasticWeatherField
 
 from utils.dataset import NinoData, MultifileNinoDataset
@@ -160,10 +159,14 @@ class MTMTrainer(DistributedTrainer):
         )
      
     # LOSS
+    @property
+    def use_fair_crps(self):
+        return self.world_cfg.num_ens > 1
+    
     def create_loss(self):
         def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
             # pointwise crps
-            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
+            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
@@ -187,7 +190,7 @@ class MTMTrainer(DistributedTrainer):
 
             # CRPS expects [B, ..., E], observation [B, ...]
             pred_psd = rearrange(pred_psd, "(e bb) ... -> bb ... e", e = E)
-            crps = f_kernel_crps(observation=obs_psd, ensemble=pred_psd, fair=True)
+            crps = f_kernel_crps(observation=obs_psd, ensemble=pred_psd, fair= self.use_fair_crps)
             return crps
 
     # METRICS
@@ -321,6 +324,7 @@ class MTMTrainer(DistributedTrainer):
             p, o, l = (self.select_field_subset(x, vi, ti) for x in (pred, obs, lsm)) # select the task-specific subset
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
+    ### TOKENS
     def tokens_to_field(self, tokens):
         V = len(self.data_cfg.variables)
         H = self.data_cfg.grid_size["lat"] // self.world_cfg.patch_size["hh"]
@@ -332,26 +336,6 @@ class MTMTrainer(DistributedTrainer):
         return rearrange(field, "b v (t tt) (h hh) (w ww) -> b (t v h w) (tt hh ww)", **self.world_cfg.patch_size)
 
     ### MASKING
-    def setup_misc(self):
-        self.masking_prior = DirichletMultinomial(self.world_cfg.alpha[0], device=self.device, generator=self.generator)
-
-    def sample_masking_rates(self):
-        N = self.world_cfg.num_tokens 
-        R_src, R_tgt = torch.empty((2,), device = self.device)
-
-        if self.world_cfg.mask_rates_src["std"] > 0:
-            torch.nn.init.trunc_normal_(R_src, **self.world_cfg.mask_rates_src, generator = self.generator)
-        else:
-            R_src.fill_(self.world_cfg.mask_rates_src["mean"])
-
-        if self.world_cfg.mask_rates_tgt["std"] > 0:
-            torch.nn.init.trunc_normal_(R_tgt, **self.world_cfg.mask_rates_tgt, generator = self.generator)
-        else:
-            R_tgt.fill_(self.world_cfg.mask_rates_tgt["mean"])
-        
-        M_src, M_tgt = int(N * R_src.item()), int(N * R_tgt.item())
-        return M_src, M_tgt
-    
     def get_flatland_shape(self):
         # flatland shape: (batch, variables, time, space) 
         B = self.batch_size
@@ -370,11 +354,40 @@ class MTMTrainer(DistributedTrainer):
         src_mask, tgt_mask = indices.split([S * V * tau, (T - tau) * V * S], dim = 1) 
         return src_mask, tgt_mask
 
-    def sample_masks(self):
-        M_src, M_tgt = self.sample_masking_rates()
-        B, V, T, S = self.get_flatland_shape()
-        src_mask, tgt_mask = self.masking_prior((B, T, V* S), M_src, None) #(batch, time, var, space) -> (batch, M)
-        return src_mask, tgt_mask
+    def sample_dirichlet(self, shape: tuple, weights: torch.Tensor | float = 1.0, sharpness: float = 1.0) -> torch.Tensor:
+        w = torch.ones(shape, device= self.device) * torch.as_tensor(weights, device= self.device)
+        probs = w / w.sum(-1, keepdim= True)  # normalize to probability simplex
+        alpha = probs * sharpness
+        return torch._sample_dirichlet(alpha, generator=self.generator)
+
+    def sample_masking_rates(self, rate_cfg: dict):
+        N = self.world_cfg.num_tokens 
+        rate = torch.empty((1,), device = self.device)
+        if rate_cfg["std"] > 0:
+            rate = torch.nn.init.trunc_normal_(rate, **rate_cfg, generator=self.generator)
+        else:
+            rate = rate.fill_(rate_cfg["mean"])
+        return int(N * rate.item())
+    
+    def sample_multivariate_masks(self):
+        B, T, V, S = self.get_flatland_shape()
+        
+        #src masking rate
+        src_rate = self.sample_masking_rates(self.world_cfg.mask_rates_src)
+
+        # temporal dirichlet
+        time_prior = self.sample_dirichlet((B, T), sharpness= self.world_cfg.alpha)
+        
+        # variate dirichlet
+        var_prior = self.sample_dirichlet((B, V), self.per_variable_weights, sharpness= self.world_cfg.alpha)
+        
+        # joint prior distribution repeated over space
+        joint = torch.einsum('b t, b v -> b t v', time_prior, var_prior)
+        joint = repeat(joint, 'b t v -> b (t v s)', s = S)
+
+        # multinomial
+        src_mask = torch.multinomial(joint, src_rate, replacement = False, generator = self.generator)
+        return src_mask, None
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
         _, _, D = tokens.size()
@@ -404,7 +417,7 @@ class MTMTrainer(DistributedTrainer):
 
         # default to full index
         if idx_flat is None:
-            idx_flat = torch.arange(T * V * S, device = self.device).expand(B, -1)
+            idx_flat = repeat(torch.arange(T * S * V, device = self.device), "i -> b i", b = B)
 
         # stride for t
         tvs = V * S
@@ -450,24 +463,24 @@ class MTMTrainer(DistributedTrainer):
         tokens = self.field_to_tokens(batch.to(self.device))
         
         # masking
-        src_mask, tgt_mask = self.sample_masks() if task == "train" else self.forecast_mask()
+        src_mask, tgt_mask = self.sample_multivariate_masks() if task == "train" else self.forecast_mask()
         src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask)
         
         # convert flat indices to coordinates
-        src_coords = self.index_to_coords(src_mask)
-        tgt_coords = self.index_to_coords(tgt_mask)
+        # src_coords = self.index_to_coords(src_mask)
+        # tgt_coords = self.index_to_coords(tgt_mask)
         
         # expand src, tgt, lsm for ensemble
-        src, src_coords, tgt_coords = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) 
-                                       for x in (src, src_coords, tgt_coords)
-                                       )
+        src, src_mask, tgt_mask = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) 
+                                    for x in (src, src_mask, tgt_mask))
+        
         # forward
         with sdpa_kernel(self.backend):
             if task == "frcst":
                 num_steps = 2
             else:
                 num_steps = 1 if torch.rand(1, device=self.device, generator = self.generator) < 0.2 else 2
-            tgt_pred = self.model(src, src_coords, tgt_coords, num_steps=num_steps)
+            tgt_pred = self.model(src, src_mask, tgt_mask, num_steps=num_steps)
 
         # split out ensemble dimension(s) if necessary
         tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
@@ -475,7 +488,7 @@ class MTMTrainer(DistributedTrainer):
         # compute loss
         pointwise_crps = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
         spectral_crps = self.spectral_crps(pred= tgt_pred, obs = tgt).nanmean()
-        loss = pointwise_crps + 0.01 * spectral_crps
+        loss = pointwise_crps + 1e-3 * spectral_crps
 
         # metrics
         if task == "train":

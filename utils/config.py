@@ -90,12 +90,10 @@ class DatasetConfig:
 @dataclass
 class WorldConfig:
     mask_rates_src: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    mask_rates_tgt: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    var_rates_src: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    var_rates_tgt: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
+    mask_rates_tgt: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
     tau: Optional[int] = None
     num_ens: Optional[int] = None
-    alpha: Sequence = field(default_factory=lambda: [0.5, 1., 1.])
+    alpha: float = 1.
     num_tokens: int = 768
     patch_size: dict = field(default_factory=lambda: {"tt": 2, "hh": 4, "ww": 4})
 
