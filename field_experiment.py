@@ -409,12 +409,14 @@ class MTMTrainer(DistributedTrainer):
         prior = repeat(prior, "b t -> b (t s)", s = S)
 
         # per variable multinomial
-        masks = [
-            torch.multinomial(prior, 
-                              self.sample_masking_rates(self.world_cfg.mask_rates_src), 
-                              replacement = False, generator = self.generator)
-                              for _ in range(V)
-        ]
+        masks = []
+        for v in range(V):
+            idx = torch.multinomial(prior, 
+                                    num_samples = self.sample_masking_rates(self.world_cfg.mask_rates_src),
+                                    replacement=False, generator=self.generator)  # (B, num_samples)
+            full_idx = (idx // S) * V * S + v * S + (idx % S) # correct to T V S shape
+            masks.append(full_idx)
+            
         src_mask = torch.cat(masks, dim = -1)
         return src_mask, tgt_mask
 
@@ -446,6 +448,7 @@ class MTMTrainer(DistributedTrainer):
 
         # stride for t
         tvs = V * S
+
         # stride for v
         vs = S
 
