@@ -185,7 +185,8 @@ class MTMTrainer(DistributedTrainer):
             x = self.tokens_to_field(x)
             x = rearrange(x, "b v t h w ... -> (... b v t) h w")
             with torch.autocast(device_type = self.device_type, enabled = False):
-                rapsd = self.rapsd(x.float()).log10()
+                rapsd = self.rapsd(x.float())
+                rapsd = torch.clamp(rapsd, min=1e-8).log10()
             return rapsd
     
     @staticmethod
@@ -208,16 +209,16 @@ class MTMTrainer(DistributedTrainer):
     
     @staticmethod
     def compute_spread(ens_pred):
-        return ens_pred.var(-1).mean().sqrt()
+        return ens_pred.var(-1).nanmean().sqrt()
 
     @staticmethod
     def compute_spread_skill(pred, obs):
         K = pred.shape[-1]
         correction = math.sqrt((K + 1) / K)
-        mean = pred.mean(-1)
-        spread = pred.var(-1).mean().sqrt()
-        skill = (obs - mean).pow(2).mean().sqrt()
-        return correction * (spread / skill)
+        mean = pred.nanmean(-1)
+        spread = pred.var(-1).nanmean().sqrt()
+        skill = (obs - mean).pow(2).nanmean().sqrt()
+        return correction * (spread / skill.clamp(1e-8))
 
     @staticmethod
     def rapsd(x: torch.Tensor) -> torch.Tensor:
@@ -504,11 +505,11 @@ class MTMTrainer(DistributedTrainer):
         
         # forward
         with sdpa_kernel(self.backend):
-            # if task == "frcst":
-            #     num_steps = 2
-            # else:
-            #     num_steps = 1 if torch.rand(1, device=self.device, generator = self.generator) < 0.2 else 2
-            tgt_pred = self.model(src, src_mask, tgt_mask, num_steps=1)
+            if task == "frcst":
+                 num_steps = 2
+            else:
+                 num_steps = 1 if torch.rand(1, device=self.device, generator = self.generator) < 0.2 else 2
+            tgt_pred = self.model(src, src_mask, tgt_mask, num_steps=num_steps)
 
         # split out ensemble dimension(s) if necessary
         tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
