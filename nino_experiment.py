@@ -5,6 +5,7 @@ import argparse
 import math
 
 from dataclasses import replace
+from typing import Callable
 from einops import rearrange, repeat
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
@@ -27,53 +28,97 @@ def default(val, d):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
+#### MASKING
 class MaskingMixin:
-    def forecast_mask(self):
+    @property
+    def frcst_src_prior(self):
         tau = self.world_cfg.tau
-        idx = self.get_flatland_index()
-        rem = math.prod([self.token_sizes[ax] for ax in self.flatland_token_layout if ax != "t"])
-        src_mask = idx[:, : rem * tau]
-        tgt_mask = idx[:, rem * tau:]
-        return src_mask, tgt_mask
+        prior = torch.ones(self.token_sizes["t"], device = self.device)
+        prior[tau:] = 0
+        return {"t": lambda: prior}
+    
+    @property
+    def frcst_tgt_prior(self):
+        tau = self.world_cfg.tau
+        prior = torch.ones(self.token_sizes["t"], device = self.device)
+        prior[:tau] = 0
+        return {"t": lambda: prior}
 
     @property
-    def masking_priors(self):
+    def src_priors(self):
+        '''Creates custom priors for any combination of dimensions. Keys must reflect the correct dimensions.'''
         return {
-            "bt": lambda self: self.sample_dirichlet((self.batch_size, self.token_sizes["t"]), sharpness=self.world_cfg.alpha),
-            "bv": lambda self: self.sample_dirichlet((self.batch_size, self.token_sizes["v"])),
-            "hw":  lambda self: torch.ones((self.token_sizes["h"],self.token_sizes["w"]), device=self.device),
+            "bt": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["t"]), sharpness=self.world_cfg.alpha),
+            "bv": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["v"])),
         }
+    
+    @property
+    def tgt_priors(self):
+        return {
+            "bt": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["t"]), sharpness=self.world_cfg.alpha),
+            "bv": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["v"]), weights= self.per_variable_weights),
+        }
+
+    @property
+    def uniform_priors(self):
+        '''Creates a uniform prior for each dimension in the token set.'''
+        return {k: lambda K= K: torch.ones((K,), device=self.device) for k, K in self.token_sizes.items()}
+
+    def get_masks(self, task: str):
+        return
+    
+    def get_src_mask(self):
+        rate = self.sample_masking_rates(self.world_cfg.num_tokens, **self.world_cfg.mask_rates_src)
+        prior = self.src_priors()
+        uniform = self.uniform_priors()
+        prior.update(uniform)
+        joint = self.compose_einsum_prior(prior, self.flatland_token_layout)
+        return self.sample_multinomial(joint, rate)
+
+    def get_masking_rate(self, N: int, **kwargs):
+        rate = self.sample_trunc_normal(**kwargs)
+        return int(N * rate.item())
+
+    @staticmethod    
+    def sample_topk(weights: torch.Tensor, k: int):
+        return weights.topk(k, sorted= False).indices
 
     def sample_dirichlet(self, shape: tuple, weights: torch.Tensor | float = 1.0, sharpness: float = 1.0) -> torch.Tensor:
         w = torch.ones(shape, device= self.device) * torch.as_tensor(weights, device= self.device)
         alpha = w.softmax(-1) * sharpness
         return torch._sample_dirichlet(alpha, generator=self.generator)
 
-    def sample_masking_rates(self, rate_cfg: dict):
-        N = self.world_cfg.num_tokens
+    def sample_multinomial(self, weight: torch.Tensor, rate: int):
+        '''Samples from a multinomial distribution parameterized by the outer product of priors and rate'''
+        return torch.multinomial(weight, rate, replacement=False, generator=self.generator)
+
+    def sample_trunc_normal(self, mean, std, a, b):
         rate = torch.empty((1,), device = self.device)
-        if rate_cfg["std"] > 0:
-            rate = torch.nn.init.trunc_normal_(rate, **rate_cfg, generator=self.generator)
-        else:
-            rate = rate.fill_(rate_cfg["mean"])
-        return int(N * rate.item())
-   
-    def sample_mask(self, priors, rate):
-        layout = self.flatland_token_layout
-        layout_axes = set(layout) | {"b"}
-        keys, tensors = [], []
-        for key, prior in priors.items():
-            if set(key).issubset(layout_axes):
-                keys.append(key)
-                tensors.append(prior(self))
-        lhs = ",".join(keys)
-        rhs = "b" + "".join(layout) if "b" in "".join(keys) else "".join(layout)
-        joint = torch.einsum(f"{lhs}->{rhs}", *tensors)
-        return torch.multinomial(joint.flatten(1), rate, replacement=False, generator=self.generator)
-    
-    def sample_tgt_masks(self):
-        return self.get_flatland_index()
+        if std > 0:
+            return torch.nn.init.trunc_normal_(rate, mean=mean,std=std,a=a, b=b, generator=self.generator)
+        return rate.fill_(mean)
+        
+    @staticmethod
+    def compose_einsum_prior(prior_registry: dict[Callable], layout: list) -> torch.Tensor:
+        '''Computes the outer product over a set of priors obtained from the registry and contracts it to the layout.'''
+        # read the registry
+        dims, einsum_args = [], []
+        for d, fn in prior_registry.items():
+            dims.append(d)
+            einsum_args.append(fn())
+
+        # dynamically create patterns
+        einsum_lhs = ",".join(dims)
+        layout_str = " ".join(layout) # the whitespace is important here
+        has_batch = any("b" in x for x in einsum_lhs)
+        einsum_rhs = "b"+" "+ layout_str if has_batch else layout_str # the whitespace is important here
+        flat_shape = f"b ({layout_str})" if has_batch else f"({layout_str})"
+        
+        #compute outer product and flatten
+        prior = torch.einsum(f"{einsum_lhs}->{einsum_rhs}", *einsum_args)
+        flat = rearrange(prior, f"{einsum_rhs} -> {flat_shape}")
+        return flat
 
     def apply_masks(self, tokens, src_mask, tgt_mask):
         _, _, D = tokens.size()
@@ -86,7 +131,8 @@ class MaskingMixin:
         lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
         return src, tgt, lsm
 
-    ### TOKEN PROPERTIES
+### TOKEN PROPERTIES
+class TokenMixin:
     @property
     def flatland_pattern(self):
         return 'b (t v h w) (tt hh ww) ...'
@@ -115,6 +161,7 @@ class MaskingMixin:
     @property
     def field_sizes(self):
         return {
+            'b': self.batch_size,
             'v': len(self.data_cfg.variables),
             't': self.data_cfg.sequence_length,
             'h': self.data_cfg.grid_size["lat"],
@@ -134,7 +181,7 @@ class MaskingMixin:
         # sizes after patching
         return {
             k: self.field_sizes[k] // self.patch_sizes.get(f"{k*2}", 1)
-            for k in ["t", "v", "h", "w"]
+            for k in ["b", "t", "v", "h", "w"]
         }
     
     @staticmethod
@@ -155,8 +202,8 @@ class MaskingMixin:
         return B, N, D
     
     def get_flatland_index(self):
-        B, N, _ = self.get_flatland_shape
-        return torch.arange(N, device = self.device).expand(B, -1)
+        B, N, _ = self.get_flatland_shape()
+        return repeat(torch.arange(N, device = self.device), "n -> b n", b = B)
     
     # TOKENIZERS
     def field_to_tokens(self, field):
@@ -198,6 +245,7 @@ class MaskingMixin:
         idx = sum(coords[..., i] * strides[layout[i]] for i in range(len(layout)))
         return idx 
     
+### ENSO DATA
 class OceanMixin:
     @property
     def land_sea_mask(self):
@@ -227,6 +275,7 @@ class OceanMixin:
             self._oras5_data = NinoData(self.cfg.oras5_path, self.data_cfg)
         return self._oras5_data
 
+### METRICS
 class MetricsMixin:
     def compute_rapsd(self, tokens: torch.Tensor):
         x = self.tokens_to_spatial(tokens)
@@ -252,6 +301,13 @@ class MetricsMixin:
     def compute_ign(self, pred: torch.Tensor, obs: torch.Tensor):
         ign = f_gaussian_ignorance(observation=obs, mu=pred.mean(-1), sigma=pred.std(-1))
         return ign.nanmean()
+    
+    def compute_spectral_crps(self, pred: torch.Tensor, obs: torch.Tensor, fair: bool = True):
+        with torch.autocast(device_type=self.device_type, enabled=False):
+            pred_spectrum = torch.fft.rfft2(self.tokens_to_spatial(pred.float())).view_as_real()
+            obs_spectrum = torch.fft.rfft2(self.tokens_to_spatial(obs.float())).view_as_real()
+        pred_spectrum = rearrange(pred_spectrum, "(e bb) ... -> bb ... e", e = pred.size(-1))
+        return f_kernel_crps(observation= obs_spectrum, ensemble= pred_spectrum, fair= fair)
 
     @staticmethod
     def compute_spread(ens_pred: torch.Tensor):
@@ -299,6 +355,7 @@ class MetricsMixin:
     def ensemble_metrics(self, ens_pred: torch.Tensor, obs: torch.Tensor, label: str = None):
         E = ens_pred.size(-1)
         crps = self.compute_crps(pred=ens_pred, obs=obs)
+        spectral_crps = self.compute_spectral_crps(pred= ens_pred, obs = obs, fair = True)
         ssr = self.compute_spread_skill(pred=ens_pred, obs=obs)
         ign = self.compute_ign(pred=ens_pred, obs=obs)
         spread = self.compute_spread(ens_pred=ens_pred)
@@ -306,6 +363,7 @@ class MetricsMixin:
         member_rmse = torch.as_tensor([self.compute_rmse(ens_pred[..., e], obs) for e in range(E)]).mean()
 
         self.current_metrics.log_metric(f"{label}_crps" if self.exists(label) else "crps", crps.item())
+        self.current_metrics.log_metric(f"{label}_spect_crps" if self.exists(label) else "spect_crps", spectral_crps.item())
         self.current_metrics.log_metric(f"{label}_ssr" if self.exists(label) else "ssr", ssr.item())
         self.current_metrics.log_metric(f"{label}_ign" if self.exists(label) else "ign", ign.item())
         self.current_metrics.log_metric(f"{label}_spread" if self.exists(label) else "spread", spread.item())
@@ -328,17 +386,6 @@ class MetricsMixin:
         else:
             self.deterministic_metrics(pred, obs, label)
 
-    def get_spectral_metrics(self, pred: torch.Tensor, obs: torch.Tensor, label: str = None):
-        obs_psd = self.compute_rapsd(obs)
-        pred_psd = self.compute_rapsd(pred)
-        label = f"{label}_spectral" if self.exists(label) else "spectral"
-
-        if obs.ndim < pred.ndim:
-            pred_psd = rearrange(pred_psd, "(e bb) ... -> bb ... e", e=pred.size(-1))
-            self.ensemble_metrics(ens_pred=pred_psd, obs=obs_psd, label=label)
-        else:
-            self.deterministic_metrics(pred=pred_psd, obs=obs_psd)
-
     @staticmethod
     def _slice_from_cfg(s):
         if isinstance(s, dict):
@@ -359,7 +406,7 @@ class MetricsMixin:
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
 ### Trainer
-class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin):
+class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, MaskingMixin):
     # PROPERTIES
     @property
     def cfg(self):
@@ -459,10 +506,7 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin):
     def create_loss(self):
         def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
             # spectral_crps
-            obs_psd= self.compute_rapsd(obs)
-            pred_psd = self.compute_rapsd(pred)
-            pred_psd = rearrange(pred_psd, "(e bb) ... -> bb ... e", e = pred.size(-1))
-            spectral_crps = f_kernel_crps(observation=obs_psd, ensemble=pred_psd, fair= self.use_fair_crps)
+            spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
             # pointwise crps
             point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
             # apply land-sea mask
@@ -470,7 +514,7 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin):
             # reduce to scalar
             return point_crps.nanmean() + 1e-3 * spectral_crps.nanmean()
         return loss
-    
+
     # MODEL
     def create_model(self):
         model = StochasticWeatherField(self.model_cfg)      
@@ -480,3 +524,70 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin):
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
         return model
+    
+    ### FORWARD
+    def forward_step(self, batch_idx, batch):
+        if self.mode == "train":
+            return self.step(batch_idx, batch)
+        else:
+            _ = self.step(batch_idx, batch)
+            _ = self.step(batch_idx, batch, task = "frcst")
+            return None
+
+    def step(self, batch_idx, batch, task: str = "train"):
+        """
+        Performs a forward pass and returns the loss.
+        """
+        # to device and tokenize
+        tokens = self.field_to_tokens(batch.to(self.device))
+        
+        # masking
+        src_mask, tgt_mask = self.get_masks(task)
+        src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask)
+        
+        # convert flat indices to coordinates
+        src_mask = self.index_to_coords(src_mask)
+        tgt_mask = self.index_to_coords(tgt_mask)
+        
+        # expand src, tgt, lsm for ensemble
+        src, src_mask, tgt_mask = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_mask, tgt_mask))
+        
+        # forward
+        with sdpa_kernel(self.backend):
+            tgt_pred = self.model(src, src_mask, tgt_mask, num_steps=1)
+
+        # split out ensemble dimension(s) if necessary
+        tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
+            
+        # compute loss
+        loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
+
+
+        # metrics
+        if task == "train":
+            self.current_metrics.log_metric(f"loss", loss.item())
+            self.compute_metrics(pred = tgt_pred, obs = tgt, lsm = lsm, label = None)
+        elif task == "frcst":
+            self.get_frcst_metrics(pred = tgt_pred, obs = tgt, lsm = lsm)
+        
+        return loss
+
+def main():
+    parser = argparse.ArgumentParser(description="Train a MIN model")
+    parser.add_argument("--id", type=str, default=None, help="alias for the task id")
+    parser.add_argument("--config", type=str, default="mae.yaml", help="path to the config file")
+    args = parser.parse_args() 
+
+    # task_id for selecting the config overrides
+    task_id = args.id if exists(args.id) else os.environ.get("SLURM_ARRAY_TASK_ID", "0")
+    # Create a config object
+    cfg_file = OmegaConf.load(args.config)
+    merged_cfg = OmegaConf.merge(cfg_file.get("defaults", {}), cfg_file.get(task_id, {})) # order matters here!
+    config = cfg.MTMConfig.from_omegaconf(merged_cfg)
+
+    #Run the trainer
+    trainer = MTMTrainer(config)
+    trainer.train()
+
+if __name__ == "__main__":
+    main()
