@@ -30,106 +30,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 #### MASKING
-class MaskingMixin:
-    @property
-    def frcst_src_prior(self):
-        tau = self.world_cfg.tau
-        prior = torch.ones(self.token_sizes["t"], device = self.device)
-        prior[tau:] = 0
-        return {"t": lambda: prior}
-    
-    @property
-    def frcst_tgt_prior(self):
-        tau = self.world_cfg.tau
-        prior = torch.ones(self.token_sizes["t"], device = self.device)
-        prior[:tau] = 0
-        return {"t": lambda: prior}
 
-    @property
-    def src_priors(self):
-        '''Creates custom priors for any combination of dimensions. Keys must reflect the correct dimensions.'''
-        return {
-            "bt": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["t"]), sharpness=self.world_cfg.alpha),
-            "bv": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["v"])),
-        }
-    
-    @property
-    def tgt_priors(self):
-        return {
-            "bt": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["t"]), sharpness=self.world_cfg.alpha),
-            "bv": lambda: self.sample_dirichlet((self.token_sizes['b'], self.token_sizes["v"]), weights= self.per_variable_weights),
-        }
-
-    @property
-    def uniform_priors(self):
-        '''Creates a uniform prior for each dimension in the token set.'''
-        return {k: lambda K= K: torch.ones((K,), device=self.device) for k, K in self.token_sizes.items()}
-
-    def get_masks(self, task: str):
-        return
-    
-    def get_src_mask(self):
-        rate = self.sample_masking_rates(self.world_cfg.num_tokens, **self.world_cfg.mask_rates_src)
-        prior = self.src_priors()
-        uniform = self.uniform_priors()
-        prior.update(uniform)
-        joint = self.compose_einsum_prior(prior, self.flatland_token_layout)
-        return self.sample_multinomial(joint, rate)
-
-    def get_masking_rate(self, N: int, **kwargs):
-        rate = self.sample_trunc_normal(**kwargs)
-        return int(N * rate.item())
-
-    @staticmethod    
-    def sample_topk(weights: torch.Tensor, k: int):
-        return weights.topk(k, sorted= False).indices
-
-    def sample_dirichlet(self, shape: tuple, weights: torch.Tensor | float = 1.0, sharpness: float = 1.0) -> torch.Tensor:
-        w = torch.ones(shape, device= self.device) * torch.as_tensor(weights, device= self.device)
-        alpha = w.softmax(-1) * sharpness
-        return torch._sample_dirichlet(alpha, generator=self.generator)
-
-    def sample_multinomial(self, weight: torch.Tensor, rate: int):
-        '''Samples from a multinomial distribution parameterized by the outer product of priors and rate'''
-        return torch.multinomial(weight, rate, replacement=False, generator=self.generator)
-
-    def sample_trunc_normal(self, mean, std, a, b):
-        rate = torch.empty((1,), device = self.device)
-        if std > 0:
-            return torch.nn.init.trunc_normal_(rate, mean=mean,std=std,a=a, b=b, generator=self.generator)
-        return rate.fill_(mean)
-        
-    @staticmethod
-    def compose_einsum_prior(prior_registry: dict[Callable], layout: list) -> torch.Tensor:
-        '''Computes the outer product over a set of priors obtained from the registry and contracts it to the layout.'''
-        # read the registry
-        dims, einsum_args = [], []
-        for d, fn in prior_registry.items():
-            dims.append(d)
-            einsum_args.append(fn())
-
-        # dynamically create patterns
-        einsum_lhs = ",".join(dims)
-        layout_str = " ".join(layout) # the whitespace is important here
-        has_batch = any("b" in x for x in einsum_lhs)
-        einsum_rhs = "b"+" "+ layout_str if has_batch else layout_str # the whitespace is important here
-        flat_shape = f"b ({layout_str})" if has_batch else f"({layout_str})"
-        
-        #compute outer product and flatten
-        prior = torch.einsum(f"{einsum_lhs}->{einsum_rhs}", *einsum_args)
-        flat = rearrange(prior, f"{einsum_rhs} -> {flat_shape}")
-        return flat
-
-    def apply_masks(self, tokens, src_mask, tgt_mask):
-        _, _, D = tokens.size()
-        # src masks
-        expanded_src_mask = repeat(src_mask, 'b n -> b n d', d = D)
-        src = tokens.gather(1, expanded_src_mask)
-        # tgt masks
-        expanded_tgt_mask = repeat(tgt_mask, 'b n -> b n d', d = D)        
-        tgt = tokens.gather(1, expanded_tgt_mask)
-        lsm = self.land_sea_mask.gather(1, expanded_tgt_mask)
-        return src, tgt, lsm
 
 ### TOKEN PROPERTIES
 class TokenMixin:
@@ -181,7 +82,7 @@ class TokenMixin:
         # sizes after patching
         return {
             k: self.field_sizes[k] // self.patch_sizes.get(f"{k*2}", 1)
-            for k in ["b", "t", "v", "h", "w"]
+            for k in self.field_sizes.keys()
         }
     
     @staticmethod
