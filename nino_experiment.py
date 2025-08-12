@@ -5,8 +5,8 @@ import argparse
 import math
 
 from dataclasses import replace
-from typing import Callable
-from einops import rearrange, repeat
+from typing import Callable, Tuple, Optional, Iterable
+from einops import rearrange, repeat, pack, unpack, einsum
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
@@ -30,7 +30,105 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 #### MASKING
+class SamplingMixin:
+    # sizes
+    def sizes_of(self, axes: Tuple[str, ...]):
+        return {a: self.sizes[a] for a in axes}
+    
+    def shape_of(self, axes: Tuple[str, ...]):
+        return tuple(self.sizes.get(a, 1) for a in axes)
 
+    def measure(self, axes: Tuple[str, ...]) -> int:
+        m = 1
+        for a in axes: m *= int(self.sizes[a])
+        return m
+    
+    def k_from_rate(self, rate: torch.Tensor | float, axes: Tuple[str, ...]) -> int:
+        m = self.measure(axes)
+        return int(max(1, min(m, round(float(rate) * m))))
+
+    # generators
+    def constant(self, axes: Tuple[str, ...], val=1.):
+        return torch.as_tensor(val, device=self.device).broadcast_to(self.shape_of(axes)).rename(*axes)
+    
+    def dirichlet(self, axes: Tuple[str, ...], logits=1.0, sharpness=1.0):
+        alpha = sharpness * self.constant(axes, logits).softmax(-1)
+        return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*axes)
+    
+    def trunc_normal(self, axes: Tuple[str, ...], mean=0., std=0., a=0., b=1.):
+        w = torch.empty(self.shape_of(axes), device=self.device)
+        w = torch.nn.init.trunc_normal_(w, mean=mean, std=std, a=a, b=b, generator=self.generator) if std > 0 else w.fill_(mean)
+        return w.rename(*axes)
+    
+    def uniform(self, axes: Tuple[str, ...]):
+        return torch.rand(self.shape_of(axes), device=self.device, generator=self.generator).rename(*axes)
+    
+    # product/contract
+    def marginalize(self, factors: Iterable[torch.Tensor], axes: Tuple[str, ...]):
+        #multiply factors, then sum out non-A axes; missing axes are unit factors.
+        fs = tuple(factors)
+        names = {n for f in fs for n in f.names if n is not None}
+        missing = tuple(ax for ax in axes if ax not in names)
+        plates = tuple(self.constant((ax,)) for ax in missing)
+        inputs = fs + plates
+        args = tuple(f.rename(None) for f in inputs)
+        lhs  = ",".join(" ".join(f.names) for f in inputs)
+        rhs = " ".join(axes)
+        return einsum(*args, f"{lhs} -> {rhs}").rename(*axes)
+
+    # indicator from indices
+    def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
+        return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
+
+    # packing/unpacking events
+    def pack(self, factor: torch.Tensor, axes: Tuple[str, ...]):
+        event_axes = tuple(axes)
+        plate_axes = tuple(n for n in factor.names if n not in axes)
+        pattern = (" ".join(plate_axes) + " *")
+        x = factor.align_to(*(plate_axes + event_axes)).rename(None)
+        flat, _ = pack([x], pattern)  # shape: (∏plate, ∏event)
+        return flat.rename(*(plate_axes + ("event",)))
+
+    def unpack(self, factor: torch.Tensor, axes: Tuple[str, ...]):
+        event_axes = tuple(axes)
+        plate_axes = tuple(n for n in factor.names if n != "event")
+        pattern = (" ".join(plate_axes) + " *")
+        [restored] = unpack(factor.rename(None), pattern = pattern, packed_shapes=[self.shape_of(event_axes)])
+        return restored.rename(*(plate_axes + event_axes))
+    
+    # ---- selection and conditioning ----
+    def select(self, factor: torch.Tensor, k: int, axis: str = "event", method: str = "topk"):
+        # select k from factor
+        plate_axes = tuple(n for n in factor.names if n != axis)
+        plates = " ".join(plate_axes) or ""
+        f = factor.align_to(*(plate_axes + (axis,))).rename(None)
+        f = rearrange(f, f"... ax  -> (...) ax")
+        idcs = f.topk(k, sorted=False, dim=-1).indices if method == "topk" else torch.multinomial(f, k, replacement=False, generator=self.generator)
+        idcs = rearrange(idcs, f"({plates}) ax -> {plates} ax", **self.sizes_of(plate_axes))
+        return idcs.rename(*(plate_axes + ("event",)))
+    
+    def take(self, factor: torch.Tensor, idx: torch.LongTensor, axis: str = "event"):
+        # gather with N-d index
+        dim = factor.names.index(axis)
+        out_names = tuple("event" if n == axis else n for n in factor.names)
+        out_shape = tuple(idx.size("event") if n == axis else factor.size(n) for n in factor.names)
+        idx = idx.align_to(*out_names).rename(None).expand(out_shape)
+        gathered = torch.gather(factor.rename(None), dim=dim, index=idx)
+        return gathered.rename(*out_names)
+    
+    # helpers
+    def get_index(self, factor: torch.Tensor, axes: Tuple[str,...], rate: float, method: str = "multinomial"):
+        packed = self.pack(factor, axes)
+        k = self.k_from_rate(rate, axes)
+        idx = self.select(packed, k, method = method)
+        return idx
+
+    def get_binary(self, factor: torch.Tensor, axes: Tuple[str,...], rate: float, method: str = "multinomial"):
+        packed = self.pack(factor, axes)
+        k = self.k_from_rate(rate, axes)
+        idx = self.select(packed, k, method = method)
+        bin = self.unpack(self.indicator(packed, idx), axes)
+        return bin
 
 ### TOKEN PROPERTIES
 class TokenMixin:
@@ -307,7 +405,7 @@ class MetricsMixin:
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
 ### Trainer
-class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, MaskingMixin):
+class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin):
     # PROPERTIES
     @property
     def cfg(self):
@@ -425,7 +523,14 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, Maski
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
         return model
+    ### Masking
+
+    def get_masks(self, task):
+        return
     
+    def apply_masks(self, *args):
+        return 
+
     ### FORWARD
     def forward_step(self, batch_idx, batch):
         if self.mode == "train":
