@@ -78,10 +78,12 @@ class SamplingMixin:
 
     # indicator from indices
     def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
+        # get a [0,1] indicator on the indices
         return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
 
     # packing/unpacking events
     def pack(self, factor: torch.Tensor, axes: Tuple[str, ...]):
+        # packs a set of axes into an event dimension and moves it to the end of the tensor
         event_axes = tuple(axes)
         plate_axes = tuple(n for n in factor.names if n not in axes)
         pattern = (" ".join(plate_axes) + " *")
@@ -90,6 +92,7 @@ class SamplingMixin:
         return flat.rename(*(plate_axes + ("event",)))
 
     def unpack(self, factor: torch.Tensor, axes: Tuple[str, ...]):
+        # unpack a full event dimension into its parts, assuming axes is the tuple that was used for packing
         event_axes = tuple(axes)
         plate_axes = tuple(n for n in factor.names if n != "event")
         pattern = (" ".join(plate_axes) + " *")
@@ -118,12 +121,14 @@ class SamplingMixin:
     
     # helpers
     def get_index(self, factor: torch.Tensor, axes: Tuple[str,...], rate: float, method: str = "multinomial"):
+        # returns index in event space
         packed = self.pack(factor, axes)
         k = self.k_from_rate(rate, axes)
         idx = self.select(packed, k, method = method)
         return idx
 
     def get_binary(self, factor: torch.Tensor, axes: Tuple[str,...], rate: float, method: str = "multinomial"):
+        #returns binary mask in the original space
         packed = self.pack(factor, axes)
         k = self.k_from_rate(rate, axes)
         idx = self.select(packed, k, method = method)
