@@ -3,19 +3,18 @@ import torch
 import os
 import argparse
 import math
-
-from dataclasses import replace
-from typing import Callable, Tuple, Optional, Iterable
 import einops
-from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.data import DataLoader
-from omegaconf import OmegaConf
 
 import utils.config as cfg
 
+from dataclasses import replace
+from functools import cached_property
+from omegaconf import OmegaConf
+from typing import Tuple, Iterable
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
 from utils.loss_fn import f_kernel_crps, f_gaussian_ignorance
 from utils.field_network import StochasticWeatherField
-
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
 
@@ -29,51 +28,222 @@ def default(val, d):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+### Trainer
+class TrainerMixin(DistributedTrainer):
+    # PROPERTIES
+    @property
+    def cfg(self):
+        return self._cfg.trainer
+    
+    @property
+    def optim_cfg(self):
+        return self._cfg.optim
+
+    @property
+    def data_cfg(self):
+        return self._cfg.data
+
+    @property
+    def model_cfg(self):
+        return self._cfg.model.decoder
+    
+    @property
+    def world_cfg(self):
+        return self._cfg.world
+    
+    @property
+    def batch_size(self):
+        return self.optim_cfg.batch_size
+
+    @property
+    def backend(self):
+         return SDPBackend.FLASH_ATTENTION if torch.cuda.get_device_capability()[0] >= 8 else SDPBackend.EFFICIENT_ATTENTION
+    
+    @property
+    def use_fair_crps(self):
+        return self.world_cfg.num_ens > 1
+    
+    # DATA
+    def create_dataset(self):
+        # instantiate datasets
+        self.train_dataset = self.lens_data()
+        self.val_dataset = self.godas_data() if self.data_cfg.eval_data == "godas" else self.picontrol_data()
+        
+        # create land-sea mask
+        self._val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
+        self._train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
+
+        # dataloaders
+        train_dl = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            shuffle=True,
+        )
+
+        val_dl = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        return train_dl, val_dl
+
+    # SETUP
+    def create_job_name(self):
+        if exists(self.cfg.job_name):
+            base_name = str(self.cfg.job_name).replace('/', '_')
+        else:
+            base_name = self.slurm_id
+        self.job_name = f"{base_name}"
+        self.cfg.job_name = self.job_name # enables resuming from config by using the job name
+    
+    # OPTIMIZATION
+    def create_optimizer(self, named_params):
+        return torch.optim.AdamW(
+            named_params,
+            lr=self.optim_cfg.lr,
+            weight_decay=self.optim_cfg.weight_decay,
+            betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+            #decoupled_weight_decay=True,
+        )
+
+    def create_scheduler(self, optimizer):
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.optim_cfg.num_epochs,
+            eta_min=self.optim_cfg.eta_min,
+            last_epoch=-1,
+        )
+
+    # MODEL
+    def create_model(self):
+        model = StochasticWeatherField(self.model_cfg)      
+        if hasattr(model, "generator"):
+            model.generator = self.generator
+        count = count_parameters(model)
+        print(f'Created model with {count:,} parameters')
+        self.misc_metrics.log_python_object("num_params", count)
+        return model
+    
+    # LOSS
+    def create_loss(self):
+        def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
+            # spectral_crps
+            spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
+            # pointwise crps
+            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
+            # apply land-sea mask
+            point_crps = point_crps[lsm]
+            # reduce to scalar
+            return point_crps.nanmean() + 1e-4 * spectral_crps.nanmean()
+        return loss
+    
+    ### FORWARD
+    def forward_step(self, batch_idx, batch):
+        if self.mode == "train":
+            return self.step(batch_idx, batch)
+        else:
+            _ = self.step(batch_idx, batch)
+            _ = self.step(batch_idx, batch, task = "frcst")
+            return None
+
+###
+class ShapeMixin:
+    # HELPERS
+    @staticmethod
+    def _as_factors(factors):
+        if isinstance(factors, torch.Tensor):
+            return (factors,)
+        # allow generator/iterable
+        return tuple(factors)
+
+    @staticmethod
+    def _as_axes(axes) -> Tuple[str, ...]:
+        return (axes,) if isinstance(axes, str) else tuple(axes)
+    
+    def sizes_of(self, axes: Iterable[str] | str) -> dict:
+        A = self._as_axes(axes)
+        return {a: self.sizes.get(a, 1) for a in A}
+
+    def shape_of(self, axes: Iterable[str] | str) -> Tuple[int]:
+        A = self._as_axes(axes)
+        return tuple(self.sizes.get(a, 1) for a in A)
+    
+    # LAYOUT
+    @cached_property
+    def token_layout(self):
+        return self._as_axes(self.world_cfg.token_layout)
+    
+    @cached_property
+    def plate_layout(self):
+        return self._as_axes(self.world_cfg.plate_layout)
+    
+    @cached_property
+    def patch_layout(self):
+        return self._as_axes(self.world_cfg.patch_layout)
+       
+    @cached_property
+    def patch_sizes(self):
+        # Return patch sizes per axis (default to 1)
+        return {
+            k: self.world_cfg.patch_cfg.get(k, 1)
+            for k in self.patch_layout
+        }
+    
+    @cached_property
+    def token_sizes(self):
+        # sizes after patching
+        return {
+            k: self.world_cfg.field_cfg[k] // self.world_cfg.patch_cfg.get(f"{k*2}", 1)
+            for k in self.token_layout
+        }
+    
+    @cached_property
+    def plate_sizes(self):
+        return {k: self.world_cfg.field_cfg[k] for k in self.plate_layout}
+
+    @cached_property
+    def sizes(self):
+        return {**self.plate_sizes, **self.token_sizes, **self.patch_sizes}
+
 #### MASKING
 class SamplingMixin:
-    def _as_axes(self, axes) -> Tuple[str, ...]:
-        return (axes,) if isinstance(axes, str) else tuple(axes)
-
-    def sizes_of(self, axes: Iterable[str] | str):
-        A = self._as_axes(axes)
-        return {a: self.token_sizes.get(a, 1) for a in A}
-
-    def shape_of(self, axes: Iterable[str] | str):
-        A = self._as_axes(axes)
-        return tuple(self.token_sizes.get(a, 1) for a in A)
-
-    def measure(self, axes: Iterable[str] | str) -> int:
+    def measure(self, axes: Iterable[str]) -> int:
         return math.prod(self.shape_of(axes))
 
-    def k_from_rate(self, rate: float, axes: Iterable[str] | str) -> int:
+    def k_from_rate(self, rate: float, axes: Iterable[str]) -> int:
         m = self.measure(axes)
         return int(max(0, min(m, int(rate * m))))
 
     # generators
-    def constant(self, axes: Iterable[str] | str, val=1.):
+    def constant(self, axes: Iterable[str], val=1.):
         A = self._as_axes(axes)
-        return torch.as_tensor(val, device=self.device).broadcast_to(self.shape_of(A)).rename(*A)
+        return torch.as_tensor(val, device=self.device, dtype = torch.float).broadcast_to(self.shape_of(A)).rename(*A)
 
-    def dirichlet(self, axes: Iterable[str] | str, logits=1.0, sharpness=1.0):
+    def dirichlet(self, axes: Iterable[str], logits=1.0, sharpness=1.0):
         A = self._as_axes(axes)
         alpha = sharpness * self.constant(A, logits).softmax(-1)
         return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*A)
 
-    def trunc_normal(self, axes: Iterable[str] | str, mean=0., std=0., a=0., b=1.):
+    def trunc_normal(self, axes: Iterable[str], mean=0., std=0., a=0., b=1.):
         A = self._as_axes(axes)
         w = torch.empty(self.shape_of(A), device=self.device)
         w = torch.nn.init.trunc_normal_(w, mean=mean, std=std, a=a, b=b, generator=self.generator) if std > 0 else w.fill_(mean)
         return w.rename(*A)
 
-    def uniform(self, axes: Iterable[str] | str):
+    def uniform(self, axes: Iterable[str]):
         A = self._as_axes(axes)
         return torch.rand(self.shape_of(A), device=self.device, generator=self.generator).rename(*A)
 
     # product/contract
-    def marginalize(self, factors: Iterable[torch.Tensor], axes: Iterable[str] | str):
-        A = self._as_axes(axes)
-        F = self._as_axes(factors)
+    def marginalize(self, factors: Iterable[torch.Tensor], axes: Iterable[str]):
+        F = self._as_factors(factors)
         names = {n for f in F for n in f.names if exists(n)}
+        A = self._as_axes(axes)
         plates = tuple(self.constant(ax) for ax in A if ax not in names)
         inputs = F + plates
         args = tuple(f.rename(None) for f in inputs)
@@ -81,12 +251,12 @@ class SamplingMixin:
         rhs  = " ".join(A)
         return einops.einsum(*args, f"{lhs} -> {rhs}").rename(*A)
 
-    # indicator from indices
+    # indicator from index
     def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
         return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
 
     # packing/unpacking events
-    def pack(self, factor: torch.Tensor, axes: Iterable[str] | str):
+    def pack(self, factor: torch.Tensor, axes: Iterable[str]):
         A = self._as_axes(axes)
         plate = tuple(n for n in factor.names if n not in A)
         x = factor.align_to(*(plate + A)).rename(None)
@@ -94,7 +264,7 @@ class SamplingMixin:
         flat, _ = einops.pack([x], pattern)
         return flat.rename(*(plate + ("event",)))
 
-    def unpack(self, factor: torch.Tensor, axes: Iterable[str] | str):
+    def unpack(self, factor: torch.Tensor, axes: Iterable[str]):
         A = self._as_axes(axes)
         plate = tuple(n for n in factor.names if n != "event")
         pattern = (" ".join(plate) + " *").strip()
@@ -122,55 +292,23 @@ class SamplingMixin:
         gathered = torch.gather(factor.rename(None), dim=dim, index=idx)
         return gathered.rename(*out_names)
 
-    # helpers
-    def get_index(self, factor: torch.Tensor, axes: Iterable[str] | str, rate: float, method: str = "multinomial"):
-        A = self._as_axes(axes)
-        packed = self.pack(factor, A)
-        k = self.k_from_rate(rate, A)
-        return self.select(packed, k, method=method)
-
-    def get_binary(self, factor: torch.Tensor, axes: Iterable[str] | str, rate: float, method: str = "multinomial"):
-        A = self._as_axes(axes)
-        packed = self.pack(factor, A)
-        k = self.k_from_rate(rate, A)
-        idx = self.select(packed, k, method=method)
-        return self.unpack(self.indicator(packed, idx), A)
-
-### TOKEN PROPERTIES
-class TokenMixin:    
+### TOKENIZATION
+class TokenMixin:       
+    # PATTERNS
     @property
     def lsm_pattern(self):
-        return '1 (h hh) (w ww)'
+        return '1 (h hh) (w ww) ...'
 
     @property
     def field_pattern(self):
         return 'b (v vv) (t tt) (h hh) (w ww) ...'    
 
     @property
-    def spatial_only_pattern(self):
-        return '(... b v vv t tt) (h hh) (w ww)'
-    
-    @property
     def flatland_pattern(self) -> str:
+        plates = ' '.join(self.plate_layout)
         tokens = ' '.join(self.token_layout)
         patches = ' '.join(self.patch_layout)
-        return f'b ({tokens}) ({patches}) ...'
-
-    @property
-    def patch_sizes(self):
-        # Return patch sizes per axis (default to 1)
-        return {
-            k: self.patch_cfg.get(k, 1)
-            for k in self.patch_layout
-        }
-    
-    @property
-    def token_sizes(self):
-        # sizes after patching
-        return {
-            k: self.field_cfg[k] // self.patch_cfg.get(f"{k*2}", 1)
-            for k in self.token_layout
-        }
+        return f'({plates}) ({tokens}) ({patches}) ...'    
 
     # SHAPES
     def get_flatland_shape(self):
@@ -189,20 +327,15 @@ class TokenMixin:
                                 f'{self.field_pattern} -> {self.flatland_pattern}', 
                                 **self.token_sizes, **self.patch_sizes)
     
-    def field_to_spatial(self, field):
-        return einops.rearrange(field.rename(None), 
-                                f"{self.field_pattern} -> {self.spatial_only_pattern}", 
-                                **self.patch_sizes)
-    
-    def tokens_to_field(self, tokens):
-        return einops.rearrange(tokens.rename(None), 
-                                f'{self.flatland_pattern} -> {self.field_pattern}', 
-                                **self.token_sizes, **self.patch_sizes)
+    def frcst_to_field(self, tokens):
+        lhs, rhs = 'b (t v h w) (tt vv hh ww) ...', 'b (v vv) (t tt) (h hh) (w ww) ...'
+        valid_axes = ('h', 'w', 'v') + self.patch_layout # need to ensure that we only query spatial and variable sizes
+        return einops.rearrange(tokens.rename(None), f'{lhs} -> {rhs}', **{ax: self.sizes[ax] for ax in valid_axes})
 
-    def tokens_to_spatial(self, tokens):
-        return einops.rearrange(tokens.rename(None), 
-                                f'{self.flatland_pattern} -> {self.spatial_only_pattern}', 
-                                **self.token_sizes, **self.patch_sizes)
+    def masked_to_spatial(self, tokens):
+        lhs, rhs = 'b (m h w) (d hh ww) ...', '(... b m d) (h hh) (w ww)' # use dummy names for the masked parts
+        valid_axes = ('h', 'w', 'hh','ww') # need to ensure that we only query spatial sizes
+        return einops.rearrange(tokens.rename(None), f'{lhs} -> {rhs}', **{ax: self.sizes[ax] for ax in valid_axes})
 
     # COORDINATE TRANSFORMS
     @staticmethod
@@ -218,7 +351,7 @@ class TokenMixin:
         sizes = sizes if exists(sizes) else self.token_sizes
         layout = layout if exists(layout) else self.token_layout
         strides = self.compute_strides(sizes, layout)
-        rem = idx_flat
+        rem = idx_flat.rename(None)
         coords = []
         for ax in layout:
             val = rem.div(strides[ax], rounding_mode="floor")
@@ -240,7 +373,7 @@ class OceanMixin:
     def land_sea_mask(self):
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
         return einops.repeat(lsm, f"{self.lsm_pattern} -> {self.flatland_pattern}", 
-                      **self.field_sizes, **self.patch_sizes, b = self.batch_size)
+                      **self.token_sizes, **self.patch_sizes, b = self.batch_size)
     
     def lens_data(self):
         if not hasattr(self, "_lens_data"):
@@ -267,7 +400,7 @@ class OceanMixin:
 ### METRICS
 class MetricsMixin:
     def compute_rapsd(self, tokens: torch.Tensor):
-        x = self.tokens_to_spatial(tokens)
+        x = self.masked_to_spatial(tokens)
         with torch.autocast(device_type=self.device_type, enabled=False):
             rapsd = self.rapsd(x.float())
             rapsd = torch.clamp(rapsd, min=1e-8).log10()
@@ -293,8 +426,8 @@ class MetricsMixin:
     
     def compute_spectral_crps(self, pred: torch.Tensor, obs: torch.Tensor, fair: bool = True):
         with torch.autocast(device_type=self.device_type, enabled=False):
-            pred_spectrum = torch.fft.rfft2(self.tokens_to_spatial(pred.float())).view_as_real()
-            obs_spectrum = torch.fft.rfft2(self.tokens_to_spatial(obs.float())).view_as_real()
+            pred_spectrum = torch.fft.rfft2(self.masked_to_spatial(pred.float()))#.view_as_real()
+            obs_spectrum = torch.fft.rfft2(self.masked_to_spatial(obs.float()))#.view_as_real()
         pred_spectrum = einops.rearrange(pred_spectrum, "(e bb) ... -> bb ... e", e = pred.size(-1))
         return f_kernel_crps(observation= obs_spectrum, ensemble= pred_spectrum, fair= fair)
 
@@ -344,26 +477,24 @@ class MetricsMixin:
     def ensemble_metrics(self, ens_pred: torch.Tensor, obs: torch.Tensor, label: str = None):
         E = ens_pred.size(-1)
         crps = self.compute_crps(pred=ens_pred, obs=obs)
-        spectral_crps = self.compute_spectral_crps(pred= ens_pred, obs = obs, fair = True)
         ssr = self.compute_spread_skill(pred=ens_pred, obs=obs)
         ign = self.compute_ign(pred=ens_pred, obs=obs)
         spread = self.compute_spread(ens_pred=ens_pred)
         member_acc = torch.as_tensor([self.compute_acc(ens_pred[..., e], obs=obs) for e in range(E)]).mean()
         member_rmse = torch.as_tensor([self.compute_rmse(ens_pred[..., e], obs) for e in range(E)]).mean()
 
-        self.current_metrics.log_metric(f"{label}_crps" if self.exists(label) else "crps", crps.item())
-        self.current_metrics.log_metric(f"{label}_spect_crps" if self.exists(label) else "spect_crps", spectral_crps.item())
-        self.current_metrics.log_metric(f"{label}_ssr" if self.exists(label) else "ssr", ssr.item())
-        self.current_metrics.log_metric(f"{label}_ign" if self.exists(label) else "ign", ign.item())
-        self.current_metrics.log_metric(f"{label}_spread" if self.exists(label) else "spread", spread.item())
-        self.current_metrics.log_metric(f"{label}_member_rmse" if self.exists(label) else "member_rmse", member_rmse.item())
-        self.current_metrics.log_metric(f"{label}_member_acc" if self.exists(label) else "member_acc", member_acc.item())
+        self.current_metrics.log_metric(f"{label}_crps" if exists(label) else "crps", crps.item())
+        self.current_metrics.log_metric(f"{label}_ssr" if exists(label) else "ssr", ssr.item())
+        self.current_metrics.log_metric(f"{label}_ign" if exists(label) else "ign", ign.item())
+        self.current_metrics.log_metric(f"{label}_spread" if exists(label) else "spread", spread.item())
+        self.current_metrics.log_metric(f"{label}_member_rmse" if exists(label) else "member_rmse", member_rmse.item())
+        self.current_metrics.log_metric(f"{label}_member_acc" if exists(label) else "member_acc", member_acc.item())
 
     def deterministic_metrics(self, pred: torch.Tensor, obs: torch.Tensor, label: str = None):
         acc = self.compute_acc(pred=pred, obs=obs)
         rmse = self.compute_rmse(pred=pred, obs=obs)
-        self.current_metrics.log_metric(f"{label}_acc" if self.exists(label) else "acc", acc.item())
-        self.current_metrics.log_metric(f"{label}_rmse" if self.exists(label) else "rmse", rmse.item())
+        self.current_metrics.log_metric(f"{label}_acc" if exists(label) else "acc", acc.item())
+        self.current_metrics.log_metric(f"{label}_rmse" if exists(label) else "rmse", rmse.item())
 
     def compute_metrics(self, pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor, label: str = None):
         pred = pred[lsm]
@@ -385,7 +516,7 @@ class MetricsMixin:
             return slice(None)
         
     def get_frcst_metrics(self, pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
-        pred, obs, lsm = (self.tokens_to_field(x) for x in (pred, obs, lsm))
+        pred, obs, lsm = (self.frcst_to_field(x) for x in (pred, obs, lsm))
         frcst_tasks = {"frcst": (slice(None), slice(None))} # default task
         if exists(self.data_cfg.frcst_tasks): # additional tasks from config
             frcst_tasks.update(self.data_cfg.frcst_tasks)
@@ -394,143 +525,89 @@ class MetricsMixin:
             p, o, l = (x[:, vi, ti] for x in (pred, obs, lsm)) # select the task-specific subset
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
-### Trainer
-class TrainerMixin(DistributedTrainer):
-    # PROPERTIES
-    @property
-    def cfg(self):
-        return self._cfg.trainer
-    
-    @property
-    def optim_cfg(self):
-        return self._cfg.optim
-
-    @property
-    def data_cfg(self):
-        return self._cfg.data
-
-    @property
-    def model_cfg(self):
-        return self._cfg.model.decoder
-    
-    @property
-    def world_cfg(self):
-        return self._cfg.world
-    
-    @property
-    def batch_size(self):
-        return self.optim_cfg.batch_size
-
-    @property
-    def backend(self):
-         return SDPBackend.FLASH_ATTENTION if torch.cuda.get_device_capability()[0] >= 8 else SDPBackend.EFFICIENT_ATTENTION
-    
-    @property
-    def use_fair_crps(self):
-        return self.world_cfg.num_ens > 1
-    
-    # DATA
-    def create_dataset(self):
-        # instantiate datasets
-        self.train_dataset = self.lens_data()
-        self.val_dataset = self.godas_data() if self.data_cfg.eval_data == "godas" else self.picontrol_data()
-        
-        # create land-sea mask
-        self._val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
-        self._train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
-
-        # dataloaders
-        train_dl = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.cfg.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            shuffle=True,
-        )
-
-        val_dl = DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.cfg.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-        return train_dl, val_dl
-
-    # SETUP
-    def create_job_name(self):
-        if exists(self.cfg.job_name):
-            base_name = str(self.cfg.job_name).replace('/', '_')
-        else:
-            base_name = self.slurm_id
-        self.job_name = f"{base_name}"
-        self.cfg.job_name = self.job_name # enables resuming from config by using the job name
-    
-    # OPTIMIZATION
-    def create_optimizer(self, named_params):
-        return torch.optim.AdamW(
-            named_params,
-            lr=self.optim_cfg.lr,
-            weight_decay=self.optim_cfg.weight_decay,
-            betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
-            #decoupled_weight_decay=True,
-        )
-
-    def create_scheduler(self, optimizer):
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.optim_cfg.num_epochs,
-            eta_min=self.optim_cfg.eta_min,
-            last_epoch=-1,
-        )
- 
-    # LOSS
-    def create_loss(self):
-        def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
-            # spectral_crps
-            spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
-            # pointwise crps
-            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
-            # apply land-sea mask
-            point_crps = point_crps[lsm]
-            # reduce to scalar
-            return point_crps.nanmean() + 1e-3 * spectral_crps.nanmean()
-        return loss
-
-    # MODEL
-    def create_model(self):
-        model = StochasticWeatherField(self.model_cfg)      
-        if hasattr(model, "generator"):
-            model.generator = self.generator
-        count = count_parameters(model)
-        print(f'Created model with {count:,} parameters')
-        self.misc_metrics.log_python_object("num_params", count)
-        return model
-
-    ### FORWARD
-    def forward_step(self, batch_idx, batch):
-        if self.mode == "train":
-            return self.step(batch_idx, batch)
-        else:
-            _ = self.step(batch_idx, batch)
-            _ = self.step(batch_idx, batch, task = "frcst")
-            return None
-
-class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin):
-    @property
-    def per_variable_weights(self):
-        w = self.data_cfg.weights if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
-        w = torch.tensor(w, device = self.device)
-        return w
-    
+class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin, ShapeMixin):
     ### Masking
+    # HELPERS    
+    def get_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "multinomial"):
+        A = self._as_axes(axes)
+        F = self._as_factors(factors)
+        F = self.marginalize(F, self.plate_layout + A)
+        packed = self.pack(F, A)
+        k = self.k_from_rate(rate, A)
+        return self.select(packed, k, method=method)
+
+    def get_gate(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "topk"):
+        A = self._as_axes(axes)
+        F = self._as_factors(factors)
+        F = self.marginalize(F, self.plate_layout + A)
+        packed = self.pack(F, A)
+        k = self.k_from_rate(rate, A)
+        idx = self.select(packed, k, method=method)
+        binary = self.indicator(packed, idx)
+        return self.unpack(binary, A)
+    
+    def dirichlet_1d(self, d: str):
+        A = self.plate_layout + self._as_axes(d)
+        return self.dirichlet(A, 
+                              sharpness= self.world_cfg.alphas.get(d, 1.), 
+                              logits= self.world_cfg.weights.get(d, 1.))
+    
+    def dirichlet_Nd(self, axes: Iterable[str]):
+        A = self._as_axes(axes)
+        return self.marginalize([self.dirichlet_1d(ax) for ax in A], self.plate_layout + A)
+
+    def split_index(self, axis: str, split_at: int):
+        idx = torch.arange(self.token_sizes[axis], device = self.device).rename(*self._as_axes(axis))
+        front, tail = idx[:split_at], idx[split_at:]
+        return self.indicator(idx, front), self.indicator(idx, tail)
+    
+    ### PRIORS
+    def src_rate(self):
+        cfg = self.world_cfg.mask_rates_src
+        return self.trunc_normal('rate', **cfg) if exists(cfg) else 1.
+    
+    def tgt_rate(self):
+        cfg = self.world_cfg.mask_rates_tgt
+        return self.trunc_normal('rate', **cfg) if exists(cfg) else 1.
+
+    def frcst(self):
+        tau = self.world_cfg.tau 
+        r = tau / self.token_sizes['t']
+        src_gate, tgt_gate = self.split_index('t', tau)
+        src_mask = self.get_index(src_gate, self.token_layout, rate = r, method='topk')
+        tgt_mask = self.get_index(tgt_gate, self.token_layout, rate = 1 - r, method='topk')
+        return src_mask, tgt_mask
+
+    def tgt_prior(self):
+        gate_axes = ('t', 'v')
+        r = self.tgt_rate()
+        gate_prior = self.dirichlet_Nd(gate_axes)
+        gate = self.get_gate(gate_prior, gate_axes, rate= r)
+        mask = self.get_index(gate, self.token_layout, rate = r)
+        return mask
+    
+    def src_prior(self):
+        r = self.src_rate()
+        prior = self.dirichlet_1d('t')
+        mask = self.get_index(prior, self.token_layout, rate = r)
+        return mask
+
     def get_masks(self, task):
-        return
+        if task == 'frcst':
+            return self.frcst()
+        return self.src_prior(), self.tgt_prior()
     
-    def apply_masks(self, *args):
-        return 
-    
+    def apply_masks(self, tokens, src_mask, tgt_mask):
+        # make sure tokens and lsm have the names expected by take
+        tokens = tokens.rename('b', 'event', 'dim')
+        lsm = self.land_sea_mask.rename('b', 'event', 'dim')
+        
+        src = self.take(tokens, src_mask)
+        tgt = self.take(tokens, tgt_mask)
+        lsm = self.take(lsm, tgt_mask)
+        return src.rename(None), tgt.rename(None), lsm.rename(None)
+
+    ### STEP
     def step(self, batch_idx, batch, task: str = "train"):
         """
         Performs a forward pass and returns the loss.
@@ -543,15 +620,15 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask)
         
         # convert flat indices to coordinates
-        src_mask = self.index_to_coords(src_mask)
-        tgt_mask = self.index_to_coords(tgt_mask)
+        src_coords = self.index_to_coords(src_mask)
+        tgt_coords = self.index_to_coords(tgt_mask)
         
         # expand src, tgt, lsm for ensemble
-        src, src_mask, tgt_mask = (einops.repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_mask, tgt_mask))
+        src, src_coords, tgt_mask = (einops.repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_coords, tgt_coords))
         
         # forward
         with sdpa_kernel(self.backend):
-            tgt_pred = self.model(src, src_mask, tgt_mask, num_steps=1)
+            tgt_pred = self.model(src, src_coords, tgt_coords, num_steps=1)
 
         # split out ensemble dimension(s) if necessary
         tgt_pred = einops.rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))

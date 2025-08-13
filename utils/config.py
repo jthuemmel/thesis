@@ -1,6 +1,7 @@
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Sequence
+from typing import List, Dict, Optional, Sequence, Tuple, Dict, Iterable
+
 from omegaconf import OmegaConf
 from math import prod
 
@@ -87,15 +88,53 @@ class DatasetConfig:
     eval_data: str = "picontrol"
     max_dirs: int = 100
 
+
+
 @dataclass
 class WorldConfig:
-    mask_rates_src: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    mask_rates_tgt: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
+    mask_rates_src: Dict = field(default_factory=lambda: {"mean":0.0,"std":1.0,"a":0.0,"b":1.0})
+    mask_rates_tgt: Optional[Dict] = field(default_factory=lambda: {"mean":0.0,"std":1.0,"a":0.0,"b":1.0})
+
+    # forecasting / ensembles
     tau: Optional[int] = None
     num_ens: Optional[int] = None
-    alpha: float = 1.
-    num_tokens: int = 768
-    patch_size: dict = field(default_factory=lambda: {"tt": 2, "hh": 4, "ww": 4})
+
+    # factor priors
+    alphas: Dict[str, float] = field(default_factory=dict)      # e.g. {"t":3., "v":10.}
+    weights: Dict[str, object] = field(default_factory=dict)    # e.g. {"v":[10,1,1,1] or scalar}
+
+    # --- TokenMixin / SamplingMixin scaffolding ---
+    plate_layout: Tuple[str, ...] = field(default_factory=lambda: ('b',))
+    token_layout: Tuple[str, ...] = field(default_factory=lambda: ('t','v','h','w'))
+    patch_layout: Tuple[str, ...] = field(default_factory=lambda: ('tt','vv','hh','ww'))
+
+    # sizes on the *unpatched* field
+    field_cfg: Dict[str, int] = field(default_factory=lambda: {'b':1, 'v':1, 't':1, 'h':1, 'w':1})
+
+    # patch sizes per patched axis (same order/naming as patch_layout)
+    patch_cfg: Dict[str, int] = field(default_factory=lambda: {'tt':1, 'vv':1, 'hh':1, 'ww':1})
+
+    def __post_init__(self):
+        # Layout sanity
+        assert len(set(self.plate_layout)) == len(self.plate_layout)
+        assert len(set(self.token_layout)) == len(self.token_layout)
+        assert len(set(self.patch_layout)) == len(self.patch_layout)
+
+        # Require a 1–1 mapping between token axes and patch axes by name convention: x <-> xx
+        token_to_patch = {ax: ax*2 for ax in self.token_layout}
+        for ax, pax in token_to_patch.items():
+            if pax not in self.patch_layout:
+                raise ValueError(f"Missing patch axis '{pax}' for token axis '{ax}' in patch_layout.")
+            if pax not in self.patch_cfg:
+                raise ValueError(f"Missing patch size for '{pax}' in patch_cfg.")
+
+        # Divisibility: field_cfg[token] % patch_cfg[token*2] == 0
+        for ax in self.token_layout:
+            pax = ax*2
+            fsz = self.field_cfg[ax]
+            psz = self.patch_cfg.get(pax, 1)
+            if fsz % psz != 0:
+                raise ValueError(f"field_cfg['{ax}']={fsz} not divisible by patch_cfg['{pax}']={psz}")
 
 @dataclass
 class ModelConfig:
