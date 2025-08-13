@@ -32,108 +32,113 @@ def count_parameters(model):
 #### MASKING
 class SamplingMixin:
     # sizes
-    def sizes_of(self, axes: Tuple[str, ...]):
-        return {a: self.sizes[a] for a in axes}
-    
-    def shape_of(self, axes: Tuple[str, ...]):
-        return tuple(self.sizes.get(a, 1) for a in axes)
+    def _as_axes(self, axes) -> Tuple[str, ...]:
+        return (axes,) if isinstance(axes, str) else tuple(axes)
 
-    def measure(self, axes: Tuple[str, ...]) -> int:
-        m = 1
-        for a in axes: m *= int(self.sizes[a])
+    def sizes_of(self, axes: Iterable[str] | str):
+        A = self._as_axes(axes)
+        return {a: self.sizes.get(a, 1) for a in A}
+
+    def shape_of(self, axes: Iterable[str] | str):
+        A = self._as_axes(axes)
+        return tuple(self.sizes.get(a, 1) for a in A)
+
+    def measure(self, axes: Iterable[str] | str) -> int:
+        A, m = self._as_axes(axes), 1
+        for a in A: m *= int(self.sizes[a])
         return m
-    
-    def k_from_rate(self, rate: torch.Tensor | float, axes: Tuple[str, ...]) -> int:
+
+    def k_from_rate(self, rate: torch.Tensor | float, axes: Iterable[str] | str) -> int:
         m = self.measure(axes)
-        return int(max(1, min(m, round(float(rate) * m))))
+        return int(max(0, min(m, round(float(rate) * m))))
 
     # generators
-    def constant(self, axes: Tuple[str, ...], val=1.):
-        return torch.as_tensor(val, device=self.device).broadcast_to(self.shape_of(axes)).rename(*axes)
-    
-    def dirichlet(self, axes: Tuple[str, ...], logits=1.0, sharpness=1.0):
-        alpha = sharpness * self.constant(axes, logits).softmax(-1)
-        return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*axes)
-    
-    def trunc_normal(self, axes: Tuple[str, ...], mean=0., std=0., a=0., b=1.):
-        w = torch.empty(self.shape_of(axes), device=self.device)
+    def constant(self, axes: Iterable[str] | str, val=1.):
+        A = self._as_axes(axes)
+        return torch.as_tensor(val, device=self.device).broadcast_to(self.shape_of(A)).rename(*A)
+
+    def dirichlet(self, axes: Iterable[str] | str, logits=1.0, sharpness=1.0):
+        A = self._as_axes(axes)
+        alpha = sharpness * self.constant(A, logits).softmax(-1)
+        return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*A)
+
+    def trunc_normal(self, axes: Iterable[str] | str, mean=0., std=0., a=0., b=1.):
+        A = self._as_axes(axes)
+        w = torch.empty(self.shape_of(A), device=self.device)
         w = torch.nn.init.trunc_normal_(w, mean=mean, std=std, a=a, b=b, generator=self.generator) if std > 0 else w.fill_(mean)
-        return w.rename(*axes)
-    
-    def uniform(self, axes: Tuple[str, ...]):
-        return torch.rand(self.shape_of(axes), device=self.device, generator=self.generator).rename(*axes)
-    
+        return w.rename(*A)
+
+    def uniform(self, axes: Iterable[str] | str):
+        A = self._as_axes(axes)
+        return torch.rand(self.shape_of(A), device=self.device, generator=self.generator).rename(*A)
+
     # product/contract
-    def marginalize(self, factors: Iterable[torch.Tensor], axes: Tuple[str, ...]):
-        #multiply factors, then sum out non-A axes; missing axes are unit factors.
-        fs = tuple(factors)
-        names = {n for f in fs for n in f.names if n is not None}
-        missing = tuple(ax for ax in axes if ax not in names)
-        plates = tuple(self.constant((ax,)) for ax in missing)
-        inputs = fs + plates
+    def marginalize(self, factors: Iterable[torch.Tensor], axes: Iterable[str] | str):
+        A = self._as_axes(axes)
+        F = self._as_axes(factors)
+        names = {n for f in F for n in f.names if n is not None}
+        plates = tuple(self.constant(ax) for ax in A if ax not in names)
+        inputs = F + plates
         args = tuple(f.rename(None) for f in inputs)
         lhs  = ",".join(" ".join(f.names) for f in inputs)
-        rhs = " ".join(axes)
-        return einsum(*args, f"{lhs} -> {rhs}").rename(*axes)
+        rhs  = " ".join(A)
+        return einsum(*args, f"{lhs} -> {rhs}").rename(*A)
 
     # indicator from indices
     def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
-        # get a [0,1] indicator on the indices
         return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
 
     # packing/unpacking events
-    def pack(self, factor: torch.Tensor, axes: Tuple[str, ...]):
-        # packs a set of axes into an event dimension and moves it to the end of the tensor
-        event_axes = tuple(axes)
-        plate_axes = tuple(n for n in factor.names if n not in axes)
-        pattern = (" ".join(plate_axes) + " *")
-        x = factor.align_to(*(plate_axes + event_axes)).rename(None)
-        flat, _ = pack([x], pattern)  # shape: (∏plate, ∏event)
-        return flat.rename(*(plate_axes + ("event",)))
+    def pack(self, factor: torch.Tensor, axes: Iterable[str] | str):
+        A = self._as_axes(axes)
+        plate = tuple(n for n in factor.names if n not in A)
+        x = factor.align_to(*(plate + A)).rename(None)
+        pattern = (" ".join(plate) + " *").strip()
+        flat, _ = pack([x], pattern)
+        return flat.rename(*(plate + ("event",)))
 
-    def unpack(self, factor: torch.Tensor, axes: Tuple[str, ...]):
-        # unpack a full event dimension into its parts, assuming axes is the tuple that was used for packing
-        event_axes = tuple(axes)
-        plate_axes = tuple(n for n in factor.names if n != "event")
-        pattern = (" ".join(plate_axes) + " *")
-        [restored] = unpack(factor.rename(None), pattern = pattern, packed_shapes=[self.shape_of(event_axes)])
-        return restored.rename(*(plate_axes + event_axes))
-    
-    # ---- selection and conditioning ----
+    def unpack(self, factor: torch.Tensor, axes: Iterable[str] | str):
+        A = self._as_axes(axes)
+        plate = tuple(n for n in factor.names if n != "event")
+        pattern = (" ".join(plate) + " *").strip()
+        [restored] = unpack(factor.rename(None), pattern=pattern, packed_shapes=[self.shape_of(A)])
+        return restored.rename(*(plate + A))
+
+    # selection and conditioning
     def select(self, factor: torch.Tensor, k: int, axis: str = "event", method: str = "topk"):
-        # select k from factor
-        plate_axes = tuple(n for n in factor.names if n != axis)
-        plates = " ".join(plate_axes) or ""
-        f = factor.align_to(*(plate_axes + (axis,))).rename(None)
-        f = rearrange(f, f"... ax  -> (...) ax")
-        idcs = f.topk(k, sorted=False, dim=-1).indices if method == "topk" else torch.multinomial(f, k, replacement=False, generator=self.generator)
-        idcs = rearrange(idcs, f"({plates}) ax -> {plates} ax", **self.sizes_of(plate_axes))
-        return idcs.rename(*(plate_axes + ("event",)))
-    
+        plate = tuple(n for n in factor.names if n != axis)
+        x = factor.align_to(*(plate + self._as_axes(axis))).rename(None)
+        flat = rearrange(x, "... ax -> (...) ax")
+        if method == "topk":
+            idcs = flat.topk(k, sorted=False, dim=-1).indices
+        else:
+            idcs = torch.multinomial(flat, k, replacement=False, generator=self.generator)
+        front = " ".join(plate)
+        idcs = rearrange(idcs, f"({front}) ax -> {front} ax", **self.sizes_of(plate))
+        return idcs.rename(*(plate + ("event",)))
+
+
     def take(self, factor: torch.Tensor, idx: torch.LongTensor, axis: str = "event"):
-        # gather with N-d index
         dim = factor.names.index(axis)
         out_names = tuple("event" if n == axis else n for n in factor.names)
         out_shape = tuple(idx.size("event") if n == axis else factor.size(n) for n in factor.names)
         idx = idx.align_to(*out_names).rename(None).expand(out_shape)
         gathered = torch.gather(factor.rename(None), dim=dim, index=idx)
         return gathered.rename(*out_names)
-    
-    # helpers
-    def get_index(self, factor: torch.Tensor, axes: Tuple[str,...], rate: float, method: str = "multinomial"):
-        # returns index in event space
-        packed = self.pack(factor, axes)
-        k = self.k_from_rate(rate, axes)
-        idx = self.select(packed, k, method = method)
-        return idx
 
-    def get_binary(self, factor: torch.Tensor, axes: Tuple[str,...], rate: float, method: str = "multinomial"):
-        #returns binary mask in the original space
-        packed = self.pack(factor, axes)
-        k = self.k_from_rate(rate, axes)
-        idx = self.select(packed, k, method = method)
-        bin = self.unpack(self.indicator(packed, idx), axes)
-        return bin
+    # helpers
+    def get_index(self, factor: torch.Tensor, axes: Iterable[str] | str, rate: float, method: str = "multinomial"):
+        A = self._as_axes(axes)
+        packed = self.pack(factor, A)
+        k = self.k_from_rate(rate, A)
+        return self.select(packed, k, method=method)
+
+    def get_binary(self, factor: torch.Tensor, axes: Iterable[str] | str, rate: float, method: str = "multinomial"):
+        A = self._as_axes(axes)
+        packed = self.pack(factor, A)
+        k = self.k_from_rate(rate, A)
+        idx = self.select(packed, k, method=method)
+        return self.unpack(self.indicator(packed, idx), A)
 
 ### TOKEN PROPERTIES
 class TokenMixin:
