@@ -17,7 +17,7 @@ class StochasticWeatherField(Module):
         self.query_ffn = GatedFFN(cfg.dim)
 
         # I/O
-        self.proj_in = Embedding(cfg.num_features, cfg.dim * cfg.dim_in)
+        self.proj_in = Linear(cfg.dim_in, cfg.dim)
         self.norm_in = ConditionalLayerNorm(cfg.dim)
         self.proj_out = Linear(cfg.dim, cfg.dim_out)
 
@@ -85,11 +85,7 @@ class StochasticWeatherField(Module):
         return None
     
     def to_x(self, src, src_coords):
-        src_var = src_coords[:, :, 1] # variable index from [B, N, C]
-        w = self.proj_in(src_var)
-        w = rearrange(w, "b n (d i) -> b n d i", i = src.size(-1))
-        x = torch.einsum("b n i, b n d i -> b n d", src, w)
-        x = self.norm_in(x) + self.coords(src_coords)
+        x = self.norm_in(self.proj_in(src)) + self.coords(src_coords)
         return x
     
     def to_q(self, tgt_coords, q_prev):
