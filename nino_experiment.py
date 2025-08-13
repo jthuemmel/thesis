@@ -6,7 +6,7 @@ import math
 
 from dataclasses import replace
 from typing import Callable, Tuple, Optional, Iterable
-from einops import rearrange, repeat, pack, unpack, einsum
+import einops
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
@@ -31,26 +31,23 @@ def count_parameters(model):
 
 #### MASKING
 class SamplingMixin:
-    # sizes
     def _as_axes(self, axes) -> Tuple[str, ...]:
         return (axes,) if isinstance(axes, str) else tuple(axes)
 
     def sizes_of(self, axes: Iterable[str] | str):
         A = self._as_axes(axes)
-        return {a: self.sizes.get(a, 1) for a in A}
+        return {a: self.token_sizes.get(a, 1) for a in A}
 
     def shape_of(self, axes: Iterable[str] | str):
         A = self._as_axes(axes)
-        return tuple(self.sizes.get(a, 1) for a in A)
+        return tuple(self.token_sizes.get(a, 1) for a in A)
 
     def measure(self, axes: Iterable[str] | str) -> int:
-        A, m = self._as_axes(axes), 1
-        for a in A: m *= int(self.sizes[a])
-        return m
+        return math.prod(self.shape_of(axes))
 
-    def k_from_rate(self, rate: torch.Tensor | float, axes: Iterable[str] | str) -> int:
+    def k_from_rate(self, rate: float, axes: Iterable[str] | str) -> int:
         m = self.measure(axes)
-        return int(max(0, min(m, round(float(rate) * m))))
+        return int(max(0, min(m, int(rate * m))))
 
     # generators
     def constant(self, axes: Iterable[str] | str, val=1.):
@@ -76,13 +73,13 @@ class SamplingMixin:
     def marginalize(self, factors: Iterable[torch.Tensor], axes: Iterable[str] | str):
         A = self._as_axes(axes)
         F = self._as_axes(factors)
-        names = {n for f in F for n in f.names if n is not None}
+        names = {n for f in F for n in f.names if exists(n)}
         plates = tuple(self.constant(ax) for ax in A if ax not in names)
         inputs = F + plates
         args = tuple(f.rename(None) for f in inputs)
         lhs  = ",".join(" ".join(f.names) for f in inputs)
         rhs  = " ".join(A)
-        return einsum(*args, f"{lhs} -> {rhs}").rename(*A)
+        return einops.einsum(*args, f"{lhs} -> {rhs}").rename(*A)
 
     # indicator from indices
     def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
@@ -94,29 +91,28 @@ class SamplingMixin:
         plate = tuple(n for n in factor.names if n not in A)
         x = factor.align_to(*(plate + A)).rename(None)
         pattern = (" ".join(plate) + " *").strip()
-        flat, _ = pack([x], pattern)
+        flat, _ = einops.pack([x], pattern)
         return flat.rename(*(plate + ("event",)))
 
     def unpack(self, factor: torch.Tensor, axes: Iterable[str] | str):
         A = self._as_axes(axes)
         plate = tuple(n for n in factor.names if n != "event")
         pattern = (" ".join(plate) + " *").strip()
-        [restored] = unpack(factor.rename(None), pattern=pattern, packed_shapes=[self.shape_of(A)])
+        [restored] = einops.unpack(factor.rename(None), pattern=pattern, packed_shapes=[self.shape_of(A)])
         return restored.rename(*(plate + A))
 
     # selection and conditioning
     def select(self, factor: torch.Tensor, k: int, axis: str = "event", method: str = "topk"):
         plate = tuple(n for n in factor.names if n != axis)
         x = factor.align_to(*(plate + self._as_axes(axis))).rename(None)
-        flat = rearrange(x, "... ax -> (...) ax")
+        flat = einops.rearrange(x, "... ax -> (...) ax")
         if method == "topk":
             idcs = flat.topk(k, sorted=False, dim=-1).indices
         else:
             idcs = torch.multinomial(flat, k, replacement=False, generator=self.generator)
         front = " ".join(plate)
-        idcs = rearrange(idcs, f"({front}) ax -> {front} ax", **self.sizes_of(plate))
+        idcs = einops.rearrange(idcs, f"({front}) ax -> {front} ax", **self.sizes_of(plate))
         return idcs.rename(*(plate + ("event",)))
-
 
     def take(self, factor: torch.Tensor, idx: torch.LongTensor, axis: str = "event"):
         dim = factor.names.index(axis)
@@ -141,11 +137,7 @@ class SamplingMixin:
         return self.unpack(self.indicator(packed, idx), A)
 
 ### TOKEN PROPERTIES
-class TokenMixin:
-    @property
-    def flatland_pattern(self):
-        return 'b (t v h w) (tt hh ww) ...'
-    
+class TokenMixin:    
     @property
     def lsm_pattern(self):
         return '1 (h hh) (w ww)'
@@ -157,76 +149,64 @@ class TokenMixin:
     @property
     def spatial_only_pattern(self):
         return '(... b v vv t tt) (h hh) (w ww)'
-
-    @property
-    def flatland_token_layout(self):
-        # returns the characters the first group in the flatland pattern (e.g. (t h w) -> ['t', 'h', 'w'])
-        return self.parse_pattern_groups(self.flatland_pattern)[0]
     
     @property
-    def flatland_patch_layout(self):
-        return self.parse_pattern_groups(self.flatland_pattern)[1]
+    def flatland_pattern(self) -> str:
+        tokens = ' '.join(self.token_layout)
+        patches = ' '.join(self.patch_layout)
+        return f'b ({tokens}) ({patches}) ...'
 
-    @property
-    def field_sizes(self):
-        return {
-            'b': self.batch_size,
-            'v': len(self.data_cfg.variables),
-            't': self.data_cfg.sequence_length,
-            'h': self.data_cfg.grid_size["lat"],
-            'w': self.data_cfg.grid_size["lon"]
-        }
-    
     @property
     def patch_sizes(self):
         # Return patch sizes per axis (default to 1)
         return {
-            k: self.world_cfg.patch_size.get(k, 1)
-            for k in ["tt", "vv", "hh", "ww"]
+            k: self.patch_cfg.get(k, 1)
+            for k in self.patch_layout
         }
     
     @property
     def token_sizes(self):
         # sizes after patching
         return {
-            k: self.field_sizes[k] // self.patch_sizes.get(f"{k*2}", 1)
-            for k in self.field_sizes.keys()
+            k: self.field_cfg[k] // self.patch_cfg.get(f"{k*2}", 1)
+            for k in self.token_layout
         }
-    
-    @staticmethod
-    def parse_pattern_groups(pattern):
-        """
-        Parses all parenthesized groups in the flatland pattern.
-        E.g., '(t v h w) (tt vv hh ww)' → [['t', 'v', 'h', 'w'], ['tt', 'vv', 'hh', 'ww']]
-        """
-        from re import findall
-        groups = findall(r"\(([^)]+)\)", pattern)
-        return [group.strip().split() for group in groups]
 
     # SHAPES
     def get_flatland_shape(self):
         B = self.batch_size
-        N = math.prod([self.token_sizes[t] for t in self.flatland_token_layout])
-        D = math.prod([self.patch_sizes[p] for p in self.flatland_patch_layout])
+        N = math.prod([self.token_sizes[t] for t in self.token_layout])
+        D = math.prod([self.patch_sizes[p] for p in self.patch_layout])
         return B, N, D
     
     def get_flatland_index(self):
         B, N, _ = self.get_flatland_shape()
-        return repeat(torch.arange(N, device = self.device), "n -> b n", b = B)
+        return einops.repeat(torch.arange(N, device = self.device), "n -> b n", b = B)
     
     # TOKENIZERS
     def field_to_tokens(self, field):
-        return rearrange(field, f'{self.field_pattern} -> {self.flatland_pattern}', **self.field_sizes, **self.patch_sizes)
+        return einops.rearrange(field.rename(None), 
+                                f'{self.field_pattern} -> {self.flatland_pattern}', 
+                                **self.token_sizes, **self.patch_sizes)
+    
+    def field_to_spatial(self, field):
+        return einops.rearrange(field.rename(None), 
+                                f"{self.field_pattern} -> {self.spatial_only_pattern}", 
+                                **self.patch_sizes)
     
     def tokens_to_field(self, tokens):
-        return rearrange(tokens, f'{self.flatland_pattern} -> {self.field_pattern}', **self.field_sizes, **self.patch_sizes)
+        return einops.rearrange(tokens.rename(None), 
+                                f'{self.flatland_pattern} -> {self.field_pattern}', 
+                                **self.token_sizes, **self.patch_sizes)
 
     def tokens_to_spatial(self, tokens):
-        return rearrange(tokens, f"{self.field_pattern} -> {self.spatial_only_pattern}", **self.patch_sizes)
+        return einops.rearrange(tokens.rename(None), 
+                                f'{self.flatland_pattern} -> {self.spatial_only_pattern}', 
+                                **self.token_sizes, **self.patch_sizes)
 
     # COORDINATE TRANSFORMS
     @staticmethod
-    def compute_strides(sizes: dict, layout: list):
+    def compute_strides(sizes: dict, layout: tuple):
         strides = {}
         stride = 1
         for ax in reversed(layout):
@@ -234,9 +214,9 @@ class TokenMixin:
             stride *= sizes[ax]
         return strides
     
-    def index_to_coords(self, idx_flat: torch.LongTensor, sizes: dict = None, layout: list = None):
+    def index_to_coords(self, idx_flat: torch.LongTensor, sizes: dict = None, layout: tuple = None):
         sizes = sizes if exists(sizes) else self.token_sizes
-        layout = layout if exists(layout) else self.flatland_token_layout
+        layout = layout if exists(layout) else self.token_layout
         strides = self.compute_strides(sizes, layout)
         rem = idx_flat
         coords = []
@@ -246,12 +226,12 @@ class TokenMixin:
             coords.append(val)
         return torch.stack(coords, dim=-1) 
 
-    def coords_to_index(self, coords: torch.LongTensor, sizes: dict = None, layout: list = None):
+    def coords_to_index(self, coords: torch.LongTensor, sizes: dict = None, layout: tuple = None):
         sizes = sizes if exists(sizes) else self.token_sizes
-        layout = layout if exists(layout) else self.flatland_token_layout
+        layout = layout if exists(layout) else self.token_layout
         strides = self.compute_strides(sizes, layout)
         # Compute dot product over coordinate axis
-        idx = sum(coords[..., i] * strides[layout[i]] for i in range(len(layout)))
+        idx = sum(coords[..., i] * strides[ax] for i, ax in enumerate(layout))
         return idx 
     
 ### ENSO DATA
@@ -259,7 +239,7 @@ class OceanMixin:
     @property
     def land_sea_mask(self):
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
-        return repeat(lsm, f"{self.lsm_pattern} -> {self.flatland_pattern}", 
+        return einops.repeat(lsm, f"{self.lsm_pattern} -> {self.flatland_pattern}", 
                       **self.field_sizes, **self.patch_sizes, b = self.batch_size)
     
     def lens_data(self):
@@ -315,7 +295,7 @@ class MetricsMixin:
         with torch.autocast(device_type=self.device_type, enabled=False):
             pred_spectrum = torch.fft.rfft2(self.tokens_to_spatial(pred.float())).view_as_real()
             obs_spectrum = torch.fft.rfft2(self.tokens_to_spatial(obs.float())).view_as_real()
-        pred_spectrum = rearrange(pred_spectrum, "(e bb) ... -> bb ... e", e = pred.size(-1))
+        pred_spectrum = einops.rearrange(pred_spectrum, "(e bb) ... -> bb ... e", e = pred.size(-1))
         return f_kernel_crps(observation= obs_spectrum, ensemble= pred_spectrum, fair= fair)
 
     @staticmethod
@@ -342,8 +322,8 @@ class MetricsMixin:
         ky = torch.fft.fftfreq(H, d=1.0).to(device)
         kx = torch.fft.fftfreq(W, d=2.0).to(device)
 
-        kx = rearrange(kx, 'w -> 1 w')
-        ky = rearrange(ky, 'h -> h 1')
+        kx = einops.rearrange(kx, 'w -> 1 w')
+        ky = einops.rearrange(ky, 'h -> h 1')
 
         radial_freq = torch.sqrt(kx ** 2 + ky ** 2).round()
         radial_freq = radial_freq / radial_freq.max()
@@ -415,7 +395,7 @@ class MetricsMixin:
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
 ### Trainer
-class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin):
+class TrainerMixin(DistributedTrainer):
     # PROPERTIES
     @property
     def cfg(self):
@@ -448,12 +428,6 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, Sampl
     @property
     def use_fair_crps(self):
         return self.world_cfg.num_ens > 1
-    
-    @property
-    def per_variable_weights(self):
-        w = self.data_cfg.weights if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
-        w = torch.tensor(w, device = self.device)
-        return w
     
     # DATA
     def create_dataset(self):
@@ -533,13 +507,6 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, Sampl
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
         return model
-    ### Masking
-
-    def get_masks(self, task):
-        return
-    
-    def apply_masks(self, *args):
-        return 
 
     ### FORWARD
     def forward_step(self, batch_idx, batch):
@@ -550,6 +517,20 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, Sampl
             _ = self.step(batch_idx, batch, task = "frcst")
             return None
 
+class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin):
+    @property
+    def per_variable_weights(self):
+        w = self.data_cfg.weights if hasattr(self.data_cfg, "weights") and exists(self.data_cfg.weights) else 1.
+        w = torch.tensor(w, device = self.device)
+        return w
+    
+    ### Masking
+    def get_masks(self, task):
+        return
+    
+    def apply_masks(self, *args):
+        return 
+    
     def step(self, batch_idx, batch, task: str = "train"):
         """
         Performs a forward pass and returns the loss.
@@ -566,14 +547,14 @@ class MTMTrainer(DistributedTrainer, MetricsMixin, OceanMixin, TokenMixin, Sampl
         tgt_mask = self.index_to_coords(tgt_mask)
         
         # expand src, tgt, lsm for ensemble
-        src, src_mask, tgt_mask = (repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_mask, tgt_mask))
+        src, src_mask, tgt_mask = (einops.repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_mask, tgt_mask))
         
         # forward
         with sdpa_kernel(self.backend):
             tgt_pred = self.model(src, src_mask, tgt_mask, num_steps=1)
 
         # split out ensemble dimension(s) if necessary
-        tgt_pred = rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
+        tgt_pred = einops.rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
             
         # compute loss
         loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
