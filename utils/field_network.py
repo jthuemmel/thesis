@@ -13,12 +13,7 @@ class StochasticWeatherField(Module):
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
 
         # Coordinates
-        wavelengths = [(1e-2, 1e1), # time -> ?
-                       #(1e-3, 1e0), # variable -> indicator 
-                       (1e-1, 1e2), # height -> smooth
-                       (1e-1, 1e2)] # weidth -> smooth
-        
-        self.coords = ContinuousPositionalEmbedding(cfg.dim_coords, wavelengths, cfg.dim)
+        self.coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
         self.query_ffn = GatedFFN(cfg.dim)
 
         # I/O

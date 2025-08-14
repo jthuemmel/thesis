@@ -135,7 +135,7 @@ class TrainerMixin(DistributedTrainer):
             # spectral_crps
             #spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
             # pointwise crps
-            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
+            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
@@ -585,13 +585,15 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
     
     def tgt_prior(self):
         r = self.tgt_rate()
-        prior = self.dirichlet_Nd('t')
+        A = self._as_axes(('t', 'v')) if 'v' in self.token_layout else self._as_axes('t')
+        prior = self.dirichlet_Nd(A)
         mask = self.get_index(prior, self.token_layout, rate = r)
         return mask
     
     def src_prior(self):
         r = self.src_rate()
-        prior = self.dirichlet_Nd('t')
+        A = self._as_axes(('t', 'v')) if 'v' in self.token_layout else self._as_axes('t')
+        prior = self.dirichlet_Nd(A)
         mask = self.get_index(prior, self.token_layout, rate = r)
         return mask
 

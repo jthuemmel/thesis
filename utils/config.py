@@ -18,6 +18,12 @@ OmegaConf.register_new_resolver(
 )
 
 OmegaConf.register_new_resolver(
+    "div",
+    lambda a,b: a/b,
+    replace=True,
+)
+
+OmegaConf.register_new_resolver(
     "div_comp",
     lambda x, y: (i // j for i, j in zip(x, y)),
     replace=True,
@@ -62,6 +68,7 @@ class NetworkConfig:
     drop_prob: Optional[float] = 0.
     expansion_factor: Optional[int] = 2
     architecture: str = "vit"
+    wavelengths: Optional[List] = None
 
 @dataclass
 class OptimConfig:
