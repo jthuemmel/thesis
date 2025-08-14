@@ -131,9 +131,11 @@ class TrainerMixin(DistributedTrainer):
     
     # LOSS
     def create_loss(self):
-        def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
+        def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor, var: torch.Tensor = None):
             # pointwise crps
             point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
+            # apply channel weights
+            point_crps = point_crps
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
@@ -307,6 +309,10 @@ class TokenMixin:
         tokens = ' '.join(self.token_layout)
         patches = ' '.join(self.patch_layout)
         return f'({plates}) ({tokens}) ({patches}) ...'    
+
+    @property
+    def var_pattern(self):
+        return '(v vv) ...'
 
     # SHAPES
     def get_flatland_shape(self):
@@ -524,6 +530,23 @@ class MetricsMixin:
 
 class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin, ShapeMixin):
     ### Masking
+    @property
+    def per_variable_weights(self):
+        weights = {'temp_ocn_0a': 1.,
+               'temp_ocn_1a': 0.1,
+               'temp_ocn_3a': 0.1,
+               'temp_ocn_5a': 0.1,
+               'temp_ocn_8a': 0.1,
+               'temp_ocn_11a': 0.1,
+               'temp_ocn_14a': 0.1,
+               'tauxa': 0.01,
+               'tauya': 0.01,
+        }
+        w = torch.as_tensor([weights.get(key, 1.) for key in self.data_cfg.variables], device = self.device)
+        return einops.repeat(w / w.mean(), 
+                             f"{self.var_pattern} -> {self.flatland_pattern}", 
+                              **self.token_sizes, **self.patch_sizes, b = self.batch_size)
+    
     # HELPERS    
     def get_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "multinomial"):
         A = self._as_axes(axes)
@@ -606,11 +629,13 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         # make sure tokens and lsm have the names expected by take
         tokens = tokens.rename('b', 'event', 'dim')
         lsm = self.land_sea_mask.rename('b', 'event', 'dim')
-        
+        var = self.per_variable_weights.rename('b', 'event', 'dim')
+
         src = self.take(tokens, src_mask)
         tgt = self.take(tokens, tgt_mask)
         lsm = self.take(lsm, tgt_mask)
-        return src.rename(None), tgt.rename(None), lsm.rename(None)
+        var = self.take(var, tgt_mask)
+        return src.rename(None), tgt.rename(None), lsm.rename(None), var.rename(None)
 
     ### STEP
     def step(self, batch_idx, batch, task: str = "train"):
@@ -619,7 +644,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         
         # masking
         src_mask, tgt_mask = self.get_masks(task)
-        src, tgt, lsm = self.apply_masks(tokens, src_mask, tgt_mask)
+        src, tgt, lsm, var = self.apply_masks(tokens, src_mask, tgt_mask)
         
         # convert flat indices to coordinates
         src_coords = self.index_to_coords(src_mask)
@@ -636,7 +661,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         tgt_pred = einops.rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
             
         # compute loss
-        loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm)
+        loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm, var = var)
 
 
         # metrics
