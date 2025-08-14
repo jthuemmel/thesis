@@ -135,7 +135,7 @@ class TrainerMixin(DistributedTrainer):
             # pointwise crps
             point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
             # apply channel weights
-            point_crps = point_crps
+            point_crps = point_crps * var
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
@@ -530,7 +530,7 @@ class MetricsMixin:
 
 class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin, ShapeMixin):
     ### Masking
-    @property
+    @cached_property
     def per_variable_weights(self):
         weights = {'temp_ocn_0a': 1.,
                'temp_ocn_1a': 0.1,
@@ -542,7 +542,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
                'tauxa': 0.01,
                'tauya': 0.01,
         }
-        w = torch.as_tensor([weights.get(key, 1.) for key in self.data_cfg.variables], device = self.device)
+        w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w / w.mean(), 
                              f"{self.var_pattern} -> {self.flatland_pattern}", 
                               **self.token_sizes, **self.patch_sizes, b = self.batch_size)
@@ -619,11 +619,13 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         prior = self.dirichlet_Nd(A)
         mask = self.get_index(prior, self.token_layout, rate = r)
         return mask
-        
-    def get_masks(self, task):
-        if task == 'frcst':
-            return self.frcst()
-        return self.src_prior(), self.tgt_prior()
+
+    def prior(self):
+        R_src, R_tgt = self.src_rate(), self.tgt_rate()
+        W = self.dirichlet_Nd(('t', 'v'))
+        src_mask = self.get_index(W, self.token_layout, rate = R_src)
+        tgt_mask = self.get_index(1 - W, self.token_layout, rate = R_tgt)
+        return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
         # make sure tokens and lsm have the names expected by take
@@ -643,7 +645,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         tokens = self.field_to_tokens(batch.to(self.device))
         
         # masking
-        src_mask, tgt_mask = self.get_masks(task)
+        src_mask, tgt_mask = self.frcst() if task == 'frcst' else self.prior()
         src, tgt, lsm, var = self.apply_masks(tokens, src_mask, tgt_mask)
         
         # convert flat indices to coordinates
