@@ -13,7 +13,12 @@ class StochasticWeatherField(Module):
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
 
         # Coordinates
-        self.coords = ContinuousPositionalEmbedding(cfg.dim_coords, [8, 8, 16, 32], cfg.dim)
+        wavelengths = [(1e-2, 1e1), # time -> ?
+                       #(1e-3, 1e0), # variable -> indicator 
+                       (1e-1, 1e2), # height -> smooth
+                       (1e-1, 1e2)] # weidth -> smooth
+        
+        self.coords = ContinuousPositionalEmbedding(cfg.dim_coords, wavelengths, cfg.dim)
         self.query_ffn = GatedFFN(cfg.dim)
 
         # I/O
@@ -30,15 +35,17 @@ class StochasticWeatherField(Module):
         self.dim_noise = cfg.dim_noise
         self.generator = None
 
-        # Interface Network
-        self.network = ModuleList([
-            Interface(cfg.dim, cfg.num_compute_blocks, dim_heads= cfg.dim_heads, dim_ctx=None) 
+        # Interface Networks
+        self.encoder = ModuleList([
+            Interface(cfg.dim, cfg.num_compute_blocks, dim_ctx=None) 
             for _ in range(cfg.num_layers)
         ])
 
+        self.decoder = Interface(cfg.dim, 2, dim_ctx=None)
+
         # Initialization
         self.apply(self.base_init)
-        #self.apply(self.zero_init)    
+        self.apply(self.zero_init)    
 
     @staticmethod
     def base_init(m):
@@ -114,11 +121,14 @@ class StochasticWeatherField(Module):
         x = self.to_x(src, src_coords)
         q = self.to_q(tgt_coords, q_prev)
         z = self.to_z(src, z_prev)
-        
+
+        #Interface network over src only
+        for block in self.encoder:
+            x, z = block(x, z)
+
         # Interface network over src and query
         combined = torch.cat([x, q], dim = 1)
-        for block in self.network:
-            combined, z = block(combined, z)
+        combined, z = self.decoder(combined, z)
         _, q = combined.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
 
         # Decode query only
