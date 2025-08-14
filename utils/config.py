@@ -108,11 +108,9 @@ class WorldConfig:
     token_layout: Tuple[str, ...] = field(default_factory=lambda: ('t','v','h','w'))
     patch_layout: Tuple[str, ...] = field(default_factory=lambda: ('tt','vv','hh','ww'))
 
-    # sizes on the *unpatched* field
-    field_cfg: Dict[str, int] = field(default_factory=lambda: {'b':1, 'v':1, 't':1, 'h':1, 'w':1})
+    # sizes
+    size_cfg: Dict[str, int] = field(default_factory=lambda: {})
 
-    # patch sizes per patched axis (same order/naming as patch_layout)
-    patch_cfg: Dict[str, int] = field(default_factory=lambda: {'tt':1, 'vv':1, 'hh':1, 'ww':1})
 
     def __post_init__(self):
         # Layout sanity
@@ -125,16 +123,16 @@ class WorldConfig:
         for ax, pax in token_to_patch.items():
             if pax not in self.patch_layout:
                 raise ValueError(f"Missing patch axis '{pax}' for token axis '{ax}' in patch_layout.")
-            if pax not in self.patch_cfg:
-                raise ValueError(f"Missing patch size for '{pax}' in patch_cfg.")
+            if pax not in self.size_cfg:
+                raise ValueError(f"Missing patch size for '{pax}' in size_cfg.")
 
         # Divisibility: field_cfg[token] % patch_cfg[token*2] == 0
         for ax in self.token_layout:
             pax = ax*2
-            fsz = self.field_cfg[ax]
-            psz = self.patch_cfg.get(pax, 1)
+            fsz = self.size_cfg[ax]
+            psz = self.size_cfg.get(pax, 1)
             if fsz % psz != 0:
-                raise ValueError(f"field_cfg['{ax}']={fsz} not divisible by patch_cfg['{pax}']={psz}")
+                raise ValueError(f"size_cfg['{ax}']={fsz} not divisible by size_cfg['{pax}']={psz}")
 
 @dataclass
 class ModelConfig:

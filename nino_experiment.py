@@ -133,13 +133,13 @@ class TrainerMixin(DistributedTrainer):
     def create_loss(self):
         def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
             # spectral_crps
-            spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
+            #spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
             # pointwise crps
             point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
-            return point_crps.nanmean() + 1e-4 * spectral_crps.nanmean()
+            return point_crps.nanmean() #+ 1e-4 * spectral_crps.nanmean()
         return loss
     
     ### FORWARD
@@ -190,7 +190,7 @@ class ShapeMixin:
     def patch_sizes(self):
         # Return patch sizes per axis (default to 1)
         return {
-            k: self.world_cfg.patch_cfg.get(k, 1)
+            k: self.world_cfg.size_cfg.get(k, 1)
             for k in self.patch_layout
         }
     
@@ -198,13 +198,13 @@ class ShapeMixin:
     def token_sizes(self):
         # sizes after patching
         return {
-            k: self.world_cfg.field_cfg[k] // self.world_cfg.patch_cfg.get(f"{k*2}", 1)
+            k: self.world_cfg.size_cfg[k] // self.world_cfg.size_cfg.get(f"{k*2}", 1)
             for k in self.token_layout
         }
     
     @cached_property
     def plate_sizes(self):
-        return {k: self.world_cfg.field_cfg[k] for k in self.plate_layout}
+        return {k: self.world_cfg.size_cfg[k] for k in self.plate_layout}
 
     @cached_property
     def sizes(self):
@@ -328,9 +328,8 @@ class TokenMixin:
                                 **self.token_sizes, **self.patch_sizes)
     
     def frcst_to_field(self, tokens):
-        lhs, rhs = 'b (t v h w) (tt vv hh ww) ...', 'b (v vv) (t tt) (h hh) (w ww) ...'
         valid_axes = ('h', 'w', 'v') + self.patch_layout # need to ensure that we only query spatial and variable sizes
-        return einops.rearrange(tokens.rename(None), f'{lhs} -> {rhs}', **{ax: self.sizes[ax] for ax in valid_axes})
+        return einops.rearrange(tokens.rename(None), f'{self.flatland_pattern} -> {self.field_pattern}', **{ax: self.sizes[ax] for ax in valid_axes})
 
     def masked_to_spatial(self, tokens):
         lhs, rhs = 'b (m h w) (d hh ww) ...', '(... b m d) (h hh) (w ww)' # use dummy names for the masked parts
@@ -435,14 +434,12 @@ class MetricsMixin:
     def compute_spread(ens_pred: torch.Tensor):
         return ens_pred.var(-1).mean().sqrt()
 
-    @staticmethod
-    def compute_spread_skill(pred: torch.Tensor, obs: torch.Tensor):
-        K = pred.shape[-1]
-        correction = math.sqrt((K + 1) / K)
-        mean = pred.nanmean(-1)
-        spread = pred.var(-1).nanmean().sqrt()
-        skill = (obs - mean).pow(2).nanmean().sqrt()
-        return correction * (spread / skill.clamp(1e-8))
+    def compute_spread_skill(self, pred: torch.Tensor, obs: torch.Tensor):
+        E = pred.shape[-1]
+        correction = (E + 1) / E
+        spread = self.compute_spread(ens_pred=pred)
+        skill = self.compute_rmse(pred.mean(-1), obs)
+        return correction * (spread / skill)
 
     @staticmethod
     def rapsd(x: torch.Tensor) -> torch.Tensor:
@@ -547,12 +544,12 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         return self.unpack(binary, A)
     
     def dirichlet_1d(self, d: str):
-        A = self.plate_layout + self._as_axes(d)
-        return self.dirichlet(A, 
+        return self.dirichlet(self.plate_layout + self._as_axes(d), #broadcast over plates
                               sharpness= self.world_cfg.alphas.get(d, 1.), 
                               logits= self.world_cfg.weights.get(d, 1.))
     
     def dirichlet_Nd(self, axes: Iterable[str]):
+        #combine multiple 1d dirichlet priors via outer product
         A = self._as_axes(axes)
         return self.marginalize([self.dirichlet_1d(ax) for ax in A], self.plate_layout + A)
 
@@ -578,7 +575,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         tgt_mask = self.get_index(tgt_gate, self.token_layout, rate = 1 - r, method='topk')
         return src_mask, tgt_mask
 
-    def tgt_prior(self):
+    def fourier_prior(self):
         gate_axes = ('t', 'v')
         r = self.tgt_rate()
         gate_prior = self.dirichlet_Nd(gate_axes)
@@ -586,9 +583,15 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         mask = self.get_index(gate, self.token_layout, rate = r)
         return mask
     
+    def tgt_prior(self):
+        r = self.tgt_rate()
+        prior = self.dirichlet_Nd('t')
+        mask = self.get_index(prior, self.token_layout, rate = r)
+        return mask
+    
     def src_prior(self):
         r = self.src_rate()
-        prior = self.dirichlet_1d('t')
+        prior = self.dirichlet_Nd('t')
         mask = self.get_index(prior, self.token_layout, rate = r)
         return mask
 
