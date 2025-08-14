@@ -132,14 +132,12 @@ class TrainerMixin(DistributedTrainer):
     # LOSS
     def create_loss(self):
         def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
-            # spectral_crps
-            #spectral_crps = self.compute_spectral_crps(pred = pred, obs = obs, fair = self.use_fair_crps)
             # pointwise crps
             point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
             # apply land-sea mask
             point_crps = point_crps[lsm]
             # reduce to scalar
-            return point_crps.nanmean() #+ 1e-4 * spectral_crps.nanmean()
+            return point_crps.nanmean()
         return loss
     
     ### FORWARD
@@ -398,13 +396,6 @@ class OceanMixin:
 
 ### METRICS
 class MetricsMixin:
-    def compute_rapsd(self, tokens: torch.Tensor):
-        x = self.masked_to_spatial(tokens)
-        with torch.autocast(device_type=self.device_type, enabled=False):
-            rapsd = self.rapsd(x.float())
-            rapsd = torch.clamp(rapsd, min=1e-8).log10()
-        return rapsd
-
     @staticmethod
     def compute_acc(pred: torch.Tensor, obs: torch.Tensor):
         numerator = (pred * obs).nansum()
@@ -422,13 +413,6 @@ class MetricsMixin:
     def compute_ign(self, pred: torch.Tensor, obs: torch.Tensor):
         ign = f_gaussian_ignorance(observation=obs, mu=pred.mean(-1), sigma=pred.std(-1))
         return ign.nanmean()
-    
-    def compute_spectral_crps(self, pred: torch.Tensor, obs: torch.Tensor, fair: bool = True):
-        with torch.autocast(device_type=self.device_type, enabled=False):
-            pred_spectrum = torch.fft.rfft2(self.masked_to_spatial(pred.float()))#.view_as_real()
-            obs_spectrum = torch.fft.rfft2(self.masked_to_spatial(obs.float()))#.view_as_real()
-        pred_spectrum = einops.rearrange(pred_spectrum, "(e bb) ... -> bb ... e", e = pred.size(-1))
-        return f_kernel_crps(observation= obs_spectrum, ensemble= pred_spectrum, fair= fair)
 
     @staticmethod
     def compute_spread(ens_pred: torch.Tensor):
@@ -441,6 +425,21 @@ class MetricsMixin:
         skill = self.compute_rmse(pred.mean(-1), obs)
         return correction * (spread / skill)
 
+    ### SPECTRAL
+    def compute_rapsd(self, tokens: torch.Tensor):
+        x = self.masked_to_spatial(tokens)
+        with torch.autocast(device_type=self.device_type, enabled=False):
+            rapsd = self.rapsd(x.float())
+            rapsd = torch.clamp(rapsd, min=1e-8).log10()
+        return rapsd
+    
+    def compute_spectral_crps(self, pred: torch.Tensor, obs: torch.Tensor, fair: bool = True):
+        with torch.autocast(device_type=self.device_type, enabled=False):
+            pred_spectrum = torch.fft.rfft2(self.masked_to_spatial(pred.float()))#.view_as_real()
+            obs_spectrum = torch.fft.rfft2(self.masked_to_spatial(obs.float()))#.view_as_real()
+        pred_spectrum = einops.rearrange(pred_spectrum, "(e bb) ... -> bb ... e", e = pred.size(-1))
+        return f_kernel_crps(observation= obs_spectrum, ensemble= pred_spectrum, fair= fair)
+    
     @staticmethod
     def rapsd(x: torch.Tensor) -> torch.Tensor:
         B, H, W = x.size()
@@ -471,6 +470,7 @@ class MetricsMixin:
 
         return binned
 
+    ### HELPERS
     def ensemble_metrics(self, ens_pred: torch.Tensor, obs: torch.Tensor, label: str = None):
         E = ens_pred.size(-1)
         crps = self.compute_crps(pred=ens_pred, obs=obs)
@@ -596,7 +596,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         prior = self.dirichlet_Nd(A)
         mask = self.get_index(prior, self.token_layout, rate = r)
         return mask
-
+        
     def get_masks(self, task):
         if task == 'frcst':
             return self.frcst()
@@ -614,9 +614,6 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
 
     ### STEP
     def step(self, batch_idx, batch, task: str = "train"):
-        """
-        Performs a forward pass and returns the loss.
-        """
         # to device and tokenize
         tokens = self.field_to_tokens(batch.to(self.device))
         
@@ -629,7 +626,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         tgt_coords = self.index_to_coords(tgt_mask)
         
         # expand src, tgt, lsm for ensemble
-        src, src_coords, tgt_mask = (einops.repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_coords, tgt_coords))
+        src, src_coords, tgt_coords = (einops.repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_coords, tgt_coords))
         
         # forward
         with sdpa_kernel(self.backend):
