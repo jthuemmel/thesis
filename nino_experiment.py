@@ -45,7 +45,7 @@ class TrainerMixin(DistributedTrainer):
 
     @property
     def model_cfg(self):
-        return self._cfg.model.decoder
+        return self._cfg.model
     
     @property
     def world_cfg(self):
@@ -133,7 +133,7 @@ class TrainerMixin(DistributedTrainer):
     def create_loss(self):
         def loss(pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor, var: torch.Tensor = None):
             # pointwise crps
-            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= True)
+            point_crps = f_kernel_crps(observation=obs, ensemble=pred, fair= self.use_fair_crps)
             # apply channel weights
             point_crps = point_crps * var
             # apply land-sea mask
@@ -547,7 +547,17 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
                              f"{self.var_pattern} -> {self.flatland_pattern}", 
                               **self.token_sizes, **self.patch_sizes, b = self.batch_size)
     
-    # HELPERS    
+    # HELPERS
+    @staticmethod
+    def logit_mirror(W: torch.Tensor, temp: float = 1.0, eps: float = 1e-6):
+        names = W.names
+        w = W.rename(None).clamp(eps, 1 - eps)
+        logit = torch.log(w) - torch.log1p(-w)           # logit
+        logit = logit / temp
+        src = torch.sigmoid(logit).rename(*names)
+        tgt = torch.sigmoid(-logit).rename(*names)
+        return src, tgt
+    
     def get_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "multinomial"):
         A = self._as_axes(axes)
         F = self._as_factors(factors)
@@ -598,46 +608,27 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         tgt_mask = self.get_index(tgt_gate, self.token_layout, rate = 1 - r, method='topk')
         return src_mask, tgt_mask
 
-    def fourier_prior(self):
-        gate_axes = ('t', 'v')
-        r = self.tgt_rate()
-        gate_prior = self.dirichlet_Nd(gate_axes)
-        gate = self.get_gate(gate_prior, gate_axes, rate= r)
-        mask = self.get_index(gate, self.token_layout, rate = r)
-        return mask
-    
-    def tgt_prior(self):
-        r = self.tgt_rate()
-        A = self._as_axes(('t', 'v')) if 'v' in self.token_layout else self._as_axes('t')
-        prior = self.dirichlet_Nd(A)
-        mask = self.get_index(prior, self.token_layout, rate = r)
-        return mask
-    
-    def src_prior(self):
-        r = self.src_rate()
-        A = self._as_axes(('t', 'v')) if 'v' in self.token_layout else self._as_axes('t')
-        prior = self.dirichlet_Nd(A)
-        mask = self.get_index(prior, self.token_layout, rate = r)
-        return mask
-
     def prior(self):
         R_src, R_tgt = self.src_rate(), self.tgt_rate()
-        W = self.dirichlet_Nd(('t', 'v'))
-        src_mask = self.get_index(W, self.token_layout, rate = R_src)
-        tgt_mask = self.get_index(1 - W, self.token_layout, rate = R_tgt)
+        A = self._as_axes(('t', 'v')) if 'v' in self.world_cfg.alphas else self._as_axes('t')
+        W = self.dirichlet_Nd(A)
+        W_src, W_tgt = self.logit_mirror(W)
+        src_mask = self.get_index(W_src, self.token_layout, rate = R_src)
+        tgt_mask = self.get_index(W_tgt, self.token_layout, rate = R_tgt)
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
-        # make sure tokens and lsm have the names expected by take
         tokens = tokens.rename('b', 'event', 'dim')
-        lsm = self.land_sea_mask.rename('b', 'event', 'dim')
-        var = self.per_variable_weights.rename('b', 'event', 'dim')
-
         src = self.take(tokens, src_mask)
         tgt = self.take(tokens, tgt_mask)
+        return src.rename(None), tgt.rename(None)
+
+    def get_loss_masks(self, tgt_mask):
+        lsm = self.land_sea_mask.rename('b', 'event', 'dim')
+        var = self.per_variable_weights.rename('b', 'event', 'dim')
         lsm = self.take(lsm, tgt_mask)
         var = self.take(var, tgt_mask)
-        return src.rename(None), tgt.rename(None), lsm.rename(None), var.rename(None)
+        return lsm.rename(None), var.rename(None)
 
     ### STEP
     def step(self, batch_idx, batch, task: str = "train"):
@@ -646,11 +637,13 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         
         # masking
         src_mask, tgt_mask = self.frcst() if task == 'frcst' else self.prior()
-        src, tgt, lsm, var = self.apply_masks(tokens, src_mask, tgt_mask)
+        src, tgt= self.apply_masks(tokens, src_mask, tgt_mask)
+        lsm, var = self.get_loss_masks(tgt_mask)
         
         # convert flat indices to coordinates
         src_coords = self.index_to_coords(src_mask)
         tgt_coords = self.index_to_coords(tgt_mask)
+        #src_coords, tgt_coords = src_mask.rename(None), tgt_mask.rename(None)
         
         # expand src, tgt, lsm for ensemble
         src, src_coords, tgt_coords = (einops.repeat(x, "b ... -> (b k) ...", k = self.world_cfg.num_ens) for x in (src, src_coords, tgt_coords))
@@ -665,14 +658,13 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         # compute loss
         loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm, var = var)
 
-
         # metrics
         if task == "train":
             self.current_metrics.log_metric(f"loss", loss.item())
             self.compute_metrics(pred = tgt_pred, obs = tgt, lsm = lsm, label = None)
         elif task == "frcst":
             self.get_frcst_metrics(pred = tgt_pred, obs = tgt, lsm = lsm)
-        
+            
         return loss
 
 def main():

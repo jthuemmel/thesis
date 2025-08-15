@@ -7,13 +7,18 @@ from utils.cpe import ContinuousPositionalEmbedding
 from utils.components import *
 
 class StochasticWeatherField(Module):
-    def __init__(self, cfg: dataclass):
+    def __init__(self, model_cfg: dataclass):
         super().__init__()
+        decoder_cfg = model_cfg.decoder
+        encoder_cfg = model_cfg.encoder
+        cfg = decoder_cfg if decoder_cfg is not None else encoder_cfg
+
         # Latents
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
 
         # Coordinates
         self.coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+        #self.coords = Embedding(cfg.num_tokens, cfg.dim)
         self.query_ffn = GatedFFN(cfg.dim)
 
         # I/O
@@ -32,15 +37,18 @@ class StochasticWeatherField(Module):
 
         # Interface Networks
         self.encoder = ModuleList([
+            Interface(encoder_cfg.dim, encoder_cfg.num_compute_blocks, dim_ctx=None) 
+            for _ in range(encoder_cfg.num_layers)
+        ]) if encoder_cfg else None
+
+        self.decoder = ModuleList([
             Interface(cfg.dim, cfg.num_compute_blocks, dim_ctx=None) 
             for _ in range(cfg.num_layers)
         ])
 
-        self.decoder = Interface(cfg.dim, 2, dim_ctx=None)
-
         # Initialization
         self.apply(self.base_init)
-        self.apply(self.zero_init)    
+        #self.apply(self.zero_init)    
 
     @staticmethod
     def base_init(m):
@@ -118,12 +126,14 @@ class StochasticWeatherField(Module):
         z = self.to_z(src, z_prev)
 
         #Interface network over src only
-        for block in self.encoder:
-            x, z = block(x, z)
+        if self.encoder is not None:
+            for block in self.encoder:
+                x, z = block(x, z)
 
         # Interface network over src and query
         combined = torch.cat([x, q], dim = 1)
-        combined, z = self.decoder(combined, z)
+        for block in self.decoder:
+            combined, z = block(combined, z)
         _, q = combined.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
 
         # Decode query only
