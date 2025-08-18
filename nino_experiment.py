@@ -4,8 +4,8 @@ import os
 import argparse
 import math
 import einops
-
-import utils.config as cfg
+import xarray as xr
+import numpy as np
 
 from dataclasses import replace
 from functools import cached_property
@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 from typing import Tuple, Iterable
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+import utils.config as cfg
 from utils.loss_fn import f_kernel_crps, f_gaussian_ignorance
 from utils.field_network import StochasticWeatherField
 from utils.dataset import NinoData, MultifileNinoDataset
@@ -68,7 +69,7 @@ class TrainerMixin(DistributedTrainer):
         # instantiate datasets
         self.train_dataset = self.lens_data()
         self.val_dataset = self.godas_data() if self.data_cfg.eval_data == "godas" else self.picontrol_data()
-        
+
         # create land-sea mask
         self._val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
         self._train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
@@ -144,13 +145,15 @@ class TrainerMixin(DistributedTrainer):
     
     ### FORWARD
     def forward_step(self, batch_idx, batch):
-        if self.mode == "train":
-            return self.step(batch_idx, batch)
-        else:
-            _ = self.step(batch_idx, batch)
-            _ = self.step(batch_idx, batch, task = "frcst")
-            return None
-
+        # step
+        tgt_pred, tgt, lsm, var = self.step(batch_idx, batch, None)        
+        # compute loss
+        loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm, var = var)
+        # metrics
+        self.current_metrics.log_metric(f"loss", loss.item())
+        self.compute_metrics(pred = tgt_pred, obs = tgt, lsm = lsm, label = None)
+        return loss
+    
 ###
 class ShapeMixin:
     # HELPERS
@@ -399,7 +402,7 @@ class OceanMixin:
         if not hasattr(self, "_oras5_data"):
             self._oras5_data = NinoData(self.cfg.oras5_path, self.data_cfg)
         return self._oras5_data
-
+        
 ### METRICS
 class MetricsMixin:
     @staticmethod
@@ -520,7 +523,7 @@ class MetricsMixin:
         
     def get_frcst_metrics(self, pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
         pred, obs, lsm = (self.frcst_to_field(x) for x in (pred, obs, lsm))
-        frcst_tasks = {"frcst": (slice(None), slice(None))} # default task
+        frcst_tasks = {"frcst": (slice(0,1), slice(None))} # default task, sst only
         if exists(self.data_cfg.frcst_tasks): # additional tasks from config
             frcst_tasks.update(self.data_cfg.frcst_tasks)
         for label, (vi, ti) in frcst_tasks.items(): # for all tasks
@@ -631,12 +634,12 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         return lsm.rename(None), var.rename(None)
 
     ### STEP
-    def step(self, batch_idx, batch, task: str = "train"):
+    def step(self, batch_idx, batch, task: str = None):
         # to device and tokenize
         tokens = self.field_to_tokens(batch.to(self.device))
         
         # masking
-        src_mask, tgt_mask = self.frcst() if task == 'frcst' else self.prior()
+        src_mask, tgt_mask = self.prior() if task is not "frcst" else self.frcst() 
         src, tgt= self.apply_masks(tokens, src_mask, tgt_mask)
         lsm, var = self.get_loss_masks(tgt_mask)
         
@@ -655,17 +658,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         # split out ensemble dimension(s) if necessary
         tgt_pred = einops.rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
             
-        # compute loss
-        loss = self.loss_fn(pred = tgt_pred, obs = tgt, lsm = lsm, var = var)
-
-        # metrics
-        if task == "train":
-            self.current_metrics.log_metric(f"loss", loss.item())
-            self.compute_metrics(pred = tgt_pred, obs = tgt, lsm = lsm, label = None)
-        elif task == "frcst":
-            self.get_frcst_metrics(pred = tgt_pred, obs = tgt, lsm = lsm)
-            
-        return loss
+        return tgt_pred, tgt, lsm, var
 
 def main():
     parser = argparse.ArgumentParser(description="Train a MIN model")

@@ -66,11 +66,6 @@ class NinoData(Dataset):
             data[key] = (data[key] - self._means.sel(variable=key)) / self._stds.sel(variable=key)
         return data
     
-    def _destandardize(self, data: xr.Dataset) -> xr.Dataset:
-        for key in self.config.variables:
-            data[key] = self._stds.sel(variable = key) * (data[key] + self._means.sel(variable=key))
-        return data
-
     def compute_means(self, data: xr.Dataset) -> None:
         if self.config.stats is None:
             values = [data[key].mean().values for key in self.variables]
