@@ -1,6 +1,6 @@
 import torch
 from torch.nn import Embedding, Module, ModuleList, Linear, init, LayerNorm
-from einops import rearrange, repeat, reduce
+from einops import rearrange, repeat, pack, unpack
 from dataclasses import dataclass
 from utils.networks import Interface
 from utils.cpe import ContinuousPositionalEmbedding
@@ -17,8 +17,8 @@ class StochasticWeatherField(Module):
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
 
         # Coordinates
-        self.coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
-        #self.coords = Embedding(cfg.num_tokens, cfg.dim)
+        self.x_coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+        self.q_coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
         self.query_ffn = GatedFFN(cfg.dim)
 
         # I/O
@@ -95,11 +95,11 @@ class StochasticWeatherField(Module):
         return None
     
     def to_x(self, src, src_coords):
-        x = self.norm_in(self.proj_in(src)) + self.coords(src_coords)
+        x = self.norm_in(self.proj_in(src)) + self.x_coords(src_coords)
         return x
     
     def to_q(self, tgt_coords, q_prev):
-        q_init = self.coords(tgt_coords)
+        q_init = self.q_coords(tgt_coords)
         q_init = q_init + self.query_ffn(q_init)
         q = self.query_conditioning(q_init, q_prev)
         return q
@@ -109,7 +109,7 @@ class StochasticWeatherField(Module):
         if self.dim_noise is not None:
             noise = self.noise_like(src)
             z_noise = self.proj_noise(noise)
-            z_init = torch.cat([z_init, z_noise], dim = 1)
+            z_init, _ = pack([z_init, z_noise], "b * d")
         z = self.latent_conditioning(z_init, z_prev)
         return z
 
@@ -122,7 +122,6 @@ class StochasticWeatherField(Module):
             ):
         
         x = self.to_x(src, src_coords)
-        q = self.to_q(tgt_coords, q_prev)
         z = self.to_z(src, z_prev)
 
         #Interface network over src only
@@ -131,10 +130,11 @@ class StochasticWeatherField(Module):
                 x, z = block(x, z)
 
         # Interface network over src and query
-        combined = torch.cat([x, q], dim = 1)
+        q = self.to_q(tgt_coords, q_prev)
+        packed, packed_shape = pack([x, q], "b * d")
         for block in self.decoder:
-            combined, z = block(combined, z)
-        _, q = combined.split([src_coords.size(1), tgt_coords.size(1)], dim = 1)
+            packed, z = block(packed, z)
+        _, q = unpack(packed, packed_shape, "b * d")
 
         # Decode query only
         pred = self.proj_out(q)
