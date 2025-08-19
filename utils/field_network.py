@@ -9,9 +9,8 @@ from utils.components import *
 class StochasticWeatherField(Module):
     def __init__(self, model_cfg: dataclass):
         super().__init__()
-        decoder_cfg = model_cfg.decoder
+        cfg = model_cfg.decoder
         encoder_cfg = model_cfg.encoder
-        cfg = decoder_cfg if decoder_cfg is not None else encoder_cfg
 
         # Latents
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
@@ -22,9 +21,12 @@ class StochasticWeatherField(Module):
         self.query_ffn = GatedFFN(cfg.dim)
 
         # I/O
+        self.film = Embedding(cfg.num_features, cfg.dim_coords)
         self.proj_in = Linear(cfg.dim_in, cfg.dim)
-        self.norm_in = ConditionalLayerNorm(cfg.dim)
-        self.proj_out = Linear(cfg.dim, cfg.dim_out)
+        self.norm_in = ConditionalLayerNorm(cfg.dim, dim_ctx= cfg.dim_coords)
+        self.proj_out1 = Linear(cfg.dim, cfg.dim_out)
+        self.norm_out = ConditionalLayerNorm(cfg.dim_out, dim_ctx= cfg.dim_coords)
+        self.proj_out2 = Linear(cfg.dim_out, cfg.dim_out)
 
          # Self-conditioning networks
         self.query_conditioning = ConditioningNetwork(cfg.dim)
@@ -48,7 +50,7 @@ class StochasticWeatherField(Module):
 
         # Initialization
         self.apply(self.base_init)
-        #self.apply(self.zero_init)    
+        self.apply(self.zero_init)    
 
     @staticmethod
     def base_init(m):
@@ -95,7 +97,9 @@ class StochasticWeatherField(Module):
         return None
     
     def to_x(self, src, src_coords):
-        x = self.norm_in(self.proj_in(src)) + self.x_coords(src_coords)
+        x = self.proj_in(src)
+        ctx = self.film(src_coords[..., 1])
+        x = self.norm_in(x, ctx) + self.x_coords(src_coords)
         return x
     
     def to_q(self, tgt_coords, q_prev):
@@ -113,6 +117,12 @@ class StochasticWeatherField(Module):
         z = self.latent_conditioning(z_init, z_prev)
         return z
 
+    def to_out(self, q, tgt_coords):
+        ctx = self.film(tgt_coords[..., 1])
+        q = self.proj_out1(q)
+        q = self.norm_out(q, ctx)
+        return self.proj_out2(q)
+
     def step(self, 
             src: torch.Tensor, 
             src_coords: torch.Tensor, 
@@ -120,9 +130,10 @@ class StochasticWeatherField(Module):
             q_prev: torch.Tensor = None,
             z_prev: torch.Tensor = None,
             ):
-        
+        # Input embedding
         x = self.to_x(src, src_coords)
         z = self.to_z(src, z_prev)
+        q = self.to_q(tgt_coords, q_prev)
 
         #Interface network over src only
         if self.encoder is not None:
@@ -130,14 +141,13 @@ class StochasticWeatherField(Module):
                 x, z = block(x, z)
 
         # Interface network over src and query
-        q = self.to_q(tgt_coords, q_prev)
         packed, packed_shape = pack([x, q], "b * d")
         for block in self.decoder:
             packed, z = block(packed, z)
         _, q = unpack(packed, packed_shape, "b * d")
 
         # Decode query only
-        pred = self.proj_out(q)
+        pred = self.to_out(q, tgt_coords)
 
         # Return prediction, query, and latent states
         return pred, q, z
