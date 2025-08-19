@@ -11,6 +11,32 @@ from typing import Optional, Tuple
 def get_weight_std(weight: Tensor):
     return 1 / weight.size(-1)**0.5
 
+class Perceiver(Module):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
+        """
+        dim: block dimension
+        num_blocks: number of latent transformer blocks
+        dim_heads: dimension of heads in attention
+        """
+        super().__init__()
+        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
+        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
+        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= False)
+
+    def forward(self, x: Tensor, z: Tensor, q: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        """
+        x: tensor of shape (B, *, N, D)
+        z: tensor of shape (B, *, M, D)
+        q: tensor of shape (B, *, Q, D)
+        ctx: (optional) conditioning tensor of shape (B, D)
+        returns tuple of (q, z) 
+        """
+        z = self.read(q = z, kv = x, ctx = ctx)
+        for block in self.compute:
+            z = block(z, ctx = ctx)
+        q = self.write(q = q, kv = z, ctx = ctx)
+        return q, z
+
 class Interface(Module):
     def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
         """
@@ -37,12 +63,13 @@ class Interface(Module):
         return x, z
 
 class TransformerBlock(Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, **kwargs):
+    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.att = Attention(dim, dim_heads)
         self.ffn = GatedFFN(dim)
+        self.has_skip = has_skip
 
     def forward(self, q: Tensor, kv: Optional[Tensor] = None, ctx: Optional[Tensor] = None, **attn_kwargs):
         """
@@ -51,7 +78,7 @@ class TransformerBlock(Module):
         ctx: (optional) conditioning tensor of shape (*, D) where * must broadcast with q
         returns: tensor of shape (B, N, D)
         """
-        skip = q
+        skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
         kv = kv if kv is not None else q
         q = skip + self.att(q, kv, kv, **attn_kwargs)

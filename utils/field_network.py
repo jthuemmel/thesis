@@ -2,9 +2,77 @@ import torch
 from torch.nn import Embedding, Module, ModuleList, Linear, init, LayerNorm
 from einops import rearrange, repeat, pack, unpack
 from dataclasses import dataclass
-from utils.networks import Interface
 from utils.cpe import ContinuousPositionalEmbedding
 from utils.components import *
+
+class WeatherField(Module):
+    def __init__(self, model_cfg: dataclass):
+        super().__init__()
+        cfg = model_cfg.decoder
+
+        self.perceiver = Perceiver(cfg.dim, cfg.num_layers)
+
+        # Latents
+        self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
+        self.film = Embedding(cfg.num_features, cfg.dim_coords)
+        
+        # Coordinates
+        self.x_coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+        self.q_coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+
+        # I/O
+        self.proj_in1 = Linear(cfg.dim_in, cfg.dim)
+        self.norm_in = ConditionalLayerNorm(cfg.dim, dim_ctx= cfg.dim_coords)
+
+        self.proj_out1 = Linear(cfg.dim, cfg.dim_out)
+        self.norm_out = ConditionalLayerNorm(cfg.dim_out, dim_ctx= cfg.dim_coords)
+        self.proj_out2 = Linear(cfg.dim_out, cfg.dim_out)
+
+        # Initialization
+        self.apply(self.base_init)
+        self.apply(self.zero_init)    
+
+    @staticmethod
+    def base_init(m):
+        if isinstance(m, Linear):
+            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+            if m.bias is not None:
+                init.zeros_(m.bias)
+
+        if isinstance(m, Embedding):
+            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+
+        if isinstance(m, LayerNorm):
+            if m.bias is not None:
+                init.zeros_(m.bias)
+            if m.weight is not None:
+                init.ones_(m.weight)
+
+        if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
+            torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
+
+    @staticmethod
+    def zero_init(m):
+        if isinstance(m, Attention):
+            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
+        if isinstance(m, GatedFFN):
+            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
+
+    def forward(self, 
+            src: torch.Tensor, 
+            src_coords: torch.Tensor, 
+            tgt_coords: torch.Tensor,
+            num_steps: int = 1,
+            ):
+        z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
+        x = self.norm_in(self.proj_in1(src), self.film(src_coords[..., 1])) 
+        x = x + self.x_coords(src_coords)
+        q = self.q_coords(tgt_coords)
+        q = self.perceiver(x, z, q)
+        q = self.norm_out(self.proj_out1(q), self.film(tgt_coords[...,1]))
+        q = self.proj_out2(q)
+        return q
+
 
 class StochasticWeatherField(Module):
     def __init__(self, model_cfg: dataclass):
@@ -134,6 +202,8 @@ class StochasticWeatherField(Module):
         x = self.to_x(src, src_coords)
         z = self.to_z(src, z_prev)
         q = self.to_q(tgt_coords, q_prev)
+
+        
 
         #Interface network over src only
         if self.encoder is not None:
