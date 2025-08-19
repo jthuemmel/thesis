@@ -15,7 +15,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import utils.config as cfg
 from utils.loss_fn import f_kernel_crps, f_gaussian_ignorance
-from utils.field_network import StochasticWeatherField
+from utils.field_network import StochasticWeatherField, WeatherField
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
 
@@ -122,7 +122,7 @@ class TrainerMixin(DistributedTrainer):
 
     # MODEL
     def create_model(self):
-        model = StochasticWeatherField(self.model_cfg)      
+        model = WeatherField(self.model_cfg)      
         if hasattr(model, "generator"):
             model.generator = self.generator
         count = count_parameters(model)
@@ -198,10 +198,11 @@ class TrainerMixin(DistributedTrainer):
         nino4_rmse = np.sqrt(((nino4_tgt - nino4_pred)**2).mean(["time"]))
         nino34_rmse = np.sqrt(((nino34_tgt - nino34_pred)**2).mean(["time"]))
         # Log
-        self.current_metrics.log_python_object(f"nino4_pcc", list(nino4_pcc.values))
-        self.current_metrics.log_python_object(f"nino34_pcc", list(nino34_pcc.values))
-        self.current_metrics.log_python_object(f"nino4_rmse", list(nino4_rmse.values))
-        self.current_metrics.log_python_object(f"nino34_rmse", list(nino34_rmse.values))
+        for lag in [3, 9, 15, 21]:
+            self.current_metrics.log_metric(f"nino4_pcc_{lag}", nino4_pcc.sel(lag = lag).values)
+            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).values)
+            self.current_metrics.log_metric(f"nino4_rmse_{lag}", nino4_rmse.sel(lag = lag).values)
+            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).values)
 
     @property
     def xr_ds_eval(self):

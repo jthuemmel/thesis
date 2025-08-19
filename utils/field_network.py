@@ -23,10 +23,8 @@ class WeatherField(Module):
         # I/O
         self.proj_in1 = Linear(cfg.dim_in, cfg.dim)
         self.norm_in = ConditionalLayerNorm(cfg.dim, dim_ctx= cfg.dim_coords)
-
         self.proj_out1 = Linear(cfg.dim, cfg.dim_out)
-        self.norm_out = ConditionalLayerNorm(cfg.dim_out, dim_ctx= cfg.dim_coords)
-        self.proj_out2 = Linear(cfg.dim_out, cfg.dim_out)
+        self.norm_out = ConditionalLayerNorm(cfg.dim, dim_ctx= cfg.dim_coords)
 
         # Initialization
         self.apply(self.base_init)
@@ -65,12 +63,14 @@ class WeatherField(Module):
             num_steps: int = 1,
             ):
         z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
-        x = self.norm_in(self.proj_in1(src), self.film(src_coords[..., 1])) 
+        x = self.proj_in1(src)
+        x = self.norm_in(x) 
         x = x + self.x_coords(src_coords)
+
         q = self.q_coords(tgt_coords)
-        q = self.perceiver(x, z, q)
-        q = self.norm_out(self.proj_out1(q), self.film(tgt_coords[...,1]))
-        q = self.proj_out2(q)
+        q, z = self.perceiver(x, z, q)
+        q = self.norm_out(q, self.film(tgt_coords[...,1]))
+        q = self.proj_out1(q)
         return q
 
 
