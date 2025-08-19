@@ -154,6 +154,87 @@ class TrainerMixin(DistributedTrainer):
         self.compute_metrics(pred = tgt_pred, obs = tgt, lsm = lsm, label = None)
         return loss
     
+    def frcst_step(self, batch_idx, batch):
+        # step
+        tgt_pred, tgt, lsm, var = self.step(batch_idx, batch, "frcst")        
+        self.get_frcst_metrics(pred = tgt_pred, obs = tgt, lsm = lsm)
+        return tgt_pred, tgt
+    
+    def evaluate_epoch(self):
+        self.switch_mode(train=False)
+        if not exists(self.val_dl):
+            return
+        
+        samples = []
+        for batch_idx, batch in enumerate(self.val_dl):
+            #no gradients needed for evaluation
+            with torch.no_grad():
+                with torch.amp.autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
+                    _ = self.forward_step(batch_idx, batch)
+                    tgt_pred, tgt = self.frcst_step(batch_idx, batch)
+                    samples.append(self.get_arrays(batch_idx, tgt_pred, tgt))
+
+        ds = xr.concat(samples, dim = "time")
+        self.get_nino_metrics(ds)
+
+    @staticmethod
+    def get_nino4(da: xr.DataArray):
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+    
+    @staticmethod
+    def get_nino34(da: xr.DataArray):
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+
+    def get_nino_metrics(self, eval_data: xr.Dataset):
+        # {var: T, Lag, Lat, Lon, (Ens)}
+        eval_data = eval_data.sel(time = slice("1700", "2010"), lat = slice(-20., 20.), lon = slice(90, 270))
+        # T, Lag, (Ens)
+        nino4_tgt, nino4_pred = self.get_nino4(eval_data["temp_ocn_0a_tgt"]), self.get_nino4(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        # PCC [Lag]
+        nino4_pcc = (nino4_tgt * nino4_pred).sum("time") / (((nino4_tgt ** 2).sum("time") ** 0.5) * (nino4_pred ** 2).sum("time") ** 0.5)
+        nino34_pcc = (nino34_tgt * nino34_pred).sum("time") / (((nino34_tgt ** 2).sum("time") ** 0.5) * (nino34_pred ** 2).sum("time") ** 0.5)
+        # RMSE [Lag]
+        nino4_rmse = np.sqrt(((nino4_tgt - nino4_pred)**2).mean(["time"]))
+        nino34_rmse = np.sqrt(((nino34_tgt - nino34_pred)**2).mean(["time"]))
+        # Log
+        self.current_metrics.log_python_object(f"nino4_pcc", list(nino4_pcc.values))
+        self.current_metrics.log_python_object(f"nino34_pcc", list(nino34_pcc.values))
+        self.current_metrics.log_python_object(f"nino4_rmse", list(nino4_rmse.values))
+        self.current_metrics.log_python_object(f"nino34_rmse", list(nino34_rmse.values))
+
+    @property
+    def xr_ds_eval(self):
+        return self.val_dataset.dataset
+    
+    def get_arrays(self, batch_idx, pred, obs):
+        #meta data
+        time, lat, lon = self.xr_ds_eval.time, self.xr_ds_eval.lat, self.xr_ds_eval.lon
+        ens = np.arange(pred.shape[-1])
+        tau = self.world_cfg.tau
+        T, tt = self.token_sizes["t"], self.patch_sizes["tt"]
+        lag = np.arange(1, 1 + ((T - tau) * tt))
+        # to field and numpy
+        pred, obs = self.frcst_to_field(pred).float().cpu().numpy(), self.frcst_to_field(obs).float().cpu().numpy()
+        # variables
+        arrays = []
+        for v, var in enumerate(self.data_cfg.variables):
+            #create xarray
+            data_array = xr.Dataset(
+                data_vars = {
+                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], np.sort(pred[:, v], axis = -1)),
+                    f"{var}_tgt": (["time", "lag", "lat", "lon"], obs[:, v]),
+                },
+                coords = {
+                    "time": time[batch_idx * self.batch_size: (batch_idx + 1) * self.batch_size],
+                    "lag": lag,
+                    "lat": lat,
+                    "lon": lon,
+                    "ens": ens
+                },
+            )
+            arrays.append(data_array)
+        return xr.merge(arrays)
 ###
 class ShapeMixin:
     # HELPERS
@@ -639,7 +720,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         tokens = self.field_to_tokens(batch.to(self.device))
         
         # masking
-        src_mask, tgt_mask = self.prior() if task is not "frcst" else self.frcst() 
+        src_mask, tgt_mask = self.prior() if task != "frcst" else self.frcst() 
         src, tgt= self.apply_masks(tokens, src_mask, tgt_mask)
         lsm, var = self.get_loss_masks(tgt_mask)
         
