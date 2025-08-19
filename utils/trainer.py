@@ -414,22 +414,22 @@ class DistributedTrainer(TrainerInterface):
         self.destroy_process_group()
 
     def log_wandb(self):
-            metrics = {}
-            for key, value in self.train_metrics.scalar_metrics()[-1].items():
-                metrics[f'train/{key}'] = value
+        metrics = {}
+        for key, value in self.train_metrics.scalar_metrics()[-1].items():
+            metrics[f'train/{key}'] = value
 
-            for key, value in self.val_metrics.scalar_metrics()[-1].items():
-                metrics[f'val/{key}'] = value
+        for key, value in self.val_metrics.scalar_metrics()[-1].items():
+            metrics[f'val/{key}'] = value
 
-            for key, value in self.misc_metrics.scalar_metrics()[-1].items():
-                metrics[f'misc/{key}'] = value
+        for key, value in self.misc_metrics.scalar_metrics()[-1].items():
+            metrics[f'misc/{key}'] = value
 
-            wandb.log(metrics)
-            if self.is_best_epoch():
-                wandb.run.summary['best/epoch'] = self.current_epoch
-                for key, value in metrics.items():
-                    if not key.startswith('misc'):
-                        wandb.run.summary[f'best/{key}'] = value
+        wandb.log(metrics)
+        if self.is_best_epoch():
+            wandb.run.summary['best/epoch'] = self.current_epoch
+            for key, value in metrics.items():
+                if not key.startswith('misc'):
+                    wandb.run.summary[f'best/{key}'] = value
 
     def load_state_dict(self, state_dict):
         self.current_epoch = state_dict['epoch']
