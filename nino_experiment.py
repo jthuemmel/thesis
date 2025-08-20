@@ -12,10 +12,12 @@ from functools import cached_property
 from omegaconf import OmegaConf
 from typing import Tuple, Iterable
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.functional import one_hot
 
 import utils.config as cfg
 from utils.loss_fn import f_kernel_crps, f_gaussian_ignorance
-from utils.field_network import StochasticWeatherField, WeatherField
+from utils.field_network import StochasticWeatherField
+from utils.model import WeatherField
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
 
@@ -236,7 +238,8 @@ class TrainerMixin(DistributedTrainer):
             )
             arrays.append(data_array)
         return xr.merge(arrays)
-###
+
+### TOKENIZATION
 class ShapeMixin:
     # HELPERS
     @staticmethod
@@ -294,91 +297,6 @@ class ShapeMixin:
     @cached_property
     def sizes(self):
         return {**self.plate_sizes, **self.token_sizes, **self.patch_sizes}
-
-#### MASKING
-class SamplingMixin:
-    def measure(self, axes: Iterable[str]) -> int:
-        return math.prod(self.shape_of(axes))
-
-    def k_from_rate(self, rate: float, axes: Iterable[str]) -> int:
-        m = self.measure(axes)
-        return int(max(0, min(m, int(rate * m))))
-
-    # generators
-    def constant(self, axes: Iterable[str], val=1.):
-        A = self._as_axes(axes)
-        return torch.as_tensor(val, device=self.device, dtype = torch.float).broadcast_to(self.shape_of(A)).rename(*A)
-
-    def dirichlet(self, axes: Iterable[str], logits=1.0, sharpness=1.0):
-        A = self._as_axes(axes)
-        alpha = sharpness * self.constant(A, logits).softmax(-1)
-        return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*A)
-
-    def trunc_normal(self, axes: Iterable[str], mean=0., std=0., a=0., b=1.):
-        A = self._as_axes(axes)
-        w = torch.empty(self.shape_of(A), device=self.device)
-        w = torch.nn.init.trunc_normal_(w, mean=mean, std=std, a=a, b=b, generator=self.generator) if std > 0 else w.fill_(mean)
-        return w.rename(*A)
-
-    def uniform(self, axes: Iterable[str]):
-        A = self._as_axes(axes)
-        return torch.rand(self.shape_of(A), device=self.device, generator=self.generator).rename(*A)
-
-    # product/contract
-    def marginalize(self, factors: Iterable[torch.Tensor], axes: Iterable[str]):
-        F = self._as_factors(factors)
-        names = {n for f in F for n in f.names if exists(n)}
-        A = self._as_axes(axes)
-        plates = tuple(self.constant(ax) for ax in A if ax not in names)
-        inputs = F + plates
-        args = tuple(f.rename(None) for f in inputs)
-        lhs  = ",".join(" ".join(f.names) for f in inputs)
-        rhs  = " ".join(A)
-        return einops.einsum(*args, f"{lhs} -> {rhs}").rename(*A)
-
-    # indicator from index
-    def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
-        return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
-
-    # packing/unpacking events
-    def pack(self, factor: torch.Tensor, axes: Iterable[str]):
-        A = self._as_axes(axes)
-        plate = tuple(n for n in factor.names if n not in A)
-        x = factor.align_to(*(plate + A)).rename(None)
-        pattern = (" ".join(plate) + " *").strip()
-        flat, _ = einops.pack([x], pattern)
-        return flat.rename(*(plate + ("event",)))
-
-    def unpack(self, factor: torch.Tensor, axes: Iterable[str]):
-        A = self._as_axes(axes)
-        plate = tuple(n for n in factor.names if n != "event")
-        pattern = (" ".join(plate) + " *").strip()
-        [restored] = einops.unpack(factor.rename(None), pattern=pattern, packed_shapes=[self.shape_of(A)])
-        return restored.rename(*(plate + A))
-
-    # selection and conditioning
-    def select(self, factor: torch.Tensor, k: int, axis: str = "event", method: str = "topk"):
-        plate = tuple(n for n in factor.names if n != axis)
-        x = factor.align_to(*(plate + self._as_axes(axis))).rename(None)
-        flat = einops.rearrange(x, "... ax -> (...) ax")
-        if method == "topk":
-            idcs = flat.topk(k, sorted=False, dim=-1).indices
-        else:
-            idcs = torch.multinomial(flat, k, replacement=False, generator=self.generator)
-        front = " ".join(plate)
-        idcs = einops.rearrange(idcs, f"({front}) ax -> {front} ax", **self.sizes_of(plate))
-        return idcs.rename(*(plate + ("event",)))
-
-    def take(self, factor: torch.Tensor, idx: torch.LongTensor, axis: str = "event"):
-        dim = factor.names.index(axis)
-        out_names = tuple("event" if n == axis else n for n in factor.names)
-        out_shape = tuple(idx.size("event") if n == axis else factor.size(n) for n in factor.names)
-        idx = idx.align_to(*out_names).rename(None).expand(out_shape)
-        gathered = torch.gather(factor.rename(None), dim=dim, index=idx)
-        return gathered.rename(*out_names)
-
-### TOKENIZATION
-class TokenMixin:       
     # PATTERNS
     @property
     def lsm_pattern(self):
@@ -424,21 +342,19 @@ class TokenMixin:
         lhs, rhs = 'b (m h w) (d hh ww) ...', '(... b m d) (h hh) (w ww)' # use dummy names for the masked parts
         valid_axes = ('h', 'w', 'hh','ww') # need to ensure that we only query spatial sizes
         return einops.rearrange(tokens.rename(None), f'{lhs} -> {rhs}', **{ax: self.sizes[ax] for ax in valid_axes})
-
+    
     # COORDINATE TRANSFORMS
-    @staticmethod
-    def compute_strides(sizes: dict, layout: tuple):
-        strides = {}
+    def compute_strides(self, layout: tuple):
+        strides, sizes = {}, self.sizes_of(layout)
         stride = 1
         for ax in reversed(layout):
             strides[ax] = stride
             stride *= sizes[ax]
         return strides
     
-    def index_to_coords(self, idx_flat: torch.LongTensor, sizes: dict = None, layout: tuple = None):
-        sizes = sizes if exists(sizes) else self.token_sizes
+    def index_to_coords(self, idx_flat: torch.LongTensor, layout: tuple = None):
         layout = layout if exists(layout) else self.token_layout
-        strides = self.compute_strides(sizes, layout)
+        strides = self.compute_strides(layout)
         rem = idx_flat.rename(None)
         coords = []
         for ax in layout:
@@ -447,13 +363,91 @@ class TokenMixin:
             coords.append(val)
         return torch.stack(coords, dim=-1) 
 
-    def coords_to_index(self, coords: torch.LongTensor, sizes: dict = None, layout: tuple = None):
-        sizes = sizes if exists(sizes) else self.token_sizes
+    def coords_to_index(self, coords: torch.LongTensor, layout: tuple = None):
         layout = layout if exists(layout) else self.token_layout
-        strides = self.compute_strides(sizes, layout)
+        strides = self.compute_strides(layout)
         # Compute dot product over coordinate axis
         idx = sum(coords[..., i] * strides[ax] for i, ax in enumerate(layout))
         return idx 
+
+#### MASKING
+class SamplingMixin:
+    def measure(self, axes: Iterable[str]) -> int:
+        return math.prod(self.shape_of(axes))
+
+    def k_from_rate(self, rate: float, axes: Iterable[str]) -> int:
+        m = self.measure(axes)
+        r = torch.as_tensor(rate, device = self.device)
+        return (r * m).long().clamp(1, m)
+
+    # generators
+    def constant(self, axes: Iterable[str], val=1.):
+        A = self._as_axes(axes)
+        return torch.as_tensor(val, device=self.device, dtype = torch.float).broadcast_to(self.shape_of(A)).rename(*A)
+
+    def dirichlet(self, axes: Iterable[str], logits=1.0, sharpness=1.0):
+        A = self._as_axes(axes)
+        alpha = sharpness * self.constant(A, logits).softmax(-1)
+        return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*A)
+
+    def trunc_normal(self, axes: Iterable[str], mean=0., std=0., a=0., b=1.):
+        A = self._as_axes(axes)
+        w = torch.empty(self.shape_of(A), device=self.device)
+        w = torch.nn.init.trunc_normal_(w, mean=mean, std=std, a=a, b=b, generator=self.generator) if std > 0 else w.fill_(mean)
+        return w.rename(*A)
+
+    def uniform(self, axes: Iterable[str]):
+        A = self._as_axes(axes)
+        return torch.rand(self.shape_of(A), device=self.device, generator=self.generator).rename(*A)
+
+    # product/contract
+    def marginalize(self, factors: Iterable[torch.Tensor], axes: Iterable[str]):
+        F = self._as_factors(factors)
+        names = {n for f in F for n in f.names if exists(n)}
+        A = self._as_axes(axes)
+        plates = tuple(self.constant(ax) for ax in A if ax not in names)
+        inputs = F + plates
+        args = tuple(f.rename(None) for f in inputs)
+        lhs  = ",".join(" ".join(f.names) for f in inputs)
+        rhs  = " ".join(A)
+        return einops.einsum(*args, f"{lhs} -> {rhs}").rename(*A)
+
+    # packing/unpacking events
+    def pack(self, factor: torch.Tensor, axes: Iterable[str]):
+        A = self._as_axes(axes)
+        plate = tuple(n for n in factor.names if n not in A)
+        x = factor.align_to(*(plate + A)).rename(None)
+        pattern = (" ".join(plate) + " *").strip()
+        flat, _ = einops.pack([x], pattern)
+        return flat.rename(*(plate + ("event",)))
+
+    def unpack(self, factor: torch.Tensor, axes: Iterable[str]):
+        A = self._as_axes(axes)
+        plate = tuple(n for n in factor.names if n != "event")
+        pattern = (" ".join(plate) + " *").strip()
+        [restored] = einops.unpack(factor.rename(None), pattern=pattern, packed_shapes=[self.shape_of(A)])
+        return restored.rename(*(plate + A))
+
+    # selection and conditioning
+    def select(self, factor: torch.Tensor, k: int, axis: str = "event", method: str = "topk"):
+        plate = tuple(n for n in factor.names if n != axis)
+        x = factor.align_to(*(plate + self._as_axes(axis))).rename(None)
+        flat = einops.rearrange(x, "... ax -> (...) ax")
+        if method == "topk":
+            idcs = flat.topk(k, sorted=False, dim=-1).indices
+        else:
+            idcs = torch.multinomial(flat, k, replacement=False, generator=self.generator)
+        front = " ".join(plate)
+        idcs = einops.rearrange(idcs, f"({front}) ax -> {front} ax", **self.sizes_of(plate))
+        return idcs.rename(*(plate + ("event",)))
+
+    def take(self, factor: torch.Tensor, idx: torch.LongTensor, axis: str = "event"):
+        dim = factor.names.index(axis)
+        out_names = tuple("event" if n == axis else n for n in factor.names)
+        out_shape = tuple(idx.size("event") if n == axis else factor.size(n) for n in factor.names)
+        idx = idx.align_to(*out_names).rename(None).expand(out_shape)
+        gathered = torch.gather(factor.rename(None), dim=dim, index=idx)
+        return gathered.rename(*out_names)
     
 ### ENSO DATA
 class OceanMixin:
@@ -613,7 +607,7 @@ class MetricsMixin:
             p, o, l = (x[:, vi, ti] for x in (pred, obs, lsm)) # select the task-specific subset
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
-class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMixin, ShapeMixin):
+class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMixin):
     ### Masking
     @cached_property
     def per_variable_weights(self):
@@ -646,64 +640,79 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
     def get_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "multinomial"):
         A = self._as_axes(axes)
         F = self._as_factors(factors)
-        F = self.marginalize(F, self.plate_layout + A)
-        packed = self.pack(F, A)
-        k = self.k_from_rate(rate, A)
-        return self.select(packed, k, method=method)
+        K = self.k_from_rate(rate, A)
+        joint = self.marginalize(F, self.plate_layout + A)
+        flat = self.pack(joint, A)  
+        return self.select(flat, K, method=method)
 
-    def get_gate(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "topk"):
+    def get_multi_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], axis: str, rate: float, method: str = "multinomial"):
         A = self._as_axes(axes)
         F = self._as_factors(factors)
-        F = self.marginalize(F, self.plate_layout + A)
-        packed = self.pack(F, A)
-        k = self.k_from_rate(rate, A)
-        idx = self.select(packed, k, method=method)
-        binary = self.indicator(packed, idx)
-        return self.unpack(binary, A)
-    
-    def dirichlet_1d(self, d: str):
-        return self.dirichlet(self.plate_layout + self._as_axes(d), #broadcast over plates
-                              sharpness= self.world_cfg.alphas.get(d, 1.), 
-                              logits= self.world_cfg.weights.get(d, 1.))
-    
+        M = tuple(a for a in A if a != axis)
+        rates = self.split_rate(axis, rate)
+        K = self.k_from_rate(rates, M)
+        idcs = []
+        for i in range(len(K)):
+            I = self._as_factors(self.indicator(self.arange_axis(axis), i))
+            joint = self.marginalize(F + I, self.plate_layout + A)
+            flat = self.pack(joint, A)
+            idcs.append(self.select(flat, K[i], method=method).rename(None))
+        idx = torch.cat(idcs, dim = -1)
+        return idx.rename(*flat.names)
+
+    def split_rate(self, d: str, rate: float):
+        w = self.dirichlet(d, sharpness= self.world_cfg.alphas.get(d, 1.),  logits= self.world_cfg.weights.get(d, 1.))
+        return (rate * w).refine_names(..., d)
+
+    def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
+        return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
+
     def dirichlet_Nd(self, axes: Iterable[str]):
         #combine multiple 1d dirichlet priors via outer product
         A = self._as_axes(axes)
-        return self.marginalize([self.dirichlet_1d(ax) for ax in A], self.plate_layout + A)
+        return self.marginalize([self.dirichlet_batched(ax) for ax in A], self.plate_layout + A)
 
-    def split_index(self, axis: str, split_at: int):
-        idx = torch.arange(self.token_sizes[axis], device = self.device).rename(*self._as_axes(axis))
-        front, tail = idx[:split_at], idx[split_at:]
-        return self.indicator(idx, front), self.indicator(idx, tail)
+    def dirichlet_batched(self, d: str):
+        A = self.plate_layout + self._as_axes(d)
+        return self.dirichlet(A,sharpness= self.world_cfg.alphas.get(d, 1.), logits= self.world_cfg.weights.get(d, 1.)).refine_names(*A)
+
+    def arange_axis(self, d: str):
+        return torch.arange(self.token_sizes[d], device = self.device).rename(d)
+
+    def split_index(self, d: str, split_at: int):
+        idx = self.arange_axis(d)
+        front = self.indicator(idx, idx[:split_at])
+        tail = self.indicator(idx, idx[split_at:])
+        return front, tail
     
+
     ### PRIORS
     def src_rate(self):
         cfg = self.world_cfg.mask_rates_src
-        return self.trunc_normal('rate', **cfg) if exists(cfg) else 1.
+        return self.trunc_normal('rate', **cfg).rename(None) if exists(cfg) else 1.
     
     def tgt_rate(self):
         cfg = self.world_cfg.mask_rates_tgt
-        return self.trunc_normal('rate', **cfg) if exists(cfg) else 1.
+        return self.trunc_normal('rate', **cfg).rename(None) if exists(cfg) else 1.
 
     def frcst(self):
         tau = self.world_cfg.tau 
         r = tau / self.token_sizes['t']
-        src_gate, tgt_gate = self.split_index('t', tau)
-        src_mask = self.get_index(src_gate, self.token_layout, rate = r, method='topk')
-        tgt_mask = self.get_index(tgt_gate, self.token_layout, rate = 1 - r, method='topk')
+        W_src, W_tgt = self.split_index('t', tau)
+        src_mask = self.get_index(W_src, self.token_layout, rate = r, method='topk')
+        tgt_mask = self.get_index(W_tgt, self.token_layout, rate = 1 - r, method='topk')
         return src_mask, tgt_mask
 
     def prior(self):
         R_src, R_tgt = self.src_rate(), self.tgt_rate()
-        A = self._as_axes(('t', 'v')) if 'v' in self.world_cfg.alphas else self._as_axes('t')
-        W = self.dirichlet_Nd(A)
-        W_src, W_tgt = self.logit_mirror(W)
-        src_mask = self.get_index(W_src, self.token_layout, rate = R_src)
-        tgt_mask = self.get_index(W_tgt, self.token_layout, rate = R_tgt)
+        A = ('t', 'v') if 'v' in self.world_cfg.alphas else 't'
+        W_src, W_tgt = self.logit_mirror(self.dirichlet_Nd(A))
+        src_mask = self.get_index(W_src, self.token_layout, R_src.item())
+        tgt_mask = self.get_index(W_tgt, self.token_layout, R_tgt.item())
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
-        tokens = tokens.rename('b', 'event', 'dim')
+        tokens = tokens.rename('b', 'event','dim')
         src = self.take(tokens, src_mask)
         tgt = self.take(tokens, tgt_mask)
         return src.rename(None), tgt.rename(None)
@@ -735,7 +744,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, TokenMixin, SamplingMix
         
         # forward
         with sdpa_kernel(self.backend):
-            tgt_pred = self.model(src, src_coords, tgt_coords, num_steps=1)
+            tgt_pred = self.model(src, src_coords, tgt_coords)
 
         # split out ensemble dimension(s) if necessary
         tgt_pred = einops.rearrange(tgt_pred, '(b k) ... (c e) -> b ... c (k e)', c = tokens.size(-1), b = tokens.size(0))
