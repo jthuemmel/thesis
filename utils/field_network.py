@@ -5,74 +5,20 @@ from dataclasses import dataclass
 from utils.cpe import ContinuousPositionalEmbedding
 from utils.components import *
 
-class WeatherField(Module):
-    def __init__(self, model_cfg: dataclass):
+class ConditioningNetwork(Module):
+    '''Self-conditioning network from Jabri et al. 2023'''
+    def __init__(self, dim: int):
         super().__init__()
-        cfg = model_cfg.decoder
-
-        self.perceiver = Perceiver(cfg.dim, cfg.num_layers)
-
-        # Latents
-        self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
-        self.film = Embedding(cfg.num_features, cfg.dim_coords)
-        
-        # Coordinates
-        self.x_coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
-        self.q_coords = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
-
-        # I/O
-        self.proj_in1 = Linear(cfg.dim_in, cfg.dim)
-        self.norm_in = ConditionalLayerNorm(cfg.dim, dim_ctx= cfg.dim_coords)
-        self.proj_out1 = Linear(cfg.dim, cfg.dim_out)
-        self.norm_out = ConditionalLayerNorm(cfg.dim, dim_ctx= cfg.dim_coords)
+        self.ffn = GatedFFN(dim)
+        self.norm = LayerNorm(dim, elementwise_affine=True)
 
         # Initialization
-        self.apply(self.base_init)
-        self.apply(self.zero_init)    
+        init.zeros_(self.norm.weight)
+        init.zeros_(self.norm.bias)
 
-    @staticmethod
-    def base_init(m):
-        if isinstance(m, Linear):
-            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
-            if m.bias is not None:
-                init.zeros_(m.bias)
-
-        if isinstance(m, Embedding):
-            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
-
-        if isinstance(m, LayerNorm):
-            if m.bias is not None:
-                init.zeros_(m.bias)
-            if m.weight is not None:
-                init.ones_(m.weight)
-
-        if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
-            torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
-
-    @staticmethod
-    def zero_init(m):
-        if isinstance(m, Attention):
-            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
-        if isinstance(m, GatedFFN):
-            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
-
-    def forward(self, 
-            src: torch.Tensor, 
-            src_coords: torch.Tensor, 
-            tgt_coords: torch.Tensor,
-            num_steps: int = 1,
-            ):
-        z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
-        x = self.proj_in1(src)
-        x = self.norm_in(x) 
-        x = x + self.x_coords(src_coords)
-
-        q = self.q_coords(tgt_coords)
-        q, z = self.perceiver(x, z, q)
-        q = self.norm_out(q, self.film(tgt_coords[...,1]))
-        q = self.proj_out1(q)
-        return q
-
+    def forward(self, initial: Tensor, previous: Tensor):
+        previous = zeros_like(initial) if previous is None else previous
+        return self.norm(previous + self.ffn(previous)) + initial
 
 class StochasticWeatherField(Module):
     def __init__(self, model_cfg: dataclass):
