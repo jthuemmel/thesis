@@ -1,9 +1,9 @@
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
-from torch import Tensor, zeros_like
-from torch.nn import Linear, Module, ModuleList, init, LayerNorm
-from torch.nn.functional import normalize, scaled_dot_product_attention, silu
+from torch import Tensor, zeros_like, LongTensor, is_autocast_enabled, get_autocast_dtype
+from torch.nn import Linear, Module, ModuleList, init, LayerNorm, Embedding
+from torch.nn.functional import normalize, scaled_dot_product_attention, silu, linear
 
 from typing import Optional, Tuple
 
@@ -133,17 +133,28 @@ class ConditionalLayerNorm(Module):
         x = (1. + scale) * self.norm(x) + shift
         return x
     
-class ConditioningNetwork(Module):
-    '''Self-conditioning network from Jabri et al. 2023'''
-    def __init__(self, dim: int):
+class SegmentLinear(Module):
+    def __init__(self, dim_in: int, dim_out: int, num_segments: int, bias: bool = True):
         super().__init__()
-        self.ffn = GatedFFN(dim)
-        self.norm = LayerNorm(dim, elementwise_affine=True)
+        self.dim_out = dim_out
+        self.weights = Embedding(num_segments, dim_in * dim_out)
+        self.bias = Embedding(num_segments, dim_out) if bias else None
 
-        # Initialization
-        init.zeros_(self.norm.weight)
-        init.zeros_(self.norm.bias)
-
-    def forward(self, initial: Tensor, previous: Tensor):
-        previous = zeros_like(initial) if previous is None else previous
-        return self.norm(previous + self.ffn(previous)) + initial
+    def forward(self, x: Tensor, coords: LongTensor):
+        # pre-allocate output tensor
+        out = x.new_empty(*x.shape[:-1], self.dim_out, dtype = get_autocast_dtype('cuda') if is_autocast_enabled() else x.dtype)
+        # flat views
+        xf = rearrange(x, '... d -> (...) d')
+        of = rearrange(out, '... d -> (...) d')
+        cf = rearrange(coords, '... -> (...)')
+        # determine which segments are present
+        segments = cf.unique(sorted = False)
+        # weights/bias for each segment
+        W = rearrange(self.weights(segments), 's (o i) -> s o i', o = self.dim_out)
+        b = None if self.bias is None else self.bias(segments)
+        # apply linear to segments
+        for i, s in enumerate(segments):
+            idx = (cf == s).nonzero().squeeze(1)
+            of.index_copy_(0, idx, linear(xf.index_select(0, idx), W[i], None if b is None else b[i]))
+        return out
+    
