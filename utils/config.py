@@ -107,8 +107,8 @@ class WorldConfig:
     num_ens: Optional[int] = None
 
     # factor priors
-    alphas: Dict[str, float] = field(default_factory=dict)      # e.g. {"t":3., "v":10.}
-    weights: Dict[str, object] = field(default_factory=dict)    # e.g. {"v":[10,1,1,1] or scalar}
+    alphas: Dict = field(default_factory=lambda:{})      # e.g. {"t":3., "v":10.}
+    weights: Dict = field(default_factory=lambda:{})    # e.g. {"v":[10,1,1,1] or scalar}
 
     # --- TokenMixin / SamplingMixin scaffolding ---
     plate_layout: Tuple[str, ...] = field(default_factory=lambda: ('b',))
@@ -116,7 +116,7 @@ class WorldConfig:
     patch_layout: Tuple[str, ...] = field(default_factory=lambda: ('tt','vv','hh','ww'))
 
     # sizes
-    size_cfg: Dict[str, int] = field(default_factory=lambda: {})
+    size_cfg: Dict = field(default_factory=lambda: {})
 
 
     def __post_init__(self):

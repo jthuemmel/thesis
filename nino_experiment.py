@@ -373,12 +373,13 @@ class ShapeMixin:
 #### MASKING
 class SamplingMixin:
     def measure(self, axes: Iterable[str]) -> int:
-        return math.prod(self.shape_of(axes))
+        A = self._as_axes(axes)
+        return math.prod(self.shape_of(A))
 
-    def k_from_rate(self, rate: float, axes: Iterable[str]) -> int:
+    def k_from_rate(self, rate: float | torch.Tensor, axes: Iterable[str]) -> int:
         m = self.measure(axes)
         r = torch.as_tensor(rate, device = self.device)
-        return (r * m).long().clamp(1, m)
+        return (r * m).long().clamp(1, m).item()
 
     # generators
     def constant(self, axes: Iterable[str], val=1.):
@@ -645,26 +646,25 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         flat = self.pack(joint, A)  
         return self.select(flat, K, method=method)
 
-    def get_multi_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], axis: str, rate: float, method: str = "multinomial"):
+    def get_multi_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rates: torch.Tensor, method: str = "multinomial"):
         A = self._as_axes(axes)
         F = self._as_factors(factors)
-        M = tuple(a for a in A if a != axis)
-        rates = self.split_rate(axis, rate)
-        K = self.k_from_rate(rates, M)
+        ax = rates.names
+        M = tuple(a for a in A if a not in ax)
+        idx = self.arange_axis(ax)
         idcs = []
-        for i in range(len(K)):
-            I = self._as_factors(self.indicator(self.arange_axis(axis), i))
+        for i in range(self.measure(ax)):
+            K = self.k_from_rate(rates[i], M)
+            I = self._as_factors(self.indicator(idx, i))
             joint = self.marginalize(F + I, self.plate_layout + A)
             flat = self.pack(joint, A)
-            idcs.append(self.select(flat, K[i], method=method).rename(None))
+            idcs.append(self.select(flat, K, method=method).rename(None))
         idx = torch.cat(idcs, dim = -1)
         return idx.rename(*flat.names)
-
-    def split_rate(self, d: str, rate: float):
-        w = self.dirichlet(d, sharpness= self.world_cfg.alphas.get(d, 1.),  logits= self.world_cfg.weights.get(d, 1.))
-        return (rate * w).refine_names(..., d)
+        
 
     def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
+        if not isinstance(idx, torch.LongTensor): idx = torch.as_tensor(idx, device = factor.device, dtype = torch.long)
         return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)
 
     def dirichlet_Nd(self, axes: Iterable[str]):
@@ -677,7 +677,8 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         return self.dirichlet(A,sharpness= self.world_cfg.alphas.get(d, 1.), logits= self.world_cfg.weights.get(d, 1.)).refine_names(*A)
 
     def arange_axis(self, d: str):
-        return torch.arange(self.token_sizes[d], device = self.device).rename(d)
+        A = self._as_axes(d)
+        return torch.arange(self.measure(A), device = self.device).rename(*A)
 
     def split_index(self, d: str, split_at: int):
         idx = self.arange_axis(d)
@@ -685,15 +686,14 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         tail = self.indicator(idx, idx[split_at:])
         return front, tail
     
-
     ### PRIORS
     def src_rate(self):
         cfg = self.world_cfg.mask_rates_src
-        return self.trunc_normal('rate', **cfg).rename(None) if exists(cfg) else 1.
+        return self.trunc_normal('v', **cfg) if exists(cfg) else 1.
     
     def tgt_rate(self):
         cfg = self.world_cfg.mask_rates_tgt
-        return self.trunc_normal('rate', **cfg).rename(None) if exists(cfg) else 1.
+        return self.trunc_normal('v', **cfg) if exists(cfg) else 1.
 
     def frcst(self):
         tau = self.world_cfg.tau 
@@ -704,11 +704,9 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         return src_mask, tgt_mask
 
     def prior(self):
-        R_src, R_tgt = self.src_rate(), self.tgt_rate()
-        A = ('t', 'v') if 'v' in self.world_cfg.alphas else 't'
-        W_src, W_tgt = self.logit_mirror(self.dirichlet_Nd(A))
-        src_mask = self.get_index(W_src, self.token_layout, R_src.item())
-        tgt_mask = self.get_index(W_tgt, self.token_layout, R_tgt.item())
+        W_src, W_tgt = self.logit_mirror(self.dirichlet_Nd('t'))
+        src_mask = self.get_multi_index(W_src, self.token_layout, rates = self.src_rate())
+        tgt_mask = self.get_multi_index(W_tgt, self.token_layout, rates = self.tgt_rate())
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
