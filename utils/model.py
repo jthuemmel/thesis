@@ -9,13 +9,14 @@ class WeatherField(Module):
     def __init__(self, model_cfg: dataclass):
         super().__init__()
         cfg = model_cfg.decoder
+        embedding_dim = (len(cfg.wavelengths) + 1) * cfg.dim_coords
 
         self.position_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, None)
         self.feature_embedding = Embedding(cfg.num_features, cfg.dim_coords)
-        embedding_dim = (len(cfg.wavelengths) + 1) * cfg.dim_coords
-
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
-        self.perceiver = Interface(cfg.dim, cfg.num_layers)
+
+        self.encoder = ModuleList([TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads) for _ in range(cfg.num_layers)])
+        self.decoder = TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads)
 
         self.proj_src = SegmentLinear(cfg.dim_in, cfg.dim_in, cfg.num_features)
         self.proj_x = SegmentLinear(embedding_dim + cfg.dim_in, cfg.dim, cfg.num_features)
@@ -75,6 +76,9 @@ class WeatherField(Module):
         x = self.norm_x(x)
         query = self.proj_q(q, var_tgt)
         latent = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
-        query, latent = self.perceiver(x, latent, query)
+        for block in self.encoder:
+            kv, _ = pack([x, latent], 'b * d')
+            latent = block(latent, kv)
+        query = self.decoder(query, latent)
         query = self.proj_out(query, var_tgt)
         return query
