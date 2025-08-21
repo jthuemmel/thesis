@@ -11,34 +11,8 @@ from typing import Optional, Tuple
 def get_weight_std(weight: Tensor):
     return 1 / weight.size(-1)**0.5
 
-class Perceiver(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
-        """
-        dim: block dimension
-        num_blocks: number of latent transformer blocks
-        dim_heads: dimension of heads in attention
-        """
-        super().__init__()
-        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= False)
-
-    def forward(self, x: Tensor, z: Tensor, q: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """
-        x: tensor of shape (B, *, N, D)
-        z: tensor of shape (B, *, M, D)
-        q: tensor of shape (B, *, Q, D)
-        ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (q, z) 
-        """
-        z = self.read(q = z, kv = x, ctx = ctx)
-        for block in self.compute:
-            z = block(z, ctx = ctx)
-        q = self.write(q = q, kv = z, ctx = ctx)
-        return q, z
-
 class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, write_has_skip: bool = True):
         """
         dim: block dimension
         num_blocks: number of latent transformer blocks
@@ -47,20 +21,21 @@ class Interface(Module):
         super().__init__()
         self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
         self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
+        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
 
-    def forward(self, x: Tensor, z: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, latent: Tensor, query: Optional[Tensor] = None, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """
-        x: tensor of shape (B, *, N, D)
-        z: tensor of shape (B, *, M, D)
+        x: input tensor of shape (B, *, N, D)
+        latent: latent tensor of shape (B, *, M, D)
+        query: (optional) query tensor of shape (B, *, Q, D)
         ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (x, z) 
+        returns tuple of (q, latent) 
         """
-        z = self.read(q = z, kv = x, ctx = ctx)
+        latent = self.read(q = latent, kv = x, ctx = ctx)
         for block in self.compute:
-            z = block(z, ctx = ctx)
-        x = self.write(q = x, kv = z, ctx = ctx)
-        return x, z
+            latent = block(latent, ctx = ctx)
+        query = self.write(q = x if query is None else query, kv = latent, ctx = ctx) #default to x as query
+        return query, latent
 
 class TransformerBlock(Module):
     def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
