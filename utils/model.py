@@ -10,14 +10,20 @@ class WeatherField(Module):
         super().__init__()
         cfg = model_cfg.decoder
 
-        self.position_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+        self.position_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, None)
+        self.feature_embedding = Embedding(cfg.num_features, cfg.dim_coords)
+        embedding_dim = (len(cfg.wavelengths) + 1) * cfg.dim_coords
+
         self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
+        self.perceiver = Interface(cfg.dim, cfg.num_layers)
 
-        self.perceiver = Perceiver(cfg.dim, cfg.num_layers)
-        self.to_x = SegmentLinear(cfg.dim_in, cfg.dim, cfg.num_features)
-        self.to_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
-        self.to_q = SegmentLinear(cfg.dim, cfg.dim, cfg.num_features)
+        self.proj_src = SegmentLinear(cfg.dim_in, cfg.dim_in, cfg.num_features)
+        self.proj_x = SegmentLinear(embedding_dim + cfg.dim_in, cfg.dim, cfg.num_features)
+        self.norm_x = LayerNorm(cfg.dim)
+        self.proj_q = SegmentLinear(embedding_dim, cfg.dim, cfg.num_features)
+        self.proj_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
 
+        
         # Initialization
         self.apply(self.base_init)
         self.apply(self.zero_init)    
@@ -53,11 +59,22 @@ class WeatherField(Module):
             src_coords: torch.Tensor, 
             tgt_coords: torch.Tensor,
             ):
-        pos_tgt, var_tgt = tgt_coords[..., (0, 2, 3)], tgt_coords[..., 1]
-        pos_src, var_src = src_coords[..., (0, 2, 3)], src_coords[..., 1]
-        z = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
-        x = self.to_x(src, var_src) + self.position_embedding(pos_src)
-        q = self.to_q(self.position_embedding(pos_tgt), var_tgt)
-        q, z = self.perceiver(x, z, q)
-        q = self.to_out(q, var_tgt)
-        return q
+        var_src, var_tgt = src_coords[..., 1], tgt_coords[..., 1]
+
+        # concatenate embedded inputs, positions and features
+        x, _ = pack([self.proj_src(src, var_src),
+                  self.feature_embedding(var_src),
+                  self.position_embedding(src_coords[..., (0, 2, 3)])], 
+                  'b n *')
+        
+        q, _ = pack([self.position_embedding(tgt_coords[..., (0, 2, 3)]),
+                     self.feature_embedding(var_tgt)],
+                    'b m *')
+        
+        x = self.proj_x(x, var_src)
+        x = self.norm_x(x)
+        query = self.proj_q(q, var_tgt)
+        latent = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
+        query, latent = self.perceiver(x, latent, query)
+        query = self.proj_out(query, var_tgt)
+        return query
