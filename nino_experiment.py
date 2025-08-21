@@ -115,12 +115,22 @@ class TrainerMixin(DistributedTrainer):
         )
 
     def create_scheduler(self, optimizer):
+        if self.cfg.scheduler_step == 'batch':
+            return torch.optim.lr_scheduler.OneCycleLR(
+                optimizer = optimizer,
+                max_lr = self.optim_cfg.lr,
+                total_steps = self.optim_cfg.total_steps,
+                pct_start = self.optim_cfg.warmup_steps / self.optim_cfg.total_steps,
+                cycle_momentum = False,
+                div_factor = self.optim_cfg.lr / self.optim_cfg.eta_min
+            )
         return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.optim_cfg.num_epochs,
-            eta_min=self.optim_cfg.eta_min,
-            last_epoch=-1,
-        )
+                optimizer,
+                T_max=self.optim_cfg.num_epochs,
+                eta_min=self.optim_cfg.eta_min,
+                last_epoch=-1,
+            )
+            
 
     # MODEL
     def create_model(self):
@@ -600,7 +610,7 @@ class MetricsMixin:
         
     def get_frcst_metrics(self, pred: torch.Tensor, obs: torch.Tensor, lsm: torch.Tensor):
         pred, obs, lsm = (self.frcst_to_field(x) for x in (pred, obs, lsm))
-        frcst_tasks = {"frcst": (slice(0,1), slice(None))} # default task, sst only
+        frcst_tasks = {"frcst": (slice(0, 1), slice(None))} # default task, sst only
         if exists(self.data_cfg.frcst_tasks): # additional tasks from config
             frcst_tasks.update(self.data_cfg.frcst_tasks)
         for label, (vi, ti) in frcst_tasks.items(): # for all tasks
@@ -662,7 +672,6 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         idx = torch.cat(idcs, dim = -1)
         return idx.rename(*flat.names)
         
-
     def indicator(self, factor: torch.Tensor, idx: torch.LongTensor):
         if not isinstance(idx, torch.LongTensor): idx = torch.as_tensor(idx, device = factor.device, dtype = torch.long)
         return torch.zeros_like(factor.rename(None)).scatter_(-1, idx.rename(None), 1).rename(*factor.names)

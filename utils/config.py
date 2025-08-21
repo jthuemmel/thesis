@@ -77,6 +77,8 @@ class OptimConfig:
     lr: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.99
+    total_steps: Optional[int] = 100000
+    warmup_steps: Optional[int] = 1000
     weight_decay: Optional[float] = 0.01
     eta_min: Optional[float] = 1e-5
 
@@ -94,8 +96,6 @@ class DatasetConfig:
     return_type: str = "tensor"
     eval_data: str = "picontrol"
     max_dirs: int = 100
-
-
 
 @dataclass
 class WorldConfig:
