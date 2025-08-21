@@ -27,7 +27,7 @@ class WeatherField(Module):
         
         # Initialization
         self.apply(self.base_init)
-        self.apply(self.zero_init)    
+        #self.apply(self.zero_init)    
 
     @staticmethod
     def base_init(m):
@@ -60,20 +60,20 @@ class WeatherField(Module):
             src_coords: torch.Tensor, 
             tgt_coords: torch.Tensor,
             ):
+        # slice out variable coordinate
         var_src, var_tgt = src_coords[..., 1], tgt_coords[..., 1]
 
-        # concatenate embedded inputs, positions and features
-        x, _ = pack([self.proj_src(src, var_src),
-                  self.feature_embedding(var_src),
-                  self.position_embedding(src_coords[..., (0, 2, 3)])], 
+        # concatenate embeddings
+        x, _ = pack([self.proj_src(src, var_src), # data embedding
+                  self.feature_embedding(var_src), #feature embedding
+                  self.position_embedding(src_coords[..., (0, 2, 3)])], #position embedding
                   'b n *')
         
-        q, _ = pack([self.position_embedding(tgt_coords[..., (0, 2, 3)]),
-                     self.feature_embedding(var_tgt)],
+        q, _ = pack([self.position_embedding(tgt_coords[..., (0, 2, 3)]), #position embedding
+                     self.feature_embedding(var_tgt)], #feature embedding
                     'b m *')
         
-        x = self.proj_x(x, var_src)
-        x = self.norm_x(x)
+        x = self.norm_x(self.proj_x(x, var_src)) #
         query = self.proj_q(q, var_tgt)
         latent = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
         for block in self.encoder:
