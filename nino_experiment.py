@@ -199,7 +199,7 @@ class TrainerMixin(DistributedTrainer):
 
     def get_nino_metrics(self, eval_data: xr.Dataset):
         # {var: T, Lag, Lat, Lon, (Ens)}
-        eval_data = eval_data.sel(time = slice("1700", "2010"), lat = slice(-20., 20.), lon = slice(90, 270))
+        eval_data = eval_data.sel(lat = slice(-20., 20.), lon = slice(90, 270))
         # T, Lag, (Ens)
         nino4_tgt, nino4_pred = self.get_nino4(eval_data["temp_ocn_0a_tgt"]), self.get_nino4(eval_data["temp_ocn_0a_pred"]).mean("ens")
         nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
@@ -247,7 +247,8 @@ class TrainerMixin(DistributedTrainer):
                 },
             )
             arrays.append(data_array)
-        return xr.merge(arrays)
+        ds = xr.merge(arrays)
+        return ds
 
 ### TOKENIZATION
 class ShapeMixin:
@@ -398,7 +399,7 @@ class SamplingMixin:
 
     def dirichlet(self, axes: Iterable[str], logits=1.0, sharpness=1.0):
         A = self._as_axes(axes)
-        alpha = sharpness * self.constant(A, logits).softmax(-1)
+        alpha = sharpness * self.constant(A, logits)
         return torch._sample_dirichlet(alpha.rename(None), generator=self.generator).rename(*A)
 
     def trunc_normal(self, axes: Iterable[str], mean=0., std=0., a=0., b=1.):
@@ -481,7 +482,7 @@ class OceanMixin:
 
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
-            picontrol_config = replace(self.data_cfg, time_slice = {"start": "0700", "stop": "0900", "step": None})
+            picontrol_config = replace(self.data_cfg, time_slice = {"start": "1850", "stop": "2000", "step": None})
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
@@ -618,6 +619,7 @@ class MetricsMixin:
             p, o, l = (x[:, vi, ti] for x in (pred, obs, lsm)) # select the task-specific subset
             self.compute_metrics(p, o, l, label= label) # compute all metrics and label them according to the task
 
+### MODEL
 class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMixin):
     ### Masking
     @cached_property
@@ -633,21 +635,9 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
                'tauya': 0.01,
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
-        return einops.repeat(w / w.mean(), 
-                             f"{self.var_pattern} -> {self.flatland_pattern}", 
-                              **self.token_sizes, **self.patch_sizes, b = self.batch_size)
+        return einops.repeat(w, f"{self.var_pattern} -> {self.flatland_pattern}", **self.token_sizes, **self.patch_sizes, b = self.batch_size)
     
     # HELPERS
-    @staticmethod
-    def logit_mirror(W: torch.Tensor, temp: float = 1.0, eps: float = 1e-6):
-        names = W.names
-        w = W.rename(None).clamp(eps, 1 - eps)
-        logit = torch.log(w) - torch.log1p(-w)           # logit
-        logit = logit / temp
-        src = torch.sigmoid(logit).rename(*names)
-        tgt = torch.sigmoid(-logit).rename(*names)
-        return src, tgt
-    
     def get_index(self, factors: Iterable[torch.Tensor], axes: Iterable[str], rate: float, method: str = "multinomial"):
         A = self._as_axes(axes)
         F = self._as_factors(factors)
@@ -683,7 +673,7 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
 
     def dirichlet_batched(self, d: str):
         A = self.plate_layout + self._as_axes(d)
-        return self.dirichlet(A,sharpness= self.world_cfg.alphas.get(d, 1.), logits= self.world_cfg.weights.get(d, 1.)).refine_names(*A)
+        return self.dirichlet(A, sharpness= self.world_cfg.alphas.get(d, 1.), logits= self.world_cfg.weights.get(d, 1.)).refine_names(*A)
 
     def arange_axis(self, d: str):
         A = self._as_axes(d)
@@ -696,13 +686,21 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         return front, tail
     
     ### PRIORS
+    @staticmethod
+    def gumbel_topk(phi, k):
+        return (phi - torch.log(-torch.log(torch.rand_like(phi)))).topk(k).indices
+
+    @staticmethod
+    def as_logit(p):
+        return torch.log(p) - torch.log1p(-p)
+
     def src_rate(self):
         cfg = self.world_cfg.mask_rates_src
-        return self.trunc_normal('v', **cfg) if exists(cfg) else 1.
+        return self.trunc_normal('rate', **cfg) if exists(cfg) else 1.
     
     def tgt_rate(self):
         cfg = self.world_cfg.mask_rates_tgt
-        return self.trunc_normal('v', **cfg) if exists(cfg) else 1.
+        return self.trunc_normal('rate', **cfg) if exists(cfg) else 1.
 
     def frcst(self):
         tau = self.world_cfg.tau 
@@ -711,11 +709,17 @@ class MTMTrainer(TrainerMixin, MetricsMixin, OceanMixin, SamplingMixin, ShapeMix
         src_mask = self.get_index(W_src, self.token_layout, rate = r, method='topk')
         tgt_mask = self.get_index(W_tgt, self.token_layout, rate = 1 - r, method='topk')
         return src_mask, tgt_mask
-
+    
     def prior(self):
-        W_src, W_tgt = self.logit_mirror(self.dirichlet_Nd('t'))
-        src_mask = self.get_multi_index(W_src, self.token_layout, rates = self.src_rate())
-        tgt_mask = self.get_multi_index(W_tgt, self.token_layout, rates = self.tgt_rate())
+        A = self._as_axes(self.token_layout)
+        K_src = self.k_from_rate(self.src_rate(), A)
+        K_tgt = self.k_from_rate(self.tgt_rate(), A)
+        T = self.dirichlet_batched('t')
+        V = self.dirichlet_batched('v')
+        packed = self.pack(self.marginalize((T, V), self.plate_layout + A), A)
+        prior = self.as_logit(packed / packed.sum(-1, True)).rename(None)
+        src_mask = self.gumbel_topk(prior, K_src).rename(*packed.names)
+        tgt_mask = self.gumbel_topk(1 - prior, K_tgt).rename(*packed.names)
         return src_mask, tgt_mask
     
     def apply_masks(self, tokens, src_mask, tgt_mask):
