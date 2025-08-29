@@ -2,9 +2,8 @@ import torch
 from utils.components import *
 
 class WeatherField(torch.nn.Module):
-    def __init__(self, model_cfg):
+    def __init__(self, cfg):
         super().__init__()
-        cfg = model_cfg.decoder
         embedding_dim = (len(cfg.wavelengths) + 1) * cfg.dim_coords
 
         # shared embeddings
@@ -13,17 +12,17 @@ class WeatherField(torch.nn.Module):
         self.latent_embedding = torch.nn.Embedding(cfg.num_latents, cfg.dim)
 
         # feature-wise linear embedding
-        self.proj_src = SegmentLinear(cfg.dim_in, cfg.dim_in, cfg.num_features)
+        self.src_to_emb = SegmentLinear(cfg.dim_in, cfg.dim_in, cfg.num_features)
 
         # linear map into feature-wise source representation
-        self.proj_x = SegmentLinear(embedding_dim + cfg.dim_in, cfg.dim, cfg.num_features)
+        self.emb_to_x = SegmentLinear(embedding_dim + cfg.dim_in, cfg.dim, cfg.num_features)
         self.norm_x = torch.nn.LayerNorm(cfg.dim)
 
         # linear map into feature-wise query representations
-        self.proj_q = SegmentLinear(embedding_dim, cfg.dim, cfg.num_features)
+        self.emb_to_q = SegmentLinear(embedding_dim, cfg.dim, cfg.num_features)
 
         # feature-wise output projection
-        self.proj_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
+        self.emb_to_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
 
         # Transformer blocks
         self.encoder = torch.nn.ModuleList([TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads) for _ in range(cfg.num_layers)])
@@ -63,7 +62,7 @@ class WeatherField(torch.nn.Module):
         var_tgt, pos_tgt = tgt_coords.split([1, 3], dim = -1)
 
         # get embeddings
-        src_data = self.proj_src(src_data, var_src)
+        src_data = self.src_to_emb(src_data, var_src)
         src_positions = self.position_embedding(pos_src)
         src_features = self.feature_embedding(var_src)
         tgt_positions = self.position_embedding(pos_tgt)
@@ -74,9 +73,9 @@ class WeatherField(torch.nn.Module):
         query = torch.cat([tgt_positions, tgt_features], dim = -1)
     
         # linear maps to shared latent space
-        src = self.proj_x(src, var_src)
+        src = self.emb_to_x(src, var_src)
         src = self.norm_x(src)
-        query = self.proj_q(query, var_tgt)
+        query = self.emb_to_q(query, var_tgt)
         
         # update latents given src
         latents = self.latent_embedding.weight.expand(src.size(0), -1, -1)
@@ -86,5 +85,5 @@ class WeatherField(torch.nn.Module):
 
         # decoder
         query = self.decoder(query, latents)
-        query = self.proj_out(query, var_tgt)
+        query = self.emb_to_out(query, var_tgt)
         return query
