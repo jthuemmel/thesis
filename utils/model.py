@@ -1,84 +1,82 @@
 import torch
-from torch.nn import Embedding, Module, ModuleList, Linear, init, LayerNorm
-from einops import rearrange, repeat, pack, unpack
-from dataclasses import dataclass
-from utils.cpe import ContinuousPositionalEmbedding
 from utils.components import *
 
-class WeatherField(Module):
-    def __init__(self, model_cfg: dataclass):
+class WeatherField(torch.nn.Module):
+    def __init__(self, model_cfg):
         super().__init__()
         cfg = model_cfg.decoder
         embedding_dim = (len(cfg.wavelengths) + 1) * cfg.dim_coords
 
         self.position_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, None)
-        self.feature_embedding = Embedding(cfg.num_features, cfg.dim_coords)
-        self.latent_embedding = Embedding(cfg.num_latents, cfg.dim)
+        self.feature_embedding = torch.nn.Embedding(cfg.num_features, cfg.dim_coords)
+        self.latent_embedding = torch.nn.Embedding(cfg.num_latents, cfg.dim)
 
-        self.encoder = ModuleList([TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads) for _ in range(cfg.num_layers)])
+        self.encoder = torch.nn.ModuleList([TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads) for _ in range(cfg.num_layers)])
         self.decoder = TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads)
 
         self.proj_src = SegmentLinear(cfg.dim_in, cfg.dim_in, cfg.num_features)
         self.proj_x = SegmentLinear(embedding_dim + cfg.dim_in, cfg.dim, cfg.num_features)
-        self.norm_x = LayerNorm(cfg.dim)
+        self.norm_x = torch.nn.LayerNorm(cfg.dim)
+
         self.proj_q = SegmentLinear(embedding_dim, cfg.dim, cfg.num_features)
         self.proj_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
-
         
         # Initialization
         self.apply(self.base_init)
-        #self.apply(self.zero_init)    
 
     @staticmethod
     def base_init(m):
-        if isinstance(m, Linear):
-            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
             if m.bias is not None:
-                init.zeros_(m.bias)
+                torch.nn.init.zeros_(m.bias)
 
-        if isinstance(m, Embedding):
-            init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+        if isinstance(m, torch.nn.Embedding):
+            torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
 
-        if isinstance(m, LayerNorm):
+        if isinstance(m, torch.nn.LayerNorm):
             if m.bias is not None:
-                init.zeros_(m.bias)
+                torch.nn.init.zeros_(m.bias)
             if m.weight is not None:
-                init.ones_(m.weight)
+                torch.nn.init.ones_(m.weight)
 
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
-    @staticmethod
-    def zero_init(m):
-        if isinstance(m, Attention):
-            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
-        if isinstance(m, GatedFFN):
-            torch.nn.init.trunc_normal_(m.to_out.weight, std = 1e-8)
-
-    def forward(self, 
-            src: torch.Tensor, 
-            src_coords: torch.Tensor, 
-            tgt_coords: torch.Tensor,
-            ):
+    def forward(self, src_data: torch.Tensor, src_coords: torch.LongTensor, tgt_coords: torch.LongTensor):
+        """
+        Args:
+            src_data: [B, N_src, D_in]
+            src_coords: [B, N_src, 4] assuming (T, V, H, W) layout
+            tgt_coords: [B, N_tgt, 4] assuming (T, V, H, W) layout
+        """
         # slice out variable coordinate
         var_src, var_tgt = src_coords[..., 1], tgt_coords[..., 1]
+        pos_src, pos_tgt = src_coords[..., (0, 2, 3)], tgt_coords[..., (0, 2, 3)]
+
+        # get embeddings
+        src_data = self.proj_src(src_data, var_src)
+        src_positions = self.position_embedding(pos_src)
+        src_features = self.feature_embedding(var_src)
+        tgt_positions = self.position_embedding(pos_tgt)
+        tgt_features = self.feature_embedding(var_tgt)
 
         # concatenate embeddings
-        x, _ = pack([self.proj_src(src, var_src), # data embedding
-                  self.feature_embedding(var_src), #feature embedding
-                  self.position_embedding(src_coords[..., (0, 2, 3)])], #position embedding
-                  'b n *')
+        data = torch.cat([src_data, src_positions, src_features], dim = -1)
+        query = torch.cat([tgt_positions, tgt_features], dim = -1)
+    
+        # linear maps
+        data = self.proj_x(data, var_src)
+        data = self.norm_x(data)
+        query = self.proj_q(query, var_tgt)
         
-        q, _ = pack([self.position_embedding(tgt_coords[..., (0, 2, 3)]), #position embedding
-                     self.feature_embedding(var_tgt)], #feature embedding
-                    'b m *')
-        
-        x = self.norm_x(self.proj_x(x, var_src)) #
-        query = self.proj_q(q, var_tgt)
-        latent = repeat(self.latent_embedding.weight, "z d -> b z d", b = src.size(0))
+        # update latents given data
+        latents = self.latent_embedding.weight.expand(src_data.size(0), -1, -1)
         for block in self.encoder:
-            kv, _ = pack([x, latent], 'b * d')
-            latent = block(latent, kv)
-        query = self.decoder(query, latent)
+            kv = torch.cat([latents, data], dim = 1)
+            latents = block(latents, kv)
+
+        # decoder
+        query = self.decoder(query, latents)
         query = self.proj_out(query, var_tgt)
         return query

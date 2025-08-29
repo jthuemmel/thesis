@@ -1,43 +1,44 @@
+import torch
+import math
+
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from torch.nn.functional import scaled_dot_product_attention
 
-from torch import Tensor, zeros_like, LongTensor, is_autocast_enabled, get_autocast_dtype
-from torch.nn import Linear, Module, ModuleList, init, LayerNorm, Embedding
-from torch.nn.functional import normalize, scaled_dot_product_attention, silu, linear
-
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 
-def get_weight_std(weight: Tensor):
+def get_weight_std(weight: torch.Tensor):
     return 1 / weight.size(-1)**0.5
 
-class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, write_has_skip: bool = True):
-        """
-        dim: block dimension
-        num_blocks: number of latent transformer blocks
-        dim_heads: dimension of heads in attention
-        """
+class ContinuousPositionalEmbedding(torch.nn.Module):
+    def __init__(self, dim_per_coord: int, wavelengths: List[Tuple[int, int]] = [(1., 256)], model_dim: Optional[int] = None):
         super().__init__()
-        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
+        d_half = dim_per_coord // 2
 
-    def forward(self, x: Tensor, latent: Tensor, query: Optional[Tensor] = None, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """
-        x: input tensor of shape (B, *, N, D)
-        latent: latent tensor of shape (B, *, M, D)
-        query: (optional) query tensor of shape (B, *, Q, D)
-        ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (q, latent) 
-        """
-        latent = self.read(q = latent, kv = x, ctx = ctx)
-        for block in self.compute:
-            latent = block(latent, ctx = ctx)
-        query = self.write(q = x if query is None else query, kv = latent, ctx = ctx) #default to x as query
-        return query, latent
+        # Precompute per-coordinate frequency factors
+        freqs = torch.stack([
+            torch.exp(math.log(2 * math.pi) - math.log(lmin) - torch.linspace(0, 1, d_half) * (math.log(lmax) - math.log(lmin)))
+            for lmin, lmax in wavelengths
+            ])
 
-class TransformerBlock(Module):
+        # register buffer and optional projection
+        self.register_buffer("freqs", freqs)  # shape (n_coords, dim_per_coord // 2)
+        self.embedding_dim = len(wavelengths) * (d_half * 2) #make sure the embedding dim is correct even if d_half rounds
+        self.proj = torch.nn.Identity() if model_dim is None else torch.nn.Linear(self.embedding_dim, model_dim)
+
+    def forward(self, positions: torch.Tensor):
+        angles = torch.einsum("...i, i d -> ...i d", positions, self.freqs)
+        emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
+        emb = rearrange(emb, "... n d two -> ... (n d two)")
+        return self.proj(emb)
+
+class SwiGLU(torch.nn.Module):
+    def forward(self, x: torch.Tensor):
+        x, gate = x.chunk(2, dim=-1)
+        return x * torch.nn.functional.silu(gate)
+
+class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
@@ -46,13 +47,7 @@ class TransformerBlock(Module):
         self.ffn = GatedFFN(dim)
         self.has_skip = has_skip
 
-    def forward(self, q: Tensor, kv: Optional[Tensor] = None, ctx: Optional[Tensor] = None, **attn_kwargs):
-        """
-        q: query tensor of shape (B, N, D)
-        kv: (optional) key-value tensor of shape (B, M, D)
-        ctx: (optional) conditioning tensor of shape (*, D) where * must broadcast with q
-        returns: tensor of shape (B, N, D)
-        """
+    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
         skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
         kv = kv if kv is not None else q
@@ -60,30 +55,30 @@ class TransformerBlock(Module):
         q = q + self.ffn(self.ffn_norm(q, ctx))
         return q
 
-class GatedFFN(Module):
+class GatedFFN(torch.nn.Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
         hidden_dim = dim * expansion_factor
-        self.to_hidden = Linear(dim, 2 * hidden_dim, bias = bias)
-        self.to_out = Linear(hidden_dim, dim, bias = bias)
+        self.to_hidden = torch.nn.Linear(dim, 2 * hidden_dim, bias = bias)
+        self.swiglu = SwiGLU()
+        self.to_out = torch.nn.Linear(hidden_dim, dim, bias = bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.to_hidden(x)
-        x, g = x.chunk(2, dim = -1)
-        x = x * silu(g)
+        x = self.swiglu(x)
         x = self.to_out(x)
         return x
     
-class Attention(Module):
+class Attention(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, bias: bool = True):
         super().__init__()
         self.split_heads = Rearrange('... n (h d) -> (...) h n d', d = dim_heads)
-        self.to_q = Linear(dim, dim, bias = bias)
-        self.to_k = Linear(dim, dim, bias = bias)
-        self.to_v = Linear(dim, dim, bias = bias)
-        self.to_out = Linear(dim, dim, bias = bias)
+        self.to_q = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_k = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_v = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, **attn_kwargs) -> Tensor:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
         B = q.size(0) #remember the original batch size
         q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
         q, k, v = map(self.split_heads, (q, k, v)) # split heads and merge any leading dimensions into the batch
@@ -92,32 +87,32 @@ class Attention(Module):
         out = self.to_out(out)
         return out
 
-class ConditionalLayerNorm(Module):
+class ConditionalLayerNorm(torch.nn.Module):
     def __init__(self, dim: int, dim_ctx: Optional[int] = None):
         super().__init__()
-        self.norm = LayerNorm(dim, elementwise_affine= dim_ctx is None)
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine= dim_ctx is None)
         if dim_ctx is None:
             self.linear = None
         else:
-            self.linear = Linear(dim_ctx, dim * 2, bias=True)
+            self.linear = torch.nn.Linear(dim_ctx, dim * 2, bias=True)
 
-    def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.linear is None: 
             return self.norm(x)
         scale, shift = self.linear(ctx).chunk(2, dim = -1)
         x = (1. + scale) * self.norm(x) + shift
         return x
     
-class SegmentLinear(Module):
+class SegmentLinear(torch.nn.Module):
     def __init__(self, dim_in: int, dim_out: int, num_segments: int, bias: bool = True):
         super().__init__()
         self.dim_out = dim_out
-        self.weights = Embedding(num_segments, dim_in * dim_out)
-        self.bias = Embedding(num_segments, dim_out) if bias else None
+        self.weights = torch.nn.Embedding(num_segments, dim_in * dim_out)
+        self.bias = torch.nn.Embedding(num_segments, dim_out) if bias else None
 
-    def forward(self, x: Tensor, coords: LongTensor):
+    def forward(self, x: torch.Tensor, coords: torch.LongTensor):
         # pre-allocate output tensor
-        out = x.new_empty(*x.shape[:-1], self.dim_out, dtype = get_autocast_dtype('cuda') if is_autocast_enabled() else x.dtype)
+        out = x.new_empty(*x.shape[:-1], self.dim_out, dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled() else x.dtype)
         # flat views
         xf = rearrange(x, '... d -> (...) d')
         of = rearrange(out, '... d -> (...) d')
@@ -129,7 +124,7 @@ class SegmentLinear(Module):
         b = None if self.bias is None else self.bias(segments)
         # apply linear to segments
         for i, s in enumerate(segments):
-            idx = (cf == s).nonzero().squeeze(1)
-            of.index_copy_(0, idx, linear(xf.index_select(0, idx), W[i], None if b is None else b[i]))
+            idx = (cf == s).nonzero().squeeze(1) # find all elements of the segment
+            lin = torch.nn.functional.linear(xf.index_select(0, idx), W[i], None if b is None else b[i]) # apply corresponding linear layer
+            of.index_copy_(0, idx, lin) # write output at index locations
         return out
-    
