@@ -4,29 +4,17 @@ from utils.components import *
 class WeatherField(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        embedding_dim = (len(cfg.wavelengths) + 1) * cfg.dim_coords
-
-        # shared embeddings
-        self.position_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, None)
-        self.feature_embedding = torch.nn.Embedding(cfg.num_features, cfg.dim_coords)
+        # embeddings
         self.latent_embedding = torch.nn.Embedding(cfg.num_latents, cfg.dim)
+        self.world_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
 
-        # feature-wise linear embedding
-        self.src_to_emb = SegmentLinear(cfg.dim_in, cfg.dim_in, cfg.num_features)
-
-        # linear map into feature-wise source representation
-        self.emb_to_x = SegmentLinear(embedding_dim + cfg.dim_in, cfg.dim, cfg.num_features)
-        self.norm_x = torch.nn.LayerNorm(cfg.dim)
-
-        # linear map into feature-wise query representations
-        self.emb_to_q = SegmentLinear(embedding_dim, cfg.dim, cfg.num_features)
-
-        # feature-wise output projection
-        self.emb_to_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
+        # linear projections
+        self.proj_in = SegmentLinear(cfg.dim_in, cfg.dim, cfg.num_features)
+        self.proj_out = SegmentLinear(cfg.dim, cfg.dim_out, cfg.num_features)
 
         # Transformer blocks
         self.encoder = torch.nn.ModuleList([TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads) for _ in range(cfg.num_layers)])
-        self.decoder = TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads)
+        self.decoder = TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads, has_skip=False)
         
         # Initialization
         self.apply(self.base_init)
@@ -50,40 +38,24 @@ class WeatherField(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
-    def forward(self, src_data: torch.Tensor, src_coords: torch.LongTensor, tgt_coords: torch.LongTensor):
-        """
-        Args:
-            src_data: [B, N_src, D_in]
-            src_coords: [B, N_src, 4] assuming (V, T, H, W) layout
-            tgt_coords: [B, N_tgt, 4] assuming (V, T, H, W) layout
-        """
-        # slice out variable coordinate, since it is treated separately
-        var_src, pos_src = src_coords.split([1, 3], dim = -1)
-        var_tgt, pos_tgt = tgt_coords.split([1, 3], dim = -1)
-
-        # get embeddings
-        src_data = self.src_to_emb(src_data, var_src)
-        src_positions = self.position_embedding(pos_src)
-        src_features = self.feature_embedding(var_src)
-        tgt_positions = self.position_embedding(pos_tgt)
-        tgt_features = self.feature_embedding(var_tgt)
-
-        # concatenate embeddings
-        src = torch.cat([src_data, src_positions, src_features], dim = -1)
-        query = torch.cat([tgt_positions, tgt_features], dim = -1)
-    
-        # linear maps to shared latent space
-        src = self.emb_to_x(src, var_src)
-        src = self.norm_x(src)
-        query = self.emb_to_q(query, var_tgt)
+    def forward(self, tokens, visible, coordinates):
+        batch = torch.arange(tokens.size(0), device=tokens.device).expand(tokens.size(0), -1) # index for fancy indexing
+        modality = coordinates[..., 0] # index for modality-wise linear layers
         
-        # update latents given src
-        latents = self.latent_embedding.weight.expand(src.size(0), -1, -1)
-        for block in self.encoder:
-            kv = torch.cat([latents, src], dim = 1)
-            latents = block(latents, kv)
+        # positional embedding for all available coordinates
+        world = self.world_embedding(coordinates)
+        
+        # embed visible values and add their positional code
+        src = self.proj_in(tokens[batch, visible], modality[batch, visible])
+        src = src + world[batch, visible]
+        
+        # update latents given src and latents
+        latents = self.latent_embedding.weight.expand(tokens.size(0), -1, -1)
+        for perceiver in self.encoder:
+            kv = torch.cat([src, latents], dim = 1)
+            latents = perceiver(latents, kv)
 
-        # decoder
-        query = self.decoder(query, latents)
-        query = self.emb_to_out(query, var_tgt)
-        return query
+        # update world given latents
+        out = self.decoder(world, latents)
+        out = self.proj_out(out, modality)
+        return out
