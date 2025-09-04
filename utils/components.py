@@ -4,7 +4,6 @@ import math
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch.nn.functional import scaled_dot_product_attention
-from torch.nn.attention import SDPBackend, sdpa_kernel 
 
 from typing import Optional, Tuple, List
 
@@ -78,16 +77,11 @@ class Attention(torch.nn.Module):
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
-    @property
-    def backend(self):
-         return SDPBackend.FLASH_ATTENTION if torch.cuda.get_device_capability()[0] >= 8 else SDPBackend.EFFICIENT_ATTENTION
-
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
         B = q.size(0) #remember the original batch size
         q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
         q, k, v = map(self.split_heads, (q, k, v)) # split heads and merge any leading dimensions into the batch
-        with sdpa_kernel(self.backend):
-            attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = rearrange(attn, '(b g) h n d ->  b g n (h d)', b = B).squeeze(1) # if there was no leading dimension, we simply squeeze the empty dimension
         out = self.to_out(out)
         return out
