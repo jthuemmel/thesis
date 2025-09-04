@@ -39,7 +39,7 @@ class WeatherField(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
     def forward(self, tokens, visible, coordinates):
-        batch = torch.arange(tokens.size(0), device=tokens.device).expand(tokens.size(0), -1) # index for fancy indexing
+        batch = torch.arange(tokens.size(0), device=tokens.device).view(-1, 1) # index for fancy indexing
         modality = coordinates[..., 0] # index for modality-wise linear layers
         
         # positional embedding for all available coordinates
