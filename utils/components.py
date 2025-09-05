@@ -26,8 +26,8 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
         self.embedding_dim = len(wavelengths) * (d_half * 2) #make sure the embedding dim is correct even if d_half rounds
         self.proj = torch.nn.Identity() if model_dim is None else torch.nn.Linear(self.embedding_dim, model_dim)
 
-    def forward(self, positions: torch.Tensor):
-        angles = torch.einsum("...i, i d -> ...i d", positions, self.freqs)
+    def forward(self, coordinates: torch.Tensor):
+        angles = torch.einsum("...i, i d -> ...i d", coordinates, self.freqs)
         emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
         emb = rearrange(emb, "... n d two -> ... (n d two)")
         return self.proj(emb)
@@ -102,28 +102,28 @@ class ConditionalLayerNorm(torch.nn.Module):
         x = (1. + scale) * self.norm(x) + shift
         return x
     
-class SegmentLinear(torch.nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, num_segments: int, bias: bool = True):
+class GroupLinear(torch.nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, num_groups: int, bias: bool = True):
         super().__init__()
         self.dim_out = dim_out
-        self.weights = torch.nn.Embedding(num_segments, dim_in * dim_out)
-        self.bias = torch.nn.Embedding(num_segments, dim_out) if bias else None
+        self.weights = torch.nn.Embedding(num_groups, dim_in * dim_out)
+        self.bias = torch.nn.Embedding(num_groups, dim_out) if bias else None
 
-    def forward(self, x: torch.Tensor, coords: torch.LongTensor):
+    def forward(self, x: torch.Tensor, group_by: torch.LongTensor):
         # pre-allocate output tensor
         out = x.new_empty(*x.shape[:-1], self.dim_out, dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled() else x.dtype)
         # flat views
         xf = rearrange(x, '... d -> (...) d')
         of = rearrange(out, '... d -> (...) d')
-        cf = rearrange(coords, '... -> (...)')
-        # determine which segments are present
-        segments = cf.unique(sorted = False)
-        # weights/bias for each segment
-        W = rearrange(self.weights(segments), 's (o i) -> s o i', o = self.dim_out)
-        b = None if self.bias is None else self.bias(segments)
-        # apply linear to segments
-        for i, s in enumerate(segments):
-            idx = (cf == s).nonzero().squeeze(1) # find all elements of the segment
+        gf = rearrange(group_by, '... -> (...)')
+        # determine which groups are present
+        groups = gf.unique(sorted = False)
+        # weights/bias for each groups
+        W = rearrange(self.weights(groups), 's (o i) -> s o i', o = self.dim_out)
+        b = None if self.bias is None else self.bias(groups)
+        # apply linear to groups
+        for i, s in enumerate(groups):
+            idx = (gf == s).nonzero().squeeze(1) # find all elements of the group
             lin = torch.nn.functional.linear(xf.index_select(0, idx), W[i], None if b is None else b[i]) # apply corresponding linear layer
             of.index_copy_(0, idx, lin) # write output at index locations
         return out
