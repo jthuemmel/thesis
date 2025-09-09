@@ -1,13 +1,13 @@
 import torch
 from utils.components import *
 
-class MaskedTokenField(torch.nn.Module):
+class MaskedTokenModel(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         # embeddings
-        self.latent_embedding = torch.nn.Embedding(cfg.num_latents, cfg.dim)
-        self.mask_embedding = torch.nn.Embedding(1, cfg.dim)
-        self.world_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+        self.latent_tokens = torch.nn.Embedding(cfg.num_latents, cfg.dim)
+        self.mask_token = torch.nn.Embedding(1, cfg.dim)
+        self.coordinate_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
 
         # grouped linear projections
         self.proj_in = GroupLinear(cfg.dim_in, cfg.dim, cfg.num_features)
@@ -38,22 +38,17 @@ class MaskedTokenField(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
-    def forward(self, tokens, visible, coordinates):
-        # embed visible values
+    def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor, coordinates: torch.LongTensor) -> torch.FloatTensor:
+        # embed tokens per-group
         src = self.proj_in(tokens, group_by = coordinates[..., 0])
-
-        # mask 
-        x = torch.where(visible[..., None], src, self.mask_embedding.weight)
-
-        # add position code
-        x = x + self.world_embedding(coordinates)
-
+        # src where visible else mask
+        x = torch.where(visible, src, self.mask_token.weight)
+        # add position codes
+        x = x + self.coordinate_embedding(coordinates)
         # expand latent vectors
-        latents = self.latent_embedding.weight.expand(tokens.size(0), -1, -1)
-        
+        latents = self.latent_tokens.weight.expand(tokens.size(0), -1, -1)
         # process
         x, latents = self.network((x, latents))
-
-        # project to out dim
+        # project per-group
         out = self.proj_out(x, group_by = coordinates[..., 0])
         return out
