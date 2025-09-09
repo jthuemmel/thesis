@@ -1,11 +1,12 @@
 import torch
 from utils.components import *
 
-class WeatherField(torch.nn.Module):
+class MaskedTokenField(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         # embeddings
         self.latent_embedding = torch.nn.Embedding(cfg.num_latents, cfg.dim)
+        self.mask_embedding = torch.nn.Embedding(1, cfg.dim)
         self.world_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
 
         # grouped linear projections
@@ -13,8 +14,10 @@ class WeatherField(torch.nn.Module):
         self.proj_out = GroupLinear(cfg.dim, cfg.dim_out, cfg.num_features)
 
         # Transformer blocks
-        self.encoder = torch.nn.ModuleList([TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads) for _ in range(cfg.num_layers)])
-        self.decoder = TransformerBlock(cfg.dim, dim_heads=cfg.dim_heads, has_skip=False)
+        self.network = torch.nn.Sequential(*[
+            InterfaceBlock(cfg.dim, dim_heads=cfg.dim_heads, num_blocks= cfg.num_compute_blocks)
+            for _ in range(cfg.num_layers)
+            ])
         
         # Initialization
         self.apply(self.base_init)
@@ -35,26 +38,22 @@ class WeatherField(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
-    def forward(self, tokens, visible, shape):
-        # fancy indices
-        batch = torch.arange(tokens.size(0), device=tokens.device).view(-1, 1)
-        indices = torch.arange(tokens.size(1), device=tokens.device).expand(tokens.size(0), -1)
-        
-        # positional embedding for all available coordinates
-        coordinates = torch.stack(torch.unravel_index(indices, shape), dim = -1)
-        world = self.world_embedding(coordinates)
-        
-        # embed visible values and add their positional codes
-        src = self.proj_in(tokens[batch, visible], group_by = coordinates[batch, visible, 0])
-        src = src + world[batch, visible]
-        
-        # update latents given src and latents
-        latents = self.latent_embedding.weight.expand(tokens.size(0), -1, -1)
-        for perceiver in self.encoder:
-            kv = torch.cat([src, latents], dim = 1)
-            latents = perceiver(latents, kv)
+    def forward(self, tokens, visible, coordinates):
+        # embed visible values
+        src = self.proj_in(tokens, group_by = coordinates[..., 0])
 
-        # update world given latents
-        out = self.decoder(world, latents)
-        out = self.proj_out(out, group_by = coordinates[batch, visible, 0])
+        # mask 
+        x = torch.where(visible[..., None], src, self.mask_embedding.weight)
+
+        # add position code
+        x = x + self.world_embedding(coordinates)
+
+        # expand latent vectors
+        latents = self.latent_embedding.weight.expand(tokens.size(0), -1, -1)
+        
+        # process
+        x, latents = self.network((x, latents))
+
+        # project to out dim
+        out = self.proj_out(x, group_by = coordinates[..., 0])
         return out

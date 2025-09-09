@@ -127,3 +127,21 @@ class GroupLinear(torch.nn.Module):
             lin = torch.nn.functional.linear(xf.index_select(0, idx), W[i], None if b is None else b[i]) # apply corresponding linear layer
             of.index_copy_(0, idx, lin) # write output at index locations
         return out
+
+class InterfaceBlock(torch.nn.Module):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, write_has_skip: bool = True):
+        super().__init__()
+        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
+        self.compute = torch.nn.ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
+        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
+
+    def forward(self, 
+                state: Tuple[torch.Tensor, torch.Tensor], 
+                query: Optional[torch.Tensor] = None, 
+                ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, z = state
+        z = self.read(q = z, kv = x, ctx = ctx)
+        for block in self.compute:
+            z = block(z, ctx = ctx)
+        query = self.write(q = x if query is None else query, kv = z, ctx = ctx) #default to x as query
+        return query, z
