@@ -1,7 +1,7 @@
 import torch
 from utils.components import *
 
-class MaskedTokenModel(torch.nn.Module):
+class MaskedPredictor(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         # embeddings
@@ -52,3 +52,4 @@ class MaskedTokenModel(torch.nn.Module):
         # project per-group
         out = self.proj_out(x, group_by = coordinates[..., 0])
         return out
+    
