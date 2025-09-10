@@ -1,6 +1,6 @@
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Sequence, Tuple, Dict, Iterable
+from typing import List, Optional
 
 from omegaconf import OmegaConf
 from math import prod
@@ -55,9 +55,7 @@ LENS_STATS = {
 class NetworkConfig:
     dim: int
     num_layers: Optional[int] = None
-    num_tokens: Optional[int] = None
     num_latents: Optional[int] = None
-    num_features: Optional[int] = None
     num_compute_blocks: Optional[int] = None
     num_cls: Optional[int] = None
     dim_in: Optional[int] = None
@@ -65,9 +63,7 @@ class NetworkConfig:
     dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
-    drop_prob: Optional[float] = 0.
     expansion_factor: Optional[int] = 2
-    architecture: str = "vit"
     wavelengths: Optional[List] = None
 
 @dataclass
@@ -86,12 +82,10 @@ class OptimConfig:
 class DatasetConfig:
     sequence_length: int = 1
     variables: List[str] = field(default_factory=lambda: VARS)
-    weights: Optional[list] = None
     time_slice: Optional[dict] = None
     lat_slice: Optional[dict] = None
     lon_slice: Optional[dict] = None
     stats: Optional[dict] = None
-    frcst_tasks: Optional[dict] = None
     grid_size: dict = field(default_factory=lambda: {"lat": 64, "lon": 120})
     return_type: str = "tensor"
     eval_data: str = "picontrol"
@@ -99,53 +93,44 @@ class DatasetConfig:
 
 @dataclass
 class WorldConfig:
-    mask_rates_src: Dict = field(default_factory=lambda: {"mean":0.0,"std":1.0,"a":0.0,"b":1.0})
-    mask_rates_tgt: Optional[Dict] = field(default_factory=lambda: {"mean":0.0,"std":1.0,"a":0.0,"b":1.0})
+    field_sizes: dict
+    patch_sizes: dict
+    batch_size: int
+    tau: int
+    alphas: dict
 
-    # forecasting / ensembles
-    tau: Optional[int] = None
-    num_ens: Optional[int] = None
-
-    # factor priors
-    alphas: Dict = field(default_factory=lambda:{})      # e.g. {"t":3., "v":10.}
-    weights: Dict = field(default_factory=lambda:{})    # e.g. {"v":[10,1,1,1] or scalar}
-
-    # --- TokenMixin / SamplingMixin scaffolding ---
-    plate_layout: Tuple[str, ...] = field(default_factory=lambda: ('b',))
-    token_layout: Tuple[str, ...] = field(default_factory=lambda: ('t','v','h','w'))
-    patch_layout: Tuple[str, ...] = field(default_factory=lambda: ('tt','vv','hh','ww'))
-
-    # sizes
-    size_cfg: Dict = field(default_factory=lambda: {})
-
+    # derived fields
+    field_layout: tuple = field(init=False)
+    patch_layout: tuple = field(init=False)
+    token_sizes: dict = field(init=False)
+    token_shape: tuple = field(init=False)
+    num_tokens: int = field(init=False)
+    num_elements: int = field(init=False)
+    dim_tokens: int = field(init=False)
+    field_pattern: str = field(init=False)
+    flat_token_pattern: str = field(init=False)
+    flat_patch_pattern: str = field(init=False)
+    flatland_pattern: str = field(init=False)
 
     def __post_init__(self):
-        # Layout sanity
-        assert len(set(self.plate_layout)) == len(self.plate_layout)
-        assert len(set(self.token_layout)) == len(self.token_layout)
-        assert len(set(self.patch_layout)) == len(self.patch_layout)
+        self.field_layout = tuple(self.field_sizes.keys())
+        self.patch_layout = tuple(self.patch_sizes.keys())
 
-        # Require a 1–1 mapping between token axes and patch axes by name convention: x <-> xx
-        token_to_patch = {ax: ax*2 for ax in self.token_layout}
-        for ax, pax in token_to_patch.items():
-            if pax not in self.patch_layout:
-                raise ValueError(f"Missing patch axis '{pax}' for token axis '{ax}' in patch_layout.")
-            if pax not in self.size_cfg:
-                raise ValueError(f"Missing patch size for '{pax}' in size_cfg.")
+        self.token_sizes = {
+            ax: (self.field_sizes[ax] // self.patch_sizes[f'{ax*2}'])
+            for ax in self.field_layout
+        }
+        self.token_shape = tuple(self.token_sizes[ax] for ax in self.field_layout)
+        
+        self.num_tokens = prod(self.token_sizes.values())
+        self.num_elements = prod(self.field_sizes.values())
+        self.dim_tokens = prod(self.patch_sizes.values())
 
-        # Divisibility: field_cfg[token] % patch_cfg[token*2] == 0
-        for ax in self.token_layout:
-            pax = ax*2
-            fsz = self.size_cfg[ax]
-            psz = self.size_cfg.get(pax, 1)
-            if fsz % psz != 0:
-                raise ValueError(f"size_cfg['{ax}']={fsz} not divisible by size_cfg['{pax}']={psz}")
-
-@dataclass
-class ModelConfig:
-    decoder: Optional[NetworkConfig] = None
-    modal: Optional[NetworkConfig] = None
-    encoder: Optional[NetworkConfig] = None
+        field = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
+        self.field_pattern = f"b {field}"
+        self.flat_token_pattern = f"({' '.join(self.field_layout)})"
+        self.flat_patch_pattern = f"({' '.join(self.patch_layout)})"
+        self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"
 
 @dataclass
 class TrainerConfig:
@@ -183,7 +168,7 @@ class TrainerConfig:
 class MTMConfig:
     trainer: TrainerConfig
     data: DatasetConfig
-    model: ModelConfig
+    model: NetworkConfig
     optim: OptimConfig
     world: WorldConfig
 
@@ -198,11 +183,7 @@ class MTMConfig:
         return cls(
             trainer=TrainerConfig(**cfg.trainer),
             data=DatasetConfig(**cfg.data),
-            model = ModelConfig(
-                decoder = NetworkConfig(**cfg.model.decoder) if exists(cfg.model.decoder) else None,
-                encoder = NetworkConfig(**cfg.model.encoder) if exists(cfg.model.encoder) else None,
-                modal = NetworkConfig(**cfg.model.modal) if exists(cfg.model.modal) else None
-            ),
+            model =  NetworkConfig(**cfg.model),
             optim =OptimConfig(**cfg.optim),
             world=WorldConfig(**cfg.world) 
         )
