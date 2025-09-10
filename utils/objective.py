@@ -10,17 +10,6 @@ class DiscreteDiffusion(torch.nn.Module):
         self.device = torch.device('cpu')
         self.world = cfg.world
         self.network = MaskedPredictor(cfg.network, cfg.world)
-        
-    ### TOKENIZATION
-    def field_to_tokens(self, field):
-        return einops.rearrange(field, 
-                                f'{self.world.field_pattern} -> {self.world.flatland_pattern}',
-                                **self.world.patch_sizes)
-    
-    def tokens_to_field(self, patch):
-        return einops.rearrange(patch, 
-                                f"{self.world.flatland_pattern} ... -> {self.world.field_pattern} ...",
-                                **self.world.token_sizes, **self.world.patch_sizes)
 
     ### MASKING
     def gumbel_noise(self, shape: tuple):
@@ -69,10 +58,7 @@ class DiscreteDiffusion(torch.nn.Module):
         return self.k_from_rates(rates)
 
     ### FORWARD
-    def forward(self, data: torch.Tensor, land_sea_mask: torch.BoolTensor = None, mode: str = 'prior'):
-        # tokens
-        data = data.to(self.device)
-        tokens = self.field_to_tokens(data)
+    def forward(self, tokens: torch.Tensor, land_sea_mask: torch.BoolTensor = None, mode: str = 'prior'):
         # masks
         ws = self.get_visible_ws() if mode == 'prior' else self.get_history_ws()  
         ks = self.get_visible_ks() if mode == 'prior' else self.get_history_ks() 
