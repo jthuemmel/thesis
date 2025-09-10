@@ -2,7 +2,7 @@ import torch
 from utils.components import *
 
 class MaskedPredictor(torch.nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, world):
         super().__init__()
         # embeddings
         self.latent_tokens = torch.nn.Embedding(cfg.num_latents, cfg.dim)
@@ -19,6 +19,10 @@ class MaskedPredictor(torch.nn.Module):
             for _ in range(cfg.num_layers)
             ])
         
+        # world shape
+        coordinates = torch.stack(torch.unravel_index(torch.arange(world.num_tokens), world.token_shape), dim=-1)
+        self.register_buffer("coordinates", coordinates)
+
         # Initialization
         self.apply(self.base_init)
 
@@ -38,18 +42,18 @@ class MaskedPredictor(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
-    def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor, coordinates: torch.LongTensor) -> torch.FloatTensor:
+    def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         # embed tokens per-group
-        src = self.proj_in(tokens, group_by = coordinates[..., 0])
+        src = self.proj_in(tokens, group_by = self.coordinates[..., 0])
         # src where visible else mask
         x = torch.where(visible, src, self.mask_token.weight)
         # add position codes
-        x = x + self.coordinate_embedding(coordinates)
+        x = x + self.coordinate_embedding(self.coordinates)
         # expand latent vectors
         latents = self.latent_tokens.weight.expand(tokens.size(0), -1, -1)
         # process
         x, latents = self.network((x, latents))
         # project per-group
-        out = self.proj_out(x, group_by = coordinates[..., 0])
+        out = self.proj_out(x, group_by = self.coordinates[..., 0])
         return out
     
