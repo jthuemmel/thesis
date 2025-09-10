@@ -2,26 +2,28 @@ import torch
 from utils.components import *
 
 class MaskedPredictor(torch.nn.Module):
-    def __init__(self, cfg, world):
+    def __init__(self, model, world):
         super().__init__()
         # embeddings
-        self.latent_tokens = torch.nn.Embedding(cfg.num_latents, cfg.dim)
-        self.mask_token = torch.nn.Embedding(1, cfg.dim)
-        self.coordinate_embedding = ContinuousPositionalEmbedding(cfg.dim_coords, cfg.wavelengths, cfg.dim)
+        self.latent_tokens = torch.nn.Embedding(model.num_latents, model.dim)
+        self.mask_token = torch.nn.Embedding(1, model.dim)
+        self.coordinate_embedding = ContinuousPositionalEmbedding(model.dim_coords, model.wavelengths, model.dim)
 
         # grouped linear projections
-        self.proj_in = GroupLinear(cfg.dim_in, cfg.dim, cfg.num_features)
-        self.proj_out = GroupLinear(cfg.dim, cfg.dim_out, cfg.num_features)
+        self.proj_in = GroupLinear(model.dim_in, model.dim, world.token_sizes['v'])
+        self.proj_out = GroupLinear(model.dim, model.dim_out, world.token_sizes['v'])
 
         # Transformer blocks
         self.network = torch.nn.Sequential(*[
-            InterfaceBlock(cfg.dim, dim_heads=cfg.dim_heads, num_blocks= cfg.num_compute_blocks)
-            for _ in range(cfg.num_layers)
+            InterfaceBlock(model.dim, dim_heads=model.dim_heads, num_blocks= model.num_compute_blocks)
+            for _ in range(model.num_layers)
             ])
         
-        # world shape
+        # world attributes
         coordinates = torch.stack(torch.unravel_index(torch.arange(world.num_tokens), world.token_shape), dim=-1)
+        modality_idx = coordinates[..., world.field_layout.index('v')]
         self.register_buffer("coordinates", coordinates)
+        self.register_buffer("modality_idx", modality_idx)
 
         # Initialization
         self.apply(self.base_init)
@@ -44,7 +46,7 @@ class MaskedPredictor(torch.nn.Module):
 
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         # embed tokens per-group
-        src = self.proj_in(tokens, group_by = self.coordinates[..., 0])
+        src = self.proj_in(tokens, group_by = self.modality_idx)
         # src where visible else mask
         x = torch.where(visible, src, self.mask_token.weight)
         # add position codes
@@ -54,6 +56,6 @@ class MaskedPredictor(torch.nn.Module):
         # process
         x, latents = self.network((x, latents))
         # project per-group
-        out = self.proj_out(x, group_by = self.coordinates[..., 0])
+        out = self.proj_out(x, group_by = self.modality_idx)
         return out
     
