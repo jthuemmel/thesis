@@ -10,6 +10,7 @@ class DiscreteDiffusion(torch.nn.Module):
         self.device = torch.device('cpu')
         self.world = cfg.world
         self.network = MaskedPredictor(cfg.network, cfg.world)
+        self.loss_fn = f_kernel_crps
 
     ### MASKING
     def gumbel_noise(self, shape: tuple):
@@ -32,6 +33,7 @@ class DiscreteDiffusion(torch.nn.Module):
         pos = einops.rearrange(torch.arange(weights.size(-1), device=weights.device), 'n -> () n')
         topk = ks > pos
         binary = torch.zeros_like(topk, dtype=torch.bool).scatter(1, index, topk)
+        binary = einops.rearrange(binary, 'b n -> b n ()') # add singleton dimension for D expand
         return binary
     
     ### PRIORS
@@ -60,14 +62,14 @@ class DiscreteDiffusion(torch.nn.Module):
     ### FORWARD
     def forward(self, tokens: torch.Tensor, land_sea_mask: torch.BoolTensor = None, mode: str = 'prior'):
         # masks
-        ws = self.get_visible_ws() if mode == 'prior' else self.get_history_ws()  
-        ks = self.get_visible_ks() if mode == 'prior' else self.get_history_ks() 
-        visible = self.binary_topk(ws, ks)[..., None]  # add singleton D dimension
+        ws = self.get_visible_ws() if mode == 'prior' else self.get_history_ws() 
+        ks = self.get_visible_ks() if mode == 'prior' else self.get_history_ks()
+        visible = self.binary_topk(ws, ks)
         # predict
         prediction = self.network(tokens, visible)
         # scoring rule
         ensemble = einops.rearrange(prediction, '(b n) ... (d e) -> b ... d (n e)', b = tokens.size(0), d = tokens.size(-1))
-        score = f_kernel_crps(tokens, ensemble)
+        score = self.loss_fn(tokens, ensemble)
         # masked loss
         mask = ~visible.expand_as(tokens) if land_sea_mask is None else torch.logical_and(land_sea_mask, ~visible)
         rate_correction = einops.reduce(mask, 'b n d -> b 1 1', 'sum') / self.world.num_elements
