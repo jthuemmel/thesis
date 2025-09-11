@@ -65,6 +65,7 @@ class NetworkConfig:
     dim_coords: Optional[int] = 32
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
+    use_checkpoint: Optional[bool] = True
 
 @dataclass
 class OptimConfig:

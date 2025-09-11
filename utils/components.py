@@ -1,14 +1,20 @@
 import torch
-import math
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from torch.nn.functional import scaled_dot_product_attention
+from torch.nn.functional import scaled_dot_product_attention, silu
+from torch.utils.checkpoint import checkpoint
 
 from typing import Optional, Tuple, List
 
 def get_weight_std(weight: torch.Tensor):
     return 1 / weight.size(-1)**0.5
+
+def checkpoint_fn(fn, *args, use_checkpoint: bool = True):
+    if use_checkpoint:
+        return checkpoint(fn, *args, use_reentrant=False)
+    else:
+        return fn(*args)
 
 class ContinuousPositionalEmbedding(torch.nn.Module):
     def __init__(self, dim_per_coord: int, wavelengths: List[Tuple[int, int]] = [(1., 256)], model_dim: Optional[int] = None):
@@ -17,8 +23,8 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
 
         # Precompute per-coordinate frequency factors
         freqs = torch.stack([
-            torch.exp(math.log(2 * math.pi) - math.log(lmin) - torch.linspace(0, 1, d_half) * (math.log(lmax) - math.log(lmin)))
-            for lmin, lmax in wavelengths
+            torch.exp((2 * torch.pi / lmin).log() - torch.linspace(0, 1, d_half) * (lmax.log() - lmin.log()))
+            for lmin, lmax in torch.as_tensor(wavelengths)
             ])
 
         # register buffer and optional projection
@@ -34,8 +40,8 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
 
 class SwiGLU(torch.nn.Module):
     def forward(self, x: torch.Tensor):
-        x, gate = x.chunk(2, dim=-1)
-        return x * torch.nn.functional.silu(gate)
+        x1, x2 = x.chunk(2, dim=-1) 
+        return silu(x1) * x2
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
@@ -79,8 +85,8 @@ class Attention(torch.nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
         B = q.size(0) #remember the original batch size
-        q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
-        q, k, v = map(self.split_heads, (q, k, v)) # split heads and merge any leading dimensions into the batch
+        q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
+        q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
         attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = rearrange(attn, '(b g) h n d ->  b g n (h d)', b = B).squeeze(1) # if there was no leading dimension, we simply squeeze the empty dimension
         out = self.to_out(out)
@@ -101,36 +107,13 @@ class ConditionalLayerNorm(torch.nn.Module):
         scale, shift = self.linear(ctx).chunk(2, dim = -1)
         x = (1. + scale) * self.norm(x) + shift
         return x
-    
-class GroupLinear(torch.nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, num_groups: int, bias: bool = True):
-        super().__init__()
-        self.dim_out = dim_out
-        self.weights = torch.nn.Embedding(num_groups, dim_in * dim_out)
-        self.bias = torch.nn.Embedding(num_groups, dim_out) if bias else None
-
-    def forward(self, x: torch.Tensor, group_by: torch.LongTensor):
-        # pre-allocate output tensor
-        out = x.new_empty(*x.shape[:-1], self.dim_out, dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled() else x.dtype)
-        # flat views
-        xf = rearrange(x, '... d -> (...) d')
-        of = rearrange(out, '... d -> (...) d')
-        gf = rearrange(group_by, '... -> (...)')
-        # determine which groups are present
-        groups = gf.unique(sorted = False)
-        # weights/bias for each groups
-        W = rearrange(self.weights(groups), 's (o i) -> s o i', o = self.dim_out)
-        b = None if self.bias is None else self.bias(groups)
-        # apply linear to groups
-        for i, s in enumerate(groups):
-            idx = (gf == s).nonzero().squeeze(1) # find all elements of the group
-            lin = torch.nn.functional.linear(xf.index_select(0, idx), W[i], None if b is None else b[i]) # apply corresponding linear layer
-            of.index_copy_(0, idx, lin) # write output at index locations
-        return out
 
 class InterfaceBlock(torch.nn.Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, write_has_skip: bool = True):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, 
+                 write_has_skip: bool = True, 
+                 use_checkpoint: bool = False):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
         self.compute = torch.nn.ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
         self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
@@ -140,8 +123,9 @@ class InterfaceBlock(torch.nn.Module):
                 query: Optional[torch.Tensor] = None, 
                 ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         x, z = state
-        z = self.read(q = z, kv = x, ctx = ctx)
+        q = x if query is None else query
+        z = checkpoint_fn(self.read, z, x, ctx, use_checkpoint= self.use_checkpoint)
         for block in self.compute:
             z = block(z, ctx = ctx)
-        query = self.write(q = x if query is None else query, kv = z, ctx = ctx) #default to x as query
+        query = checkpoint_fn(self.write, q, z, ctx, use_checkpoint= self.use_checkpoint)
         return query, z
