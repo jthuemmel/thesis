@@ -25,7 +25,7 @@ class MaskedPredictor(torch.nn.Module):
         
         # Initialization
         self.apply(self.base_init)
-
+    
     @staticmethod
     def base_init(m):
         if isinstance(m, torch.nn.Linear):
@@ -46,13 +46,9 @@ class MaskedPredictor(torch.nn.Module):
 
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         src = self.proj_in(tokens)
-        # src where visible else mask
         x = torch.where(visible, src, self.mask_token)
-        # add position codes
         x = x + self.coordinate_embedding(self.coordinates)
-        # expand latent vectors
         latents = self.latent_tokens.expand(tokens.size(0), -1, -1)
-        # process
         x, latents = self.network((x, latents))
         out = self.proj_out(x)
         return out
