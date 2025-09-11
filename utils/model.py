@@ -10,8 +10,8 @@ class MaskedPredictor(torch.nn.Module):
         self.coordinate_embedding = ContinuousPositionalEmbedding(model.dim_coords, model.wavelengths, model.dim)
 
         # grouped linear projections
-        self.proj_in = GroupLinear(model.dim_in, model.dim, world.token_sizes['v'])
-        self.proj_out = GroupLinear(model.dim, model.dim_out, world.token_sizes['v'])
+        self.proj_in = EinsumLinear(model.dim_in, model.dim, num_groups= world.token_sizes['v'])
+        self.proj_out = EinsumLinear(model.dim, model.dim_out, num_groups= world.token_sizes['v'])
 
         # Transformer blocks
         self.network = torch.nn.Sequential(*[
@@ -44,6 +44,7 @@ class MaskedPredictor(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
+    @torch.compile
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         # embed tokens per-group
         src = self.proj_in(tokens, group_by = self.modality_idx)

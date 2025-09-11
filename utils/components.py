@@ -128,6 +128,19 @@ class GroupLinear(torch.nn.Module):
             of.index_copy_(0, idx, lin) # write output at index locations
         return out
 
+class EinsumLinear(torch.nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, num_groups: int, bias: bool = True):
+        super().__init__()
+        self.weights = torch.nn.Embedding(num_groups, dim_in * dim_out)
+        self.bias = torch.nn.Embedding(num_groups, dim_out) if bias else None
+
+    def forward(self, x: torch.Tensor, group_by: torch.LongTensor):
+        W = rearrange(self.weights(group_by), '... (o i) -> ... o i', i = x.size(-1))
+        out = torch.einsum('... o i, b n i -> b n o', W, x)
+        if self.bias is not None:
+            out = out + self.bias(group_by)
+        return out
+
 class InterfaceBlock(torch.nn.Module):
     def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, write_has_skip: bool = True):
         super().__init__()
