@@ -13,7 +13,7 @@ class DiscreteDiffusion(torch.nn.Module):
         self.network = MaskedPredictor(cfg.network, cfg.world).to(device)
         self.loss_fn = f_kernel_crps
 
-    ### MASKING
+    ### SAMPLING
     def uniform(self, shape: tuple):
         return torch.rand(shape, device=self.device, generator = self.generator)
     
@@ -27,16 +27,19 @@ class DiscreteDiffusion(torch.nn.Module):
                              f'b {ax} -> b {self.world.flat_token_pattern}',
                              **self.world.token_sizes)
     
+    ### MASKING
     def k_from_rates(self, rates):
         return (self.world.num_tokens * rates).long().clamp(1, self.world.num_tokens - 1)
             
     def binary_topk(self, weights, ks):
         index = weights.argsort(dim=-1, descending=True)
-        ks = einops.rearrange(ks, 'b -> b ()')
-        pos = einops.rearrange(torch.arange(weights.size(-1), device=weights.device), 'n -> () n')
-        topk = ks > pos
-        binary = torch.zeros_like(topk, dtype=torch.bool, device = self.device).scatter(1, index, topk)
-        binary = einops.rearrange(binary, 'b n -> b n ()') # add singleton dimension for D expand
+        pos = torch.arange(weights.size(-1), device=weights.device)
+        # views for broadcasting
+        index = einops.rearrange(index, 'b n -> b n ()')
+        ks = einops.rearrange(ks, 'b -> b () ()')
+        pos = einops.rearrange(pos, 'n -> () n ()' )
+        # scatter topk True/False to indices based on sorted weights
+        binary = torch.zeros_like(index, dtype=torch.bool, device = self.device).scatter(1, index, ks > pos)
         return binary
     
     ### PRIORS
@@ -53,9 +56,8 @@ class DiscreteDiffusion(torch.nn.Module):
                              **self.world.token_sizes,b=self.world.batch_size)
     
     def get_visible_ks(self):
-        linear_grid = torch.linspace(0, 1, self.world.batch_size, device=self.device)
-        u = self.uniform((1,))
-        rates = (u + linear_grid) % 1
+        stratification = torch.linspace(0, 1, self.world.batch_size, device=self.device)
+        rates = (self.uniform((1,)) + stratification) % 1 #modulo ensures rates are in [0, 1]
         return self.k_from_rates(rates)
     
     def get_history_ks(self):
@@ -77,4 +79,4 @@ class DiscreteDiffusion(torch.nn.Module):
         mask = ~visible.expand_as(tokens) if land_sea_mask is None else torch.logical_and(land_sea_mask, ~visible)
         rate_correction = einops.reduce(mask, 'b n d -> b 1 1', 'sum') / self.world.num_elements
         loss = (score * mask / rate_correction).mean()
-        return loss
+        return loss, tokens, ensemble, visible
