@@ -228,14 +228,12 @@ class DistributedTrainer(TrainerInterface):
 
     def setup_model(self):
         model = self.create_model().to(self.device)
-        compiled = torch.compile(model, dynamic = True, disable = not self.cfg.use_compile)
-        self.model = DistributedDataParallel(compiled, 
+        self.model = DistributedDataParallel(model, 
                                              device_ids=[self.local_rank], 
                                              output_device=self.local_rank, 
-                                             find_unused_parameters=hasattr(model, 'stage') # need to set this for multi-stage models
                                              )
         if self.cfg.use_ema:
-            self.ema_model = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn())
+            self.ema_model = AveragedModel(self.model.module, multi_avg_fn=get_ema_multi_avg_fn())
         
     def create_seed(self):
         """
@@ -354,34 +352,28 @@ class DistributedTrainer(TrainerInterface):
 
     def train_epoch(self):
         self.switch_mode(train=True)
-        #Join context manager prevents hangups due to uneven sharding
-        joinables = [self.model, self.optimizer] if self.cfg.use_zero else [self.model]
-        with Join(joinables):
-            for batch_idx, batch in enumerate(self.train_dl):
-                self.optimizer.zero_grad()
-                #automatic mixed precision
-                with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
-                    loss = self.forward_step(batch_idx, batch)
-                #backpropagation
-                self.grad_scaler.scale(loss).backward()
-                #manual unscaling to enable clipping
-                self.grad_scaler.unscale_(self.optimizer)
-                if self.cfg.clip_gradients:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_gradients)
-                #optimizer step
-                self.grad_scaler.step(self.optimizer)
-                if self.cfg.use_ema:
-                    self.ema_model.update_parameters(self.model)
-                self.grad_scaler.update()
-                #scheduler step
-                if self.cfg.scheduler_step == "batch" and exists(self.scheduler):
-                    self.scheduler.step()                
+        for batch_idx, batch in enumerate(self.train_dl):
+            self.optimizer.zero_grad()
+            #automatic mixed precision
+            with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
+                loss = self.forward_step(batch_idx, batch)
+            #backpropagation
+            self.grad_scaler.scale(loss).backward()
+            #manual unscaling to enable clipping
+            self.grad_scaler.unscale_(self.optimizer)
+            if self.cfg.clip_gradients:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_gradients)
+            #optimizer step
+            self.grad_scaler.step(self.optimizer)
+            if self.cfg.use_ema:
+                self.ema_model.update_parameters(self.model.module)
+            self.grad_scaler.update()
+            #scheduler step
+            if self.cfg.scheduler_step == "batch" and exists(self.scheduler):
+                self.scheduler.step()                
 
-            if self.cfg.scheduler_step == "epoch" and exists(self.scheduler):
-                self.scheduler.step()
-
-            if self.cfg.use_zero:
-                self.optimizer.consolidate_state_dict()
+        if self.cfg.scheduler_step == "epoch" and exists(self.scheduler):
+            self.scheduler.step()
 
     def evaluate_epoch(self):
         self.switch_mode(train=False)
@@ -458,14 +450,14 @@ class DistributedTrainer(TrainerInterface):
             'train_metrics': self.train_metrics.epochs,
             'val_metrics': self.val_metrics.epochs,
             'misc_metrics': self.misc_metrics.epochs,
-            'model_state': self.model.state_dict(),
+            'model_state': self.model.module.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'scheduler_state': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state': self.grad_scaler.state_dict(),
             'generator_state': self.generator.get_state(),
         }
         if self.cfg.use_ema:
-            state_dict['ema_model_state'] = self.ema_model.state_dict()
+            state_dict['ema_model_state'] = self.ema_model.module.state_dict()
         return state_dict
     
     def load_checkpoint(self, path: Path):
@@ -495,11 +487,13 @@ class DistributedTrainer(TrainerInterface):
         # save config
         self.save_config()
         # save model
+        if self.cfg.use_zero:
+            self.optimizer.consolidate_state_dict()
+
         torch.save(self.state_dict(), self.ckpt_path)
+
         if self.is_best_epoch():
             torch.save(self.state_dict(), self.best_path)
-            #if exists(wandb.run):
-            #    wandb.save(str(self.best_path), policy='now', base_path=str(self.model_dir))
 
         self.train_metrics.scalars_to_csv(self.model_dir / 'train_metrics.csv')
         self.val_metrics.scalars_to_csv(self.model_dir / 'val_metrics.csv')
