@@ -10,8 +10,8 @@ class MaskedPredictor(torch.nn.Module):
         self.coordinate_embedding = ContinuousPositionalEmbedding(model.dim_coords, model.wavelengths, model.dim)
 
         # grouped linear projections
-        self.proj_in = EinsumLinear(model.dim_in, model.dim, num_groups= world.token_sizes['v'])
-        self.proj_out = EinsumLinear(model.dim, model.dim_out, num_groups= world.token_sizes['v'])
+        self.proj_in = GroupLinear(model.dim_in, model.dim, num_groups= world.token_sizes['v'])
+        self.proj_out = GroupLinear(model.dim, model.dim_out, num_groups= world.token_sizes['v'])
 
         # Transformer blocks
         self.network = torch.nn.Sequential(*[

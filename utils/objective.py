@@ -5,21 +5,24 @@ from utils.model import MaskedPredictor
 from utils.loss_fn import f_kernel_crps
 
 class DiscreteDiffusion(torch.nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, device: torch.DeviceObjType = torch.device('cpu'), generator: torch.Generator = None):
         super().__init__()
-        self.device = torch.device('cpu')
+        self.device = device
+        self.generator = generator
         self.world = cfg.world
-        self.network = MaskedPredictor(cfg.network, cfg.world)
+        self.network = MaskedPredictor(cfg.network, cfg.world).to(device)
         self.loss_fn = f_kernel_crps
 
     ### MASKING
+    def uniform(self, shape: tuple):
+        return torch.rand(shape, device=self.device, generator = self.generator)
+    
     def gumbel_noise(self, shape: tuple):
-        u = torch.rand(shape, device=self.device)
-        return -torch.log(-torch.log(u))
+        return -torch.log(-torch.log(self.uniform(shape)))
             
     def dirichlet_marginal(self, ax: str):
         concentration = torch.full((self.world.batch_size, self.world.token_sizes[ax]), self.world.alphas[ax], device=self.device)
-        log_probs = torch._sample_dirichlet(concentration).log()
+        log_probs = torch._sample_dirichlet(concentration, generator = self.generator).log()
         return einops.repeat(log_probs, 
                              f'b {ax} -> b {self.world.flat_token_pattern}',
                              **self.world.token_sizes)
@@ -32,7 +35,7 @@ class DiscreteDiffusion(torch.nn.Module):
         ks = einops.rearrange(ks, 'b -> b ()')
         pos = einops.rearrange(torch.arange(weights.size(-1), device=weights.device), 'n -> () n')
         topk = ks > pos
-        binary = torch.zeros_like(topk, dtype=torch.bool).scatter(1, index, topk)
+        binary = torch.zeros_like(topk, dtype=torch.bool, device = self.device).scatter(1, index, topk)
         binary = einops.rearrange(binary, 'b n -> b n ()') # add singleton dimension for D expand
         return binary
     
@@ -51,7 +54,7 @@ class DiscreteDiffusion(torch.nn.Module):
     
     def get_visible_ks(self):
         linear_grid = torch.linspace(0, 1, self.world.batch_size, device=self.device)
-        u = torch.rand((1,), device=self.device)
+        u = self.uniform((1,))
         rates = (u + linear_grid) % 1
         return self.k_from_rates(rates)
     
