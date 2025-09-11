@@ -233,7 +233,7 @@ class DistributedTrainer(TrainerInterface):
                                              output_device=self.local_rank, 
                                              )
         if self.cfg.use_ema:
-            self.ema_model = AveragedModel(self.model.module, multi_avg_fn=get_ema_multi_avg_fn())
+            self.ema_model = AveragedModel(self.model.module, multi_avg_fn=get_ema_multi_avg_fn(self.cfg.ema_decay))
         
     def create_seed(self):
         """
@@ -362,7 +362,7 @@ class DistributedTrainer(TrainerInterface):
             #manual unscaling to enable clipping
             self.grad_scaler.unscale_(self.optimizer)
             if self.cfg.clip_gradients:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_gradients)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_value)
             #optimizer step
             self.grad_scaler.step(self.optimizer)
             if self.cfg.use_ema:

@@ -87,7 +87,6 @@ class DatasetConfig:
     lat_slice: Optional[dict] = None
     lon_slice: Optional[dict] = None
     stats: Optional[dict] = None
-    grid_size: dict = field(default_factory=lambda: {"lat": 64, "lon": 120})
     return_type: str = "tensor"
     eval_data: str = "picontrol"
     max_dirs: int = 100
@@ -96,9 +95,9 @@ class DatasetConfig:
 class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
-    batch_size: int
     tau: int
     alphas: dict
+    num_ens: Optional[int] = 0
 
     # derived fields
     field_layout: tuple = field(init=False)
@@ -151,9 +150,10 @@ class TrainerConfig:
     val_loss_name: str = "loss"
     mixed_precision: bool = True
     use_ema: bool = False
+    ema_decay: float = 0.9999
     use_zero: bool = False
-    use_compile: bool = False
     clip_gradients: bool = True
+    clip_value: float = 1.
     scheduler_step: str = "epoch"
     num_workers: int = 4
 

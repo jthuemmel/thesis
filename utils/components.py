@@ -125,10 +125,10 @@ class InterfaceBlock(torch.nn.Module):
         self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
 
     def forward(self, 
-                state: Tuple[torch.Tensor, torch.Tensor], 
+                x: torch.Tensor,
+                z: torch.Tensor, 
                 query: Optional[torch.Tensor] = None, 
                 ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, z = state
         q = x if query is None else query
         z = checkpoint_fn(self.read, z, x, ctx, use_checkpoint= self.use_checkpoint)
         for block in self.compute:

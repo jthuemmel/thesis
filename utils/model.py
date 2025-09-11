@@ -18,7 +18,7 @@ class MaskedPredictor(torch.nn.Module):
         self.proj_out = SegmentLinear(model.dim, model.dim_out, self.coordinates[..., world.field_layout.index('v')])
 
         # Transformer blocks
-        self.network = torch.nn.Sequential(*[
+        self.network = torch.nn.ModuleList([
             InterfaceBlock(model.dim, dim_heads=model.dim_heads, num_blocks= model.num_compute_blocks, use_checkpoint=model.use_checkpoint)
             for _ in range(model.num_layers)
             ])
@@ -49,7 +49,8 @@ class MaskedPredictor(torch.nn.Module):
         x = torch.where(visible, src, self.mask_token)
         x = x + self.coordinate_embedding(self.coordinates)
         latents = self.latent_tokens.expand(tokens.size(0), -1, -1)
-        x, latents = self.network((x, latents))
+        for block in self.network:
+            x, latents = block(x, latents)
         out = self.proj_out(x)
         return out
     

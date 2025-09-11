@@ -45,7 +45,6 @@ class NinoData(Dataset):
         return ds
     
     def _preprocess(self, sliced_data: xr.Dataset) -> dict:
-
         # Compute data dependent attributes
         self.compute_means(sliced_data)
         self.compute_stds(sliced_data)
