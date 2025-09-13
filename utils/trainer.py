@@ -389,13 +389,12 @@ class DistributedTrainer(TrainerInterface):
         self.switch_mode(train=False)
         if not exists(self.val_dl):
             return
-        #Join context manager prevents hangups due to uneven sharding
-        with Join([self.model]):
-            for batch_idx, batch in enumerate(self.val_dl):
-                #no gradients needed for evaluation
-                with torch.no_grad():
-                    with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
-                        _ = self.forward_step(batch_idx, batch)
+        for batch_idx, batch in enumerate(self.val_dl):
+            #no gradients needed for evaluation
+            with torch.no_grad():
+                with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
+                    _ = self.forward_step(batch_idx, batch)
+                    dist.barrier()
                 
     def post_training(self):
         self.end_time = datetime.now(UTC)
