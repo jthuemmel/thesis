@@ -375,9 +375,10 @@ class DistributedTrainer(TrainerInterface):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_value)
             #optimizer step
             self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            # ema step
             if self.cfg.use_ema:
                 self.ema_model.update_parameters(self.model.module)
-            self.grad_scaler.update()
             #scheduler step
             if self.cfg.scheduler_step == "batch" and exists(self.scheduler):
                 self.scheduler.step()                
@@ -390,11 +391,9 @@ class DistributedTrainer(TrainerInterface):
         if not exists(self.val_dl):
             return
         for batch_idx, batch in enumerate(self.val_dl):
-            #no gradients needed for evaluation
             with torch.no_grad():
                 with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
                     _ = self.forward_step(batch_idx, batch)
-                    dist.barrier()
                 
     def post_training(self):
         self.end_time = datetime.now(UTC)
