@@ -92,16 +92,13 @@ class Experiment(DistributedTrainer):
     
     def create_model(self):
         model = MaskedPredictor(self.model_cfg, self.world)
-        count = count_parameters(model)
-        print(f'Created model with {count:,} parameters')
-        self.misc_metrics.log_python_object("num_params", count)
         return model
     
     def create_loss(self):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, weight: torch.Tensor = 1.):
             mask = torch.logical_and(self.land_sea_mask, ~visible)
             score = f_kernel_crps(obs, ens)
-            loss = (score * mask * weight).sum() / mask.sum().clamp(1.)
+            loss = (score * mask * weight).sum() / mask.sum().clamp(1)
             self.current_metrics.log_metric(f"loss", loss.item())
             return loss 
         return loss_fn
@@ -123,7 +120,7 @@ class Experiment(DistributedTrainer):
 
         # mask
         t = self.timestep() if task == 'prior' else self.beta_history()
-        weight = 1.
+        weight = self.beta_dt(t)
         visible = self.beta_schedule(t).bernoulli(generator=self.generator).bool()
 
         # predict
