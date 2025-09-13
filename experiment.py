@@ -97,7 +97,7 @@ class Experiment(DistributedTrainer):
     def create_loss(self):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, weight: torch.Tensor = 1.):
             mask = torch.logical_and(self.land_sea_mask, ~visible)
-            score = f_gaussian_crps(obs, ens.mean(-1), ens.std(-1))
+            score = f_kernel_crps(obs, ens)
             loss = (score * mask * weight).sum() / mask.sum().clamp(1.)
             return loss 
         return loss_fn
