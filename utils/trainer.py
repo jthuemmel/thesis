@@ -17,15 +17,19 @@ from dataclasses import asdict, is_dataclass
 from utils.metrics import MetricSaver
 
 ###  HELPERS ###
-def wandb_set_startup_timeout(seconds: int):
-    assert isinstance(seconds, int)
-    os.environ['WANDB__SERVICE_WAIT'] = f'{seconds}'
-
 def exists(val):
     return val is not None
 
 def default(val, d):
     return val if exists(val) else d
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def wandb_set_startup_timeout(seconds: int):
+    assert isinstance(seconds, int)
+    os.environ['WANDB__SERVICE_WAIT'] = f'{seconds}'
+
 
 ### TRAINER INTERFACE ###
 class TrainerInterface:
@@ -228,12 +232,18 @@ class DistributedTrainer(TrainerInterface):
 
     def setup_model(self):
         model = self.create_model().to(self.device)
+        count = count_parameters(model)
+        
         self.model = DistributedDataParallel(model, 
                                              device_ids=[self.local_rank], 
                                              output_device=self.local_rank, 
                                              )
         if self.cfg.use_ema:
             self.ema_model = AveragedModel(self.model.module, multi_avg_fn=get_ema_multi_avg_fn(self.cfg.ema_decay))
+        
+        if self.is_root:
+            print(f'Created model with {count:,} parameters')
+            self.misc_metrics.log_python_object("num_params", count)
         
     def create_seed(self):
         """

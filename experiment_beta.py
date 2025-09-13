@@ -99,10 +99,9 @@ class Experiment(DistributedTrainer):
     
     def create_loss(self):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, weight: torch.Tensor = 1.):
-            score = f_gaussian_crps(obs, ens.mean(-1), ens.std(-1))
             mask = torch.logical_and(self.land_sea_mask, ~visible)
-            loss = einops.reduce(score * mask * weight, 'b n d -> b', 'sum') / einops.reduce(mask.long(), 'b n d -> b', 'sum').clamp(1.)
-            loss = loss.nanmean()
+            score = f_kernel_crps(obs, ens)
+            loss = (score * mask * weight).sum() / mask.sum().clamp(1.)
             self.current_metrics.log_metric(f"loss", loss.item())
             return loss 
         return loss_fn
@@ -124,7 +123,7 @@ class Experiment(DistributedTrainer):
 
         # mask
         t = self.timestep() if task == 'prior' else self.beta_history()
-        weight = self.beta_dt(t)
+        weight = 1.
         visible = self.beta_schedule(t).bernoulli(generator=self.generator).bool()
 
         # predict
@@ -152,18 +151,16 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, b=self.optim_cfg.batch_size)
     
     @staticmethod
-    def beta_schedule(t: torch.Tensor, eps= 1e-4):
-        beta = 0.5 - 0.5 * torch.cos(torch.pi * t)
-        return beta.clamp(max = 1 - eps)
+    def beta_schedule(t: torch.Tensor):
+        return 0.5 - 0.5 * torch.cos(torch.pi * t)
 
     @staticmethod
     def beta_dt(t: torch.Tensor):
-        beta = 0.5 * torch.pi * torch.sin(torch.pi * t)
-        return beta
+        return 0.5 * torch.pi * torch.sin(torch.pi * t)
     
     def timestep(self):
         stratification = torch.linspace(0, 1, self.optim_cfg.batch_size, device=self.device).view(-1, 1)
-        t = self.uniform((self.optim_cfg.batch_size, self.world.token_sizes['t'],))
+        t = self.uniform((1, self.world.token_sizes['t'],))
         t = (t + stratification) % 1
         t = einops.repeat(t, f'b t -> b {self.world.flat_token_pattern} ()', **self.world.token_sizes)
         return t
