@@ -14,7 +14,7 @@ def get_statistics(prediction: torch.Tensor, dim: int = 1, mode: str = 'ensemble
 
 def f_gaussian_ignorance(observation: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     # I = ½ ln(2π) + ln σ + ½ z^2
-    sigma = sigma.clamp(min=1e-9)
+    sigma = sigma.clamp(min=1e-6)
     z = (observation - mu) / sigma
     log2pi = 0.5 * math.log(2 * math.pi)
     score = log2pi + torch.log(sigma) + 0.5 * z**2
@@ -22,7 +22,8 @@ def f_gaussian_ignorance(observation: torch.Tensor, mu: torch.Tensor, sigma: tor
 
 def f_gaussian_crps(observation: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor):
     sqrtPi, sqrtTwo = math.sqrt(math.pi), math.sqrt(2) #precompute constants
-    z = (observation - mu) / sigma #z transform
+    sigma = sigma.clamp(min=1e-6)
+    z = (observation - mu) / sigma
     phi = torch.exp(-z ** 2 / 2) / (sqrtTwo * sqrtPi) #standard normal pdf
     score = sigma * (z * torch.erf(z / sqrtTwo) + 2 * phi - 1 / sqrtPi) #crps as per Gneiting et al 2005
     return score
