@@ -56,7 +56,4 @@ class SegmentLinear(torch.nn.Module):
         return segments, len(unique_vals)
 
     def forward(self, x: torch.Tensor):
-        out = x.new_empty(*x.shape[:-1], self.linear.dim_out)
-        for idx, sl in self.segments:
-            out[:, sl] = self.linear(x[:, sl], idx)
-        return out
+        return torch.cat([self.linear(x[:, s, :], idx) for idx, s in self.segments], dim = 1)

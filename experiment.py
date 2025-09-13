@@ -99,7 +99,6 @@ class Experiment(DistributedTrainer):
             mask = torch.logical_and(self.land_sea_mask, ~visible)
             score = f_kernel_crps(obs, ens)
             loss = (score * mask * weight).sum() / mask.sum().clamp(1.)
-            self.current_metrics.log_metric(f"loss", loss.item())
             return loss 
         return loss_fn
     
@@ -119,22 +118,33 @@ class Experiment(DistributedTrainer):
         tokens = self.field_to_tokens(batch.to(self.device))
 
         # mask
-        ws = self.get_visible_ws() if task == 'prior' else self.get_history_ws() 
-        ks = self.get_visible_ks() if task == 'prior' else self.get_history_ks()
-        visible = self.binary_topk(ws, ks)
+        visible, weight = self.get_masking(task)
 
         # predict
         prediction = self.ema_model(tokens, visible) if task == 'ema' else self.model(tokens, visible)
 
         # score
         ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
-        loss = self.loss_fn(ensemble, tokens, visible)
+        loss = self.loss_fn(ensemble, tokens, visible, weight = weight)
 
         # metrics
         metrics = self.compute_metrics(ens = ensemble, obs = tokens, vis = visible)
+        metrics['loss'] = loss
         self.log_metrics(metrics, task=task)
         return loss
     
+    def get_masking(self, task: str):
+        if 'beta' in self.cfg.wb_tags:
+            t = self.beta_timestep() if task == 'prior' else self.beta_history()
+            weight = self.beta_dt(t)
+            visible = self.beta_schedule(t).bernoulli(generator=self.generator).bool()
+        elif 'dirichlet' in self.cfg.wb_tags:
+            ws = self.dirichlet_ws() if task == 'prior' else self.dirichlet_history() 
+            ks = self.dirichlet_ks() if task == 'prior' else self.history_ks()
+            weight = 1.
+            visible = self.binary_topk(ws, ks)
+        return visible, weight
+
     ### MASKING
     def k_from_rates(self, rates):
         return (self.world.num_tokens * rates).long().clamp(1, self.world.num_tokens - 1)
@@ -150,7 +160,6 @@ class Experiment(DistributedTrainer):
         binary = torch.zeros_like(index, dtype=torch.bool, device = self.device).scatter(1, index, ks > pos)
         return binary
     
-    ### SAMPLING
     def uniform(self, shape: tuple):
         return torch.rand(shape, device=self.device, generator = self.generator)
     
@@ -164,25 +173,53 @@ class Experiment(DistributedTrainer):
                              f'b {ax} -> b {self.world.flat_token_pattern}',
                              **self.world.token_sizes, b = self.optim_cfg.batch_size)
     
-    ### PRIORS
-    def get_visible_ws(self):
+    def beta_history(self):
+        step = torch.zeros((self.world.token_sizes['t'],), device=self.device)
+        step[:self.world.tau] = 1.
+        return einops.repeat(step,
+                            f't -> b {self.world.flat_token_pattern} ()',
+                            **self.world.token_sizes, b=self.optim_cfg.batch_size)
+    
+    @staticmethod
+    def beta_schedule(t: torch.Tensor):
+        return 0.5 - 0.5 * torch.cos(torch.pi * t)
+
+    @staticmethod
+    def beta_dt(t: torch.Tensor):
+        return 0.5 * torch.pi * torch.sin(torch.pi * t)
+    
+    def beta_timestep(self):
+        stratification = torch.linspace(0, 1, self.optim_cfg.batch_size, device=self.device).view(-1, 1)
+        t = self.uniform((1, self.world.token_sizes['t'],))
+        t = (t + stratification) % 1
+        t = einops.repeat(t, f'b t -> b {self.world.flat_token_pattern} ()', **self.world.token_sizes)
+        return t
+    
+    def beta_history(self):
+        step = torch.zeros((self.world.token_sizes['t'],), device=self.device)
+        step[:self.world.tau] = 1.
+        return einops.repeat(step,
+                             f't -> b {self.world.flat_token_pattern} ()',
+                             **self.world.token_sizes, b=self.optim_cfg.batch_size)
+
+    def dirichlet_ws(self):
         G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
         D = torch.stack([self.dirichlet_marginal(ax) for ax in self.world.alphas.keys()], dim = 0).sum(0)
         return G + D
 
-    def get_history_ws(self):
+    def dirichlet_history(self):
         step = torch.zeros((self.world.token_sizes['t'],), device=self.device)
         step[:self.world.tau] = float('inf')
         return einops.repeat(step,
                              f't -> b {self.world.flat_token_pattern}',
                              **self.world.token_sizes, b=self.optim_cfg.batch_size)
     
-    def get_visible_ks(self):
+    def dirichlet_ks(self):
         stratification = torch.linspace(0, 1, self.optim_cfg.batch_size, device=self.device)
         rates = (self.uniform((1,)) + stratification) % 1 #modulo ensures rates are in [0, 1]
         return self.k_from_rates(rates)
     
-    def get_history_ks(self):
+    def history_ks(self):
         rates = torch.full((self.optim_cfg.batch_size,), self.world.tau / self.world.token_sizes['t'],device=self.device)
         return self.k_from_rates(rates)
     
@@ -231,7 +268,7 @@ class Experiment(DistributedTrainer):
     
     def log_metrics(self, metrics: dict, task: str = None):
         for key, val in metrics.items():
-            name = f"{task}_{key}" if task is not None else key
+            name = f"{task}_{key}" if exists(task) and task != 'prior' else key
             self.current_metrics.log_metric(name, val.item())
 
     def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, vis: torch.Tensor):

@@ -77,7 +77,7 @@ class GatedFFN(torch.nn.Module):
         return x
     
 class Attention(torch.nn.Module):
-    def __init__(self, dim: int, dim_heads: int = 64, bias: bool = True):
+    def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False):
         super().__init__()
         self.split_heads = Rearrange('... n (h d) -> (...) h n d', d = dim_heads)
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
