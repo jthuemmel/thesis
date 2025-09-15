@@ -285,11 +285,9 @@ class DistributedTrainer(TrainerInterface):
     def create_device(self):
         if torch.cuda.is_available():
             self.device = torch.device(type = 'cuda', index = int(self.local_rank))
-            self.device_type = 'cuda'
             torch.cuda.set_device(device = self.device)
             print(f"Rank {self.rank} set device to {torch.cuda.current_device()}", flush=True)
         else:
-            self.device_type = 'cpu'
             self.device = torch.device(type = 'cpu')
             print(f"Rank {self.rank} set device to {self.device}", flush=True)
     
@@ -365,7 +363,7 @@ class DistributedTrainer(TrainerInterface):
         for batch_idx, batch in enumerate(self.train_dl):
             self.optimizer.zero_grad()
             #automatic mixed precision
-            with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
+            with autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
                 loss = self.forward_step(batch_idx, batch)
             #backpropagation
             self.grad_scaler.scale(loss).backward()
@@ -392,7 +390,7 @@ class DistributedTrainer(TrainerInterface):
             return
         for batch_idx, batch in enumerate(self.val_dl):
             with torch.no_grad():
-                with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
+                with autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
                     _ = self.forward_step(batch_idx, batch)
                 
     def post_training(self):
