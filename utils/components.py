@@ -6,17 +6,10 @@ from torch.nn.functional import scaled_dot_product_attention, silu
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-
 from typing import Optional, Tuple, List
 
 def get_weight_std(weight: torch.Tensor):
     return 1 / weight.size(-1)**0.5
-
-def checkpoint_fn(fn, *args, use_checkpoint: bool = True):
-    if use_checkpoint:
-        return checkpoint(fn, *args, use_reentrant=False)
-    else:
-        return fn(*args)
 
 class ContinuousPositionalEmbedding(torch.nn.Module):
     def __init__(self, dim_per_coord: int, wavelengths: List[Tuple[int, int]] = [(1., 256)], model_dim: Optional[int] = None):
@@ -35,8 +28,9 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
         self.proj = torch.nn.Identity() if model_dim is None else torch.nn.Linear(self.embedding_dim, model_dim)
 
     def forward(self, coordinates: torch.Tensor):
-        angles = torch.einsum("...i, i d -> ...i d", coordinates, self.freqs)
-        emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
+        with torch.amp.autocast(enabled = False, device_type = coordinates.device.type): # overflows fp16 if not careful
+            angles = torch.einsum("...i, i d -> ...i d", coordinates, self.freqs)
+            emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
         emb = rearrange(emb, "... n d two -> ... (n d two)")
         return self.proj(emb)
 
@@ -130,8 +124,8 @@ class InterfaceBlock(torch.nn.Module):
                 query: Optional[torch.Tensor] = None, 
                 ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         q = x if query is None else query
-        z = checkpoint_fn(self.read, z, x, ctx, use_checkpoint= self.use_checkpoint)
+        z = checkpoint(self.read, z, x, ctx) if self.use_checkpoint else self.read(z, x, ctx)
         for block in self.compute:
             z = block(z, ctx = ctx)
-        query = checkpoint_fn(self.write, q, z, ctx, use_checkpoint= self.use_checkpoint)
+        query = checkpoint(self.write, q, z, ctx) if self.use_checkpoint else self.write(q, z, ctx)
         return query, z
