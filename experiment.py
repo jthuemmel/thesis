@@ -98,7 +98,7 @@ class Experiment(DistributedTrainer):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, weight: torch.Tensor = 1.):
             mask = torch.logical_and(self.land_sea_mask, ~visible)
             score = f_kernel_crps(obs, ens)
-            loss = (score * mask * weight).sum() / mask.sum().clamp(1.)
+            loss = (score * weight)[mask].mean()
             return loss 
         return loss_fn
     
@@ -125,19 +125,20 @@ class Experiment(DistributedTrainer):
 
         # score
         ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
-        loss = self.loss_fn(ensemble, tokens, visible, weight = weight)
+        loss = self.loss_fn(ensemble, tokens, visible, weight)
 
         # metrics
         metrics = self.compute_metrics(ens = ensemble, obs = tokens, vis = visible)
-        metrics['loss'] = loss
+        metrics['loss'] = loss.item()
         self.log_metrics(metrics, task=task)
         return loss
     
     def get_masking(self, task: str):
         if 'beta' in self.cfg.wb_tags:
             t = self.beta_timestep() if task == 'prior' else self.beta_history()
-            weight = self.beta_dt(t)
-            visible = self.beta_schedule(t).bernoulli(generator=self.generator).bool()
+            visible_rate = self.beta_schedule(t)
+            weight = self.beta_dt(t) 
+            visible = visible_rate.bernoulli(generator=self.generator).bool()
         elif 'dirichlet' in self.cfg.wb_tags:
             ws = self.dirichlet_ws() if task == 'prior' else self.dirichlet_history() 
             ks = self.dirichlet_ks() if task == 'prior' else self.history_ks()
@@ -269,19 +270,19 @@ class Experiment(DistributedTrainer):
     def log_metrics(self, metrics: dict, task: str = None):
         for key, val in metrics.items():
             name = f"{task}_{key}" if exists(task) and task != 'prior' else key
-            self.current_metrics.log_metric(name, val.item())
+            self.current_metrics.log_metric(name, val)
 
     def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, vis: torch.Tensor):
         mask = torch.logical_and(self.land_sea_mask, ~vis)
         ens = ens[mask]
         obs = obs[mask]
         metrics = {
-            "crps": self.compute_crps(pred=ens, obs=obs),
-            "ssr": self.compute_spread_skill(pred=ens, obs=obs),
-            "ign": self.compute_ign(pred=ens, obs=obs),
-            "spread": self.compute_spread(pred=ens),
-            "acc": self.compute_acc(pred=ens.mean(-1), obs=obs),
-            "rmse": self.compute_rmse(pred=ens.mean(-1), obs=obs),
+            "crps": self.compute_crps(pred=ens, obs=obs).item(),
+            "ssr": self.compute_spread_skill(pred=ens, obs=obs).item(),
+            "ign": self.compute_ign(pred=ens, obs=obs).item(),
+            "spread": self.compute_spread(pred=ens).item(),
+            "acc": self.compute_acc(pred=ens.mean(-1), obs=obs).item(),
+            "rmse": self.compute_rmse(pred=ens.mean(-1), obs=obs).item(),
         }
         return metrics
 
