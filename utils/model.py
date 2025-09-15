@@ -10,8 +10,8 @@ class MaskedPredictor(torch.nn.Module):
         self.register_buffer("coordinates", torch.stack(torch.unravel_index(torch.arange(world.num_tokens), world.token_shape), dim=-1))
 
         # learnable tokens
-        self.latent_tokens = torch.nn.Parameter(torch.empty(1, model.num_latents, model.dim))
-        self.mask_token = torch.nn.Parameter(torch.empty(1, 1, model.dim))
+        self.latent_tokens = torch.nn.Embedding(model.num_latents, model.dim)
+        self.mask_token = torch.nn.Embedding(1, model.dim)
         
         # variable-wise segmented linear projections
         self.proj_in = SegmentLinear(model.dim_in, model.dim, self.coordinates[..., world.field_layout.index('v')])
@@ -34,8 +34,6 @@ class MaskedPredictor(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
         if isinstance(m, torch.nn.Embedding):
             torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
-        if isinstance(m, torch.nn.Parameter):
-            torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
         if isinstance(m, torch.nn.LayerNorm):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
@@ -46,9 +44,9 @@ class MaskedPredictor(torch.nn.Module):
 
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         src = self.proj_in(tokens)
-        x = torch.where(visible, src, self.mask_token)
-        x = x + self.coordinate_embedding(self.coordinates)
-        latents = self.latent_tokens.expand(tokens.size(0), -1, -1)
+        masked = torch.where(visible, src, self.mask_token.weight)
+        x = masked + self.coordinate_embedding(self.coordinates)
+        latents = self.latent_tokens.weight.expand(tokens.size(0), -1, -1)
         for block in self.network:
             x, latents = block(x, latents)
         out = self.proj_out(x)
