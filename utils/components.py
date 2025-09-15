@@ -124,8 +124,8 @@ class InterfaceBlock(torch.nn.Module):
                 query: Optional[torch.Tensor] = None, 
                 ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         q = x if query is None else query
-        z = checkpoint(self.read, z, x, ctx) if self.use_checkpoint else self.read(z, x, ctx)
+        z = checkpoint(self.read, z, x, ctx, use_reentrant=False) if self.use_checkpoint else self.read(z, x, ctx)
         for block in self.compute:
             z = block(z, ctx = ctx)
-        query = checkpoint(self.write, q, z, ctx) if self.use_checkpoint else self.write(q, z, ctx)
+        query = checkpoint(self.write, q, z, ctx, use_reentrant=False) if self.use_checkpoint else self.write(q, z, ctx)
         return query, z
