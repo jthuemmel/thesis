@@ -4,6 +4,9 @@ import argparse
 import math
 import einops
 
+import xarray as xr
+import numpy as np
+
 from dataclasses import replace
 from omegaconf import OmegaConf
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -96,16 +99,34 @@ class Experiment(DistributedTrainer):
         return model
     
     def create_loss(self):
-        def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, weight: torch.Tensor = 1.):
+        def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
             mask = torch.logical_and(self.land_sea_mask, ~visible)
-            score = f_kernel_crps(obs, ens)
-            loss = (score * weight)[mask].mean()
+            score = f_kernel_crps(obs, ens) * self.per_variable_weights()
+            loss = (score * mask_weight)[mask].mean()
             return loss 
         return loss_fn
     
     def setup_misc(self):
         self.mask_generator = Masking(world_cfg= self.world, optim_cfg= self.optim_cfg, device= self.device, generator= self.generator)
 
+    def per_variable_weights(self):
+        weights = {
+            'temp_ocn_0a': 1.,
+            'temp_ocn_1a': 0.1,
+            'temp_ocn_3a': 0.1,
+            'temp_ocn_5a': 0.1,
+            'temp_ocn_8a': 0.1,
+            'temp_ocn_11a': 0.1,
+            'temp_ocn_14a': 0.1,
+            'tauxa': 0.01,
+            'tauya': 0.01,
+        }
+        w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
+        return einops.repeat(w, f"(v vv) -> {self.world.flatland_pattern}", 
+                             **self.world.token_sizes, 
+                             **self.world.patch_sizes, 
+                             b = self.optim_cfg.batch_size)
+    
     #FORWARD       
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
@@ -116,12 +137,11 @@ class Experiment(DistributedTrainer):
             mask= 'bernoulli',
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
-        ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
-        ensemble = self.tokens_to_field(ensemble)
-        return batch, ensemble
+        prediction = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
+        prediction = self.tokens_to_field(prediction)
+        return prediction
 
     def forward_step(self, batch_idx, batch):
-        # tokenize
         tokens = self.field_to_tokens(batch.to(self.device))
         visible, weight = self.mask_generator(
             timestep= self.world.timestep,
@@ -131,8 +151,6 @@ class Experiment(DistributedTrainer):
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
         ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
         loss = self.loss_fn(ensemble, tokens, visible, weight)
-
-        # metrics
         metrics = self.compute_metrics(ens = ensemble, obs = tokens, vis = visible)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
@@ -149,7 +167,105 @@ class Experiment(DistributedTrainer):
                                 f"{self.world.flatland_pattern} ... -> {self.world.field_pattern} ...",
                                 **self.world.token_sizes, **self.world.patch_sizes)
     
-    # METRICS
+    # EVAL
+    def evaluate_epoch(self):
+        super().evaluate_epoch()
+        self.evaluate_frcst()
+
+    def evaluate_frcst(self):
+        self.switch_mode(train=False)
+        if not exists(self.val_dl):
+            return
+        samples = []
+        for batch_idx, batch in enumerate(self.val_dl):
+            with torch.no_grad():
+                with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+                    prediction = self.frcst_step(batch_idx, batch)
+                    samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
+
+        ds = xr.concat(samples, dim = "time")
+        self.get_nino_metrics(ds)
+
+    @staticmethod
+    def get_nino4(da: xr.DataArray):
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+    
+    @staticmethod
+    def get_nino34(da: xr.DataArray):
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+
+    @staticmethod
+    def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
+        num = (pred * obs).sum(dim)
+        denom = np.sqrt((pred**2).sum(dim)) * np.sqrt((obs**2).sum(dim))
+        return num / denom
+
+    @staticmethod
+    def xr_rmse(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
+        return np.sqrt(((pred - obs) ** 2).mean(dim))
+
+    @staticmethod
+    def xr_spread_skill(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
+        K = pred.sizes["ens"]
+        correction = math.sqrt((K + 1) / K)
+        mean = pred.mean("ens")
+        spread = np.sqrt(pred.var("ens").mean(dim))
+        skill = np.sqrt(((obs - mean) ** 2).mean(dim))
+        return correction * (spread / skill)
+    
+    def get_field_metrics(self, eval_data: xr.Dataset):
+        eval_data = eval_data.sel(lat = slice(-20., 20.), lon = slice(90, 270), time = slice('1980', '2015'))
+        for var in ['temp_ocn_0a']:
+            tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
+            pcc = self.xr_pcc(pred.mean('ens'), tgt, ('time', 'lat', 'lon'))
+            rmse = self.xr_rmse(pred.mean('ens'), tgt, ('time', 'lat', 'lon'))
+            ssr = self.xr_spread_skill(pred, tgt, ('time', 'lat', 'lon'))
+            self.current_metrics.log_metric(f"{var}_pcc", pcc.values)
+            self.current_metrics.log_metric(f"{var}_ssr", ssr.values)
+            self.current_metrics.log_metric(f"{var}_rmse", rmse.values)
+
+    def get_nino_metrics(self, eval_data: xr.Dataset):
+        eval_data = eval_data.sel(lat = slice(-20., 20.), lon = slice(90, 270), time = slice('1980', '2015'))
+        nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
+        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
+        for lag in [3, 9, 15, 21]:
+            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).values)
+            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).values)
+
+    @property
+    def xr_ds_eval(self):
+        return self.val_dataset.dataset
+    
+    def get_xarray_dataset(self, batch_idx, pred, obs):
+        #meta data
+        time, lat, lon = self.xr_ds_eval.time, self.xr_ds_eval.lat, self.xr_ds_eval.lon
+        ens = np.arange(pred.shape[-1])
+        tau = self.world.tau
+        T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
+        lag = np.arange(1, 1 + ((T - tau) * tt))
+        history = tau * tt
+        # variables
+        arrays = []
+        for v, var in enumerate(self.data_cfg.variables):
+            #create xarray
+            data_array = xr.Dataset(
+                data_vars = {
+                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], pred[:, v, history:].float().cpu().numpy()),
+                    f"{var}_tgt": (["time", "lag", "lat", "lon"], obs[:, v, history:].float().cpu().numpy()),
+                },
+                coords = {
+                    "time": time[batch_idx * self.optim_cfg.batch_size: (batch_idx + 1) * self.optim_cfg.batch_size],
+                    "lag": lag,
+                    "lat": lat,
+                    "lon": lon,
+                    "ens": ens
+                },
+            )
+            arrays.append(data_array)
+        ds = xr.merge(arrays)
+        return ds
+
     @staticmethod
     def compute_acc(pred, obs):
         return (pred * obs).nansum() / (pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt())
@@ -211,19 +327,22 @@ class Experiment(DistributedTrainer):
 
     def godas_data(self):
         if not hasattr(self, "_godas_data"):
-            godas_config = replace(self.data_cfg, time_slice = {"start": "1980", "stop": "2015", "step": None})
-            self._godas_data = NinoData(self.cfg.godas_path, time_slice= godas_config)
+            godas_config = self.data_cfg
+            godas_config = replace(godas_config, time_slice = {"start": "1975", "stop": "2020", "step": None})
+            self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
 
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
-            picontrol_config = replace(self.data_cfg, time_slice = {"start": "1800", "stop": "2000", "step": None})
+            picontrol_config = self.data_cfg
+            picontrol_config = replace(picontrol_config, time_slice = {"start": "1800", "stop": "2020", "step": None})
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
     def oras5_data(self):
         if not hasattr(self, "_oras5_data"):
-            oras5_config = replace(self.data_cfg, time_slice = {"start": "1980", "stop": "2015", "step": None})
+            oras5_config = self.data_cfg
+            oras5_config = replace(oras5_config, time_slice = {"start": "1975", "stop": "2020", "step": None})
             self._oras5_data = NinoData(self.cfg.oras5_path, oras5_config)
         return self._oras5_data
 
@@ -252,6 +371,7 @@ class Experiment(DistributedTrainer):
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             drop_last=True,
+            shuffle=False
         )
         return train_dl, val_dl
 
