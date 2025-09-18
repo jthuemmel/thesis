@@ -12,6 +12,7 @@ import utils.config as cfg
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
 from utils.model import MaskedPredictor
+from utils.masking import Masking
 from utils.loss_fn import *
 
 ### HELPER FUNCTIONS
@@ -102,127 +103,40 @@ class Experiment(DistributedTrainer):
             return loss 
         return loss_fn
     
-    #FORWARD
+    def setup_misc(self):
+        self.mask_generator = Masking(world_cfg= self.world, optim_cfg= self.optim_cfg, device= self.device, generator= self.generator)
+
+    #FORWARD       
+    def frcst_step(self, batch_idx, batch):
+        batch = batch.to(self.device)
+        tokens = self.field_to_tokens(batch)
+        visible, _ = self.mask_generator(
+            timestep= 'history',
+            schedule= 'uniform',
+            mask= 'bernoulli',
+        )
+        prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
+        ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
+        ensemble = self.tokens_to_field(ensemble)
+        return batch, ensemble
+
     def forward_step(self, batch_idx, batch):
-        if self.mode == "train":
-            return self.step(batch, task = 'prior')
-        else:
-            _ = self.step(batch, task = 'prior')
-            _ = self.step(batch, task = "frcst")
-            if hasattr(self, 'ema_model'):
-                _ = self.step(batch, task = "ema") 
-            return None
-        
-    def step(self, batch: torch.Tensor, task: str = 'prior'):
         # tokenize
         tokens = self.field_to_tokens(batch.to(self.device))
-
-        # mask
-        visible, weight = self.get_masking(task)
-
-        # predict
-        prediction = self.ema_model(tokens, visible) if task == 'ema' else self.model(tokens, visible)
-
-        # score
+        visible, weight = self.mask_generator(
+            timestep= self.world.timestep,
+            schedule= self.world.schedule,
+            mask= self.world.mask,
+        )
+        prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
         ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
         loss = self.loss_fn(ensemble, tokens, visible, weight)
 
         # metrics
         metrics = self.compute_metrics(ens = ensemble, obs = tokens, vis = visible)
         metrics['loss'] = loss.item()
-        self.log_metrics(metrics, task=task)
+        self.log_metrics(metrics)
         return loss
-    
-    def get_masking(self, task: str):
-        if 'beta' in self.cfg.wb_tags:
-            t = self.beta_timestep() if task == 'prior' else self.beta_history()
-            visible_rate = self.beta_schedule(t)
-            weight = self.beta_dt(t) 
-            visible = visible_rate.bernoulli(generator=self.generator).bool()
-        elif 'dirichlet' in self.cfg.wb_tags:
-            ws = self.dirichlet_ws() if task == 'prior' else self.dirichlet_history() 
-            ks = self.dirichlet_ks() if task == 'prior' else self.history_ks()
-            weight = 1.
-            visible = self.binary_topk(ws, ks)
-        return visible, weight
-
-    ### MASKING
-    def k_from_rates(self, rates):
-        return (self.world.num_tokens * rates).long().clamp(1, self.world.num_tokens - 1)
-            
-    def binary_topk(self, weights, ks):
-        index = weights.argsort(dim=-1, descending=True)
-        pos = torch.arange(weights.size(-1), device=weights.device)
-        # views for broadcasting
-        index = einops.rearrange(index, 'b n -> b n ()')
-        ks = einops.rearrange(ks, 'b -> b () ()')
-        pos = einops.rearrange(pos, 'n -> () n ()' )
-        # scatter topk True/False to indices based on sorted weights
-        binary = torch.zeros_like(index, dtype=torch.bool, device = self.device).scatter(1, index, ks > pos)
-        return binary
-    
-    def uniform(self, shape: tuple):
-        return torch.rand(shape, device=self.device, generator = self.generator)
-    
-    def gumbel_noise(self, shape: tuple):
-        return -torch.log(-torch.log(self.uniform(shape)))
-            
-    def dirichlet_marginal(self, ax: str):
-        concentration = torch.full((self.optim_cfg.batch_size, self.world.token_sizes[ax]), self.world.alphas[ax], device=self.device)
-        log_probs = torch._sample_dirichlet(concentration, generator = self.generator).log()
-        return einops.repeat(log_probs, 
-                             f'b {ax} -> b {self.world.flat_token_pattern}',
-                             **self.world.token_sizes, b = self.optim_cfg.batch_size)
-    
-    def beta_history(self):
-        step = torch.zeros((self.world.token_sizes['t'],), device=self.device)
-        step[:self.world.tau] = 1.
-        return einops.repeat(step,
-                            f't -> b {self.world.flat_token_pattern} ()',
-                            **self.world.token_sizes, b=self.optim_cfg.batch_size)
-    
-    @staticmethod
-    def beta_schedule(t: torch.Tensor):
-        return 0.5 - 0.5 * torch.cos(torch.pi * t)
-
-    @staticmethod
-    def beta_dt(t: torch.Tensor):
-        return 0.5 * torch.pi * torch.sin(torch.pi * t)
-    
-    def beta_timestep(self):
-        stratification = torch.linspace(0, 1, self.optim_cfg.batch_size, device=self.device).view(-1, 1)
-        t = self.uniform((1, self.world.token_sizes['t'],))
-        t = (t + stratification) % 1
-        t = einops.repeat(t, f'b t -> b {self.world.flat_token_pattern} ()', **self.world.token_sizes)
-        return t
-    
-    def beta_history(self):
-        step = torch.zeros((self.world.token_sizes['t'],), device=self.device)
-        step[:self.world.tau] = 1.
-        return einops.repeat(step,
-                             f't -> b {self.world.flat_token_pattern} ()',
-                             **self.world.token_sizes, b=self.optim_cfg.batch_size)
-
-    def dirichlet_ws(self):
-        G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
-        D = torch.stack([self.dirichlet_marginal(ax) for ax in self.world.alphas.keys()], dim = 0).sum(0)
-        return G + D
-
-    def dirichlet_history(self):
-        step = torch.zeros((self.world.token_sizes['t'],), device=self.device)
-        step[:self.world.tau] = float('inf')
-        return einops.repeat(step,
-                             f't -> b {self.world.flat_token_pattern}',
-                             **self.world.token_sizes, b=self.optim_cfg.batch_size)
-    
-    def dirichlet_ks(self):
-        stratification = torch.linspace(0, 1, self.optim_cfg.batch_size, device=self.device)
-        rates = (self.uniform((1,)) + stratification) % 1 #modulo ensures rates are in [0, 1]
-        return self.k_from_rates(rates)
-    
-    def history_ks(self):
-        rates = torch.full((self.optim_cfg.batch_size,), self.world.tau / self.world.token_sizes['t'],device=self.device)
-        return self.k_from_rates(rates)
     
     # Tokenizer
     def field_to_tokens(self, field):
@@ -297,18 +211,20 @@ class Experiment(DistributedTrainer):
 
     def godas_data(self):
         if not hasattr(self, "_godas_data"):
-            self._godas_data = NinoData(self.cfg.godas_path, self.data_cfg)
+            godas_config = replace(self.data_cfg, time_slice = {"start": "1980", "stop": "2015", "step": None})
+            self._godas_data = NinoData(self.cfg.godas_path, time_slice= godas_config)
         return self._godas_data
 
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
-            picontrol_config = replace(self.data_cfg, time_slice = {"start": "1900", "stop": "2000", "step": None})
+            picontrol_config = replace(self.data_cfg, time_slice = {"start": "1800", "stop": "2000", "step": None})
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
     def oras5_data(self):
         if not hasattr(self, "_oras5_data"):
-            self._oras5_data = NinoData(self.cfg.oras5_path, self.data_cfg)
+            oras5_config = replace(self.data_cfg, time_slice = {"start": "1980", "stop": "2015", "step": None})
+            self._oras5_data = NinoData(self.cfg.oras5_path, oras5_config)
         return self._oras5_data
 
     def create_dataset(self):

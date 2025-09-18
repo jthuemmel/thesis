@@ -447,7 +447,7 @@ class DistributedTrainer(TrainerInterface):
             self.scheduler.load_state_dict(state_dict['scheduler_state'])
         self.grad_scaler.load_state_dict(state_dict['scaler_state'])
 
-        if hasattr(self, 'ema_model'):
+        if self.cfg.use_ema:
             self.ema_model.load_state_dict(state_dict['ema_model_state'])
 
     def state_dict(self):

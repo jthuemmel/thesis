@@ -97,6 +97,9 @@ class WorldConfig:
     patch_sizes: dict
     tau: int
     alphas: dict
+    timestep: str
+    schedule: str
+    mask: str
     num_ens: Optional[int] = 0
 
     # derived fields
