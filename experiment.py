@@ -138,6 +138,7 @@ class Experiment(DistributedTrainer):
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
         prediction = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
+        prediction = prediction * self.land_sea_mask[..., None]
         prediction = self.tokens_to_field(prediction)
         return prediction
 
@@ -150,6 +151,7 @@ class Experiment(DistributedTrainer):
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
         ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
+        ensemble = ensemble * self.land_sea_mask[..., None]
         loss = self.loss_fn(ensemble, tokens, visible, weight)
         metrics = self.compute_metrics(ens = ensemble, obs = tokens, vis = visible)
         metrics['loss'] = loss.item()
@@ -185,6 +187,7 @@ class Experiment(DistributedTrainer):
 
         ds = xr.concat(samples, dim = "time")
         self.get_nino_metrics(ds)
+        self.get_field_metrics(ds)
 
     @staticmethod
     def get_nino4(da: xr.DataArray):
@@ -248,11 +251,15 @@ class Experiment(DistributedTrainer):
         # variables
         arrays = []
         for v, var in enumerate(self.data_cfg.variables):
+            std = self.val_dataset._stds.sel(variable = var).values
+            mean = self.val_dataset._means.sel(variable = var).values
+            p = pred[:, v, history:].float().cpu().numpy() * std + mean
+            o = obs[:, v, history:].float().cpu().numpy() * std + mean
             #create xarray
             data_array = xr.Dataset(
                 data_vars = {
-                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], pred[:, v, history:].float().cpu().numpy()),
-                    f"{var}_tgt": (["time", "lag", "lat", "lon"], obs[:, v, history:].float().cpu().numpy()),
+                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], p),
+                    f"{var}_tgt": (["time", "lag", "lat", "lon"], o),
                 },
                 coords = {
                     "time": time[batch_idx * self.optim_cfg.batch_size: (batch_idx + 1) * self.optim_cfg.batch_size],
