@@ -115,9 +115,9 @@ class Masking:
     def binary_topk(self, weights, ks):
         index = weights.argsort(dim=-1, descending=True)
         pos = torch.arange(weights.size(-1), device=weights.device)
-        index = einops.rearrange(index, "b n -> b n ()")
-        ks = einops.rearrange(ks, "b -> b () ()")
-        pos = einops.rearrange(pos, "n -> () n ()")
+        index = einops.rearrange(index, "b n -> b n 1")
+        ks = einops.rearrange(ks, "b n 1 -> b 1 1")
+        pos = einops.rearrange(pos, "n -> 1 n 1")
         binary = torch.zeros_like(index, dtype=torch.bool, device=self.device).scatter(
             1, index, ks > pos
         )
