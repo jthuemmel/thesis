@@ -32,6 +32,10 @@ class Masking:
         elif schedule == "uniform":
             rate = t
             weight = 1.
+        elif schedule == 'affine':
+            min, max = 0.05, 0.5
+            rate = (max - min) * t + min
+            weight = 1.
         else:
             raise ValueError(f"Unknown schedule: {schedule}")
         return rate, weight
