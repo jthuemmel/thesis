@@ -14,8 +14,12 @@ class MaskedPredictor(torch.nn.Module):
         self.mask_token = torch.nn.Embedding(1, model.dim)
         
         # variable-wise segmented linear projections
-        self.proj_in = SegmentLinear(model.dim_in, model.dim, self.coordinates[..., world.field_layout.index('v')])
-        self.proj_out = SegmentLinear(model.dim, model.dim_out, self.coordinates[..., world.field_layout.index('v')])
+        if world.token_sizes['v'] > 1:
+            self.proj_in = SegmentLinear(model.dim_in, model.dim, self.coordinates[..., world.field_layout.index('v')])
+            self.proj_out = SegmentLinear(model.dim, model.dim_out, self.coordinates[..., world.field_layout.index('v')])
+        else:
+            self.proj_in = torch.nn.Linear(model.dim_in, model.dim)
+            self.proj_out = torch.nn.Linear(model.dim, model.dim_out)
 
         # Transformer blocks
         self.network = torch.nn.ModuleList([
