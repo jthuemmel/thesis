@@ -51,6 +51,73 @@ class Experiment(DistributedTrainer):
     def world(self):
         return self._cfg.world
     
+        # DATA
+    
+    def lens_data(self):
+        if not hasattr(self, "_lens_data"):
+            lens_config = self.data_cfg
+            lens_config = replace(lens_config, stats = default(self.data_cfg.stats, cfg.LENS_STATS))
+            lens_config = replace(lens_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
+            self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
+        return self._lens_data       
+
+    def godas_data(self):
+        if not hasattr(self, "_godas_data"):
+            godas_config = self.data_cfg
+            godas_config = replace(godas_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
+            self._godas_data = NinoData(self.cfg.godas_path, godas_config)
+        return self._godas_data
+
+    def picontrol_data(self):
+        if not hasattr(self, "_picontrol_data"):
+            picontrol_config = self.data_cfg
+            picontrol_config = replace(picontrol_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
+            self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
+        return self._picontrol_data
+
+    def oras5_data(self):
+        if not hasattr(self, "_oras5_data"):
+            oras5_config = self.data_cfg
+            oras5_config = replace(oras5_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
+            self._oras5_data = NinoData(self.cfg.oras5_path, oras5_config)
+        return self._oras5_data
+
+    def create_dataset(self):
+        # instantiate datasets
+        self.train_dataset = self.lens_data()
+        self.val_dataset = self.godas_data() if self.data_cfg.eval_data == "godas" else self.picontrol_data()
+
+        # create land-sea mask
+        self._val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
+        self._train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
+
+        # dataloaders
+        train_dl = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.optim_cfg.batch_size,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            shuffle=True,
+        )
+
+        val_dl = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.optim_cfg.batch_size,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            shuffle=False
+        )
+        return train_dl, val_dl
+
+    @property
+    def land_sea_mask(self):
+        lsm = self._train_lsm if self.mode == "train" else self._val_lsm
+        return einops.repeat(lsm, 
+                             f"1 (h hh) (w ww) -> {self.world.flatland_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
+    
     # SETUP
     def create_job_name(self):
         if exists(self.cfg.job_name):
@@ -186,6 +253,7 @@ class Experiment(DistributedTrainer):
                     samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
 
         ds = xr.concat(samples, dim = "time")
+        ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
         self.get_nino_metrics(ds)
         self.get_field_metrics(ds)
 
@@ -217,18 +285,16 @@ class Experiment(DistributedTrainer):
         return correction * (spread / skill)
     
     def get_field_metrics(self, eval_data: xr.Dataset):
-        eval_data = eval_data.sel(lat = slice(-20., 20.), lon = slice(90, 270), time = slice('1980', '2015'))
         for var in ['temp_ocn_0a']:
             tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
-            pcc = self.xr_pcc(pred.mean('ens'), tgt, ('time', 'lat', 'lon'))
-            rmse = self.xr_rmse(pred.mean('ens'), tgt, ('time', 'lat', 'lon'))
-            ssr = self.xr_spread_skill(pred, tgt, ('time', 'lat', 'lon'))
+            pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
             self.current_metrics.log_metric(f"{var}_pcc", pcc.values)
             self.current_metrics.log_metric(f"{var}_ssr", ssr.values)
             self.current_metrics.log_metric(f"{var}_rmse", rmse.values)
 
     def get_nino_metrics(self, eval_data: xr.Dataset):
-        eval_data = eval_data.sel(lat = slice(-20., 20.), lon = slice(90, 270), time = slice('1980', '2015'))
         nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
         nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
         nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
@@ -323,72 +389,6 @@ class Experiment(DistributedTrainer):
         }
         return metrics
 
-    # DATA
-    def lens_data(self):
-        if not hasattr(self, "_lens_data"):
-            lens_config = self.data_cfg
-            lens_config = replace(lens_config, stats = default(self.data_cfg.stats, cfg.LENS_STATS))
-            lens_config = replace(lens_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
-            self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
-        return self._lens_data       
-
-    def godas_data(self):
-        if not hasattr(self, "_godas_data"):
-            godas_config = self.data_cfg
-            godas_config = replace(godas_config, time_slice = {"start": "1975", "stop": "2020", "step": None})
-            self._godas_data = NinoData(self.cfg.godas_path, godas_config)
-        return self._godas_data
-
-    def picontrol_data(self):
-        if not hasattr(self, "_picontrol_data"):
-            picontrol_config = self.data_cfg
-            picontrol_config = replace(picontrol_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
-            self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
-        return self._picontrol_data
-
-    def oras5_data(self):
-        if not hasattr(self, "_oras5_data"):
-            oras5_config = self.data_cfg
-            oras5_config = replace(oras5_config, time_slice = {"start": "1975", "stop": "2020", "step": None})
-            self._oras5_data = NinoData(self.cfg.oras5_path, oras5_config)
-        return self._oras5_data
-
-    def create_dataset(self):
-        # instantiate datasets
-        self.train_dataset = self.lens_data()
-        self.val_dataset = self.godas_data() if self.data_cfg.eval_data == "godas" else self.picontrol_data()
-
-        # create land-sea mask
-        self._val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
-        self._train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
-
-        # dataloaders
-        train_dl = torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=self.optim_cfg.batch_size,
-            num_workers=self.cfg.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            shuffle=True,
-        )
-
-        val_dl = torch.utils.data.DataLoader(
-            self.val_dataset,
-            batch_size=self.optim_cfg.batch_size,
-            num_workers=self.cfg.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            shuffle=False
-        )
-        return train_dl, val_dl
-
-    @property
-    def land_sea_mask(self):
-        lsm = self._train_lsm if self.mode == "train" else self._val_lsm
-        return einops.repeat(lsm, 
-                             f"1 (h hh) (w ww) -> {self.world.flatland_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
-    
 def main():
     parser = argparse.ArgumentParser(description="Train a MIN model")
     parser.add_argument("--id", type=str, default=None, help="alias for the task id")
