@@ -283,7 +283,9 @@ class Experiment(DistributedTrainer):
         return correction * (spread / skill)
     
     def get_field_metrics(self, eval_data: xr.Dataset):
-        for var in ['temp_ocn_0a']:
+        for var in self.data_cfg.variables:
+            if var not in self.data_cfg.eval_variables:
+                continue
             tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
             pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
@@ -315,6 +317,8 @@ class Experiment(DistributedTrainer):
         # variables
         arrays = []
         for v, var in enumerate(self.data_cfg.variables):
+            if var not in self.data_cfg.eval_variables:
+                continue
             std = self.val_dataset._stds.sel(variable = var).values
             mean = self.val_dataset._means.sel(variable = var).values
             p = pred[:, v, history:].float().cpu().numpy() * std + mean

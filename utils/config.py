@@ -83,6 +83,7 @@ class OptimConfig:
 class DatasetConfig:
     sequence_length: int = 1
     variables: List[str] = field(default_factory=lambda: VARS)
+    eval_variables: List[str] = field(default_factory=lambda: VARS)
     time_slice: Optional[dict] = None
     lat_slice: Optional[dict] = None
     lon_slice: Optional[dict] = None
@@ -111,6 +112,8 @@ class WorldConfig:
     num_elements: int = field(init=False)
     dim_tokens: int = field(init=False)
     field_pattern: str = field(init=False)
+    token_pattern: str = field(init=False)
+    patch_pattern: str = field(init=False)
     flat_token_pattern: str = field(init=False)
     flat_patch_pattern: str = field(init=False)
     flatland_pattern: str = field(init=False)
@@ -131,8 +134,10 @@ class WorldConfig:
 
         field = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
         self.field_pattern = f"b {field}"
-        self.flat_token_pattern = f"({' '.join(self.field_layout)})"
-        self.flat_patch_pattern = f"({' '.join(self.patch_layout)})"
+        self.patch_pattern = ' '.join(self.patch_layout)
+        self.token_pattern = ' '.join(self.field_layout)
+        self.flat_token_pattern = f"({self.token_pattern})"
+        self.flat_patch_pattern = f"({self.patch_pattern})"
         self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"
 
 @dataclass
