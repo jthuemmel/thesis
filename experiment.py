@@ -255,6 +255,84 @@ class Experiment(DistributedTrainer):
         self.get_nino_metrics(ds)
         self.get_field_metrics(ds)
 
+    def get_xarray_dataset(self, batch_idx, pred, obs):
+        #meta data
+        meta_data = self.val_dataset.dataset
+        time, lat, lon = meta_data.time, meta_data.lat, meta_data.lon
+        ens = np.arange(pred.shape[-1])
+        tau = self.world.tau
+        T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
+        lag = np.arange(1, 1 + ((T - tau) * tt))
+        history = tau * tt
+
+        # variables
+        arrays = []
+        for v, var in enumerate(self.data_cfg.variables):
+            if var not in self.data_cfg.eval_variables:
+                continue
+            
+            std = self.val_dataset._stds.sel(variable = var).values
+            mean = self.val_dataset._means.sel(variable = var).values
+            p = pred[:, v, history:].float().cpu().numpy() * std + mean
+            o = obs[:, v, history:].float().cpu().numpy() * std + mean
+
+            #create xarray
+            data_array = xr.Dataset(
+                data_vars = {
+                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], p),
+                    f"{var}_tgt": (["time", "lag", "lat", "lon"], o),
+                },
+                coords = {
+                    "time": time[batch_idx * self.optim_cfg.batch_size: (batch_idx + 1) * self.optim_cfg.batch_size],
+                    "lag": lag,
+                    "lat": lat,
+                    "lon": lon,
+                    "ens": ens
+                },
+            )
+            arrays.append(data_array)
+        ds = xr.merge(arrays)
+        return ds
+
+    def get_field_metrics(self, eval_data: xr.Dataset):
+        for var in self.data_cfg.variables:
+            if var not in self.data_cfg.eval_variables:
+                continue
+            tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
+            pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            self.current_metrics.log_metric(f"{var}_pcc", pcc.values)
+            self.current_metrics.log_metric(f"{var}_ssr", ssr.values)
+            self.current_metrics.log_metric(f"{var}_rmse", rmse.values)
+
+    def get_nino_metrics(self, eval_data: xr.Dataset):
+        nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
+        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
+        for lag in [3, 9, 15, 21]:
+            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).values)
+            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).values)
+        
+    def log_metrics(self, metrics: dict, task: str = None):
+        for key, val in metrics.items():
+            name = f"{task}_{key}" if exists(task) and task != 'prior' else key
+            self.current_metrics.log_metric(name, val)
+
+    def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, vis: torch.Tensor):
+        mask = torch.logical_and(self.land_sea_mask, ~vis)
+        ens = ens[mask]
+        obs = obs[mask]
+        metrics = {
+            "crps": self.compute_crps(pred=ens, obs=obs).item(),
+            "ssr": self.compute_spread_skill(pred=ens, obs=obs).item(),
+            "ign": self.compute_ign(pred=ens, obs=obs).item(),
+            "spread": self.compute_spread(pred=ens).item(),
+            "acc": self.compute_acc(pred=ens.mean(-1), obs=obs).item(),
+            "rmse": self.compute_rmse(pred=ens.mean(-1), obs=obs).item(),
+        }
+        return metrics
+
     @staticmethod
     def get_nino4(da: xr.DataArray):
         return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
@@ -282,65 +360,6 @@ class Experiment(DistributedTrainer):
         skill = np.sqrt(((obs - mean) ** 2).mean(dim))
         return correction * (spread / skill)
     
-    def get_field_metrics(self, eval_data: xr.Dataset):
-        for var in self.data_cfg.variables:
-            if var not in self.data_cfg.eval_variables:
-                continue
-            tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
-            pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            self.current_metrics.log_metric(f"{var}_pcc", pcc.values)
-            self.current_metrics.log_metric(f"{var}_ssr", ssr.values)
-            self.current_metrics.log_metric(f"{var}_rmse", rmse.values)
-
-    def get_nino_metrics(self, eval_data: xr.Dataset):
-        nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
-        nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
-        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
-        for lag in [3, 9, 15, 21]:
-            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).values)
-            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).values)
-
-    @property
-    def xr_ds_eval(self):
-        return self.val_dataset.dataset
-    
-    def get_xarray_dataset(self, batch_idx, pred, obs):
-        #meta data
-        time, lat, lon = self.xr_ds_eval.time, self.xr_ds_eval.lat, self.xr_ds_eval.lon
-        ens = np.arange(pred.shape[-1])
-        tau = self.world.tau
-        T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
-        lag = np.arange(1, 1 + ((T - tau) * tt))
-        history = tau * tt
-        # variables
-        arrays = []
-        for v, var in enumerate(self.data_cfg.variables):
-            if var not in self.data_cfg.eval_variables:
-                continue
-            std = self.val_dataset._stds.sel(variable = var).values
-            mean = self.val_dataset._means.sel(variable = var).values
-            p = pred[:, v, history:].float().cpu().numpy() * std + mean
-            o = obs[:, v, history:].float().cpu().numpy() * std + mean
-            #create xarray
-            data_array = xr.Dataset(
-                data_vars = {
-                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], p),
-                    f"{var}_tgt": (["time", "lag", "lat", "lon"], o),
-                },
-                coords = {
-                    "time": time[batch_idx * self.optim_cfg.batch_size: (batch_idx + 1) * self.optim_cfg.batch_size],
-                    "lag": lag,
-                    "lat": lat,
-                    "lon": lon,
-                    "ens": ens
-                },
-            )
-            arrays.append(data_array)
-        ds = xr.merge(arrays)
-        return ds
-
     @staticmethod
     def compute_acc(pred, obs):
         return (pred * obs).nansum() / (pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt())
@@ -371,25 +390,6 @@ class Experiment(DistributedTrainer):
         spread = pred.var(-1).mean().sqrt()
         skill = (obs - mean).pow(2).mean().sqrt()
         return correction * (spread / skill)
-    
-    def log_metrics(self, metrics: dict, task: str = None):
-        for key, val in metrics.items():
-            name = f"{task}_{key}" if exists(task) and task != 'prior' else key
-            self.current_metrics.log_metric(name, val)
-
-    def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, vis: torch.Tensor):
-        mask = torch.logical_and(self.land_sea_mask, ~vis)
-        ens = ens[mask]
-        obs = obs[mask]
-        metrics = {
-            "crps": self.compute_crps(pred=ens, obs=obs).item(),
-            "ssr": self.compute_spread_skill(pred=ens, obs=obs).item(),
-            "ign": self.compute_ign(pred=ens, obs=obs).item(),
-            "spread": self.compute_spread(pred=ens).item(),
-            "acc": self.compute_acc(pred=ens.mean(-1), obs=obs).item(),
-            "rmse": self.compute_rmse(pred=ens.mean(-1), obs=obs).item(),
-        }
-        return metrics
 
 def main():
     parser = argparse.ArgumentParser(description="Train a MIN model")

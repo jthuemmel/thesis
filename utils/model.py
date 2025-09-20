@@ -6,14 +6,18 @@ class MaskedPredictor(torch.nn.Module):
     def __init__(self, model, world):
         super().__init__()
         # per-variable linear projections
-        self.proj_in = EinMix(f'{world.flatland_pattern} -> b {world.flat_token_pattern} d',
-                            weight_shape = f'v {world.patch_pattern} d',
-                            bias_shape = 'v d',
-                            d = model.dim, **world.patch_sizes, **world.token_sizes)
+        self.proj_in = EinMix(
+            pattern = f'{world.flatland_pattern} -> b {world.flat_token_pattern} d',
+            weight_shape = f'v {world.patch_pattern} d', 
+            bias_shape = 'v d',
+            d = model.dim, **world.patch_sizes, **world.token_sizes
+            )
         
-        self.proj_out = EinMix(f'b {world.flat_token_pattern} d -> {world.flatland_pattern} e',
-                            weight_shape = f'v {world.patch_pattern} e d',
-                            d = model.dim, e = world.num_ens, **world.patch_sizes, **world.token_sizes)
+        self.proj_out = EinMix(
+            pattern = f'b {world.flat_token_pattern} d -> {world.flatland_pattern} e',
+            weight_shape = f'v {world.patch_pattern} e d',
+            d = model.dim, e = world.num_ens, **world.patch_sizes, **world.token_sizes
+            )
 
         # learnable tokens
         self.positions = torch.nn.Embedding(world.num_tokens, model.dim)
@@ -22,7 +26,11 @@ class MaskedPredictor(torch.nn.Module):
 
         # Transformer
         self.network = torch.nn.ModuleList([
-            InterfaceBlock(model.dim, dim_heads=model.dim_heads, num_blocks= model.num_compute_blocks, use_checkpoint=model.use_checkpoint)
+            InterfaceBlock(model.dim, 
+                           dim_heads=model.dim_heads, 
+                           num_blocks= model.num_compute_blocks, 
+                           use_checkpoint=model.use_checkpoint
+                           )
             for _ in range(model.num_layers)
             ])
         
