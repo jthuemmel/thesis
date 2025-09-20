@@ -1,25 +1,24 @@
 import torch
 from utils.components import *
-from utils.index_linear import SegmentLinear
+from einops.layers.torch import EinMix
 
 class MaskedPredictor(torch.nn.Module):
     def __init__(self, model, world):
         super().__init__()
-         # coordinates
-        self.coordinate_embedding = ContinuousPositionalEmbedding(model.dim_coords, model.wavelengths, model.dim)
-        self.register_buffer("coordinates", torch.stack(torch.unravel_index(torch.arange(world.num_tokens), world.token_shape), dim=-1))
+        # per-variable linear projections
+        self.proj_in = EinMix(f'{world.flatland_pattern} -> b {world.flat_token_pattern} d',
+                            weight_shape = f'v {' '.join(world.patch_layout)} d',
+                            bias_shape = 'v d',
+                            d = model.dim, **world.patch_sizes, **world.token_sizes)
+        
+        self.proj_out = EinMix(f'b {world.flat_token_pattern} d -> {world.flatland_pattern} e',
+                            weight_shape = f'v {' '.join(world.patch_layout)} e d',
+                            d = model.dim, e = world.num_ens, **world.patch_sizes, **world.token_sizes)
 
         # learnable tokens
-        self.latent_tokens = torch.nn.Embedding(model.num_latents, model.dim)
-        self.mask_token = torch.nn.Embedding(1, model.dim)
-        
-        # variable-wise segmented linear projections
-        if world.token_sizes['v'] > 1:
-            self.proj_in = SegmentLinear(model.dim_in, model.dim, self.coordinates[..., world.field_layout.index('v')])
-            self.proj_out = SegmentLinear(model.dim, model.dim_out, self.coordinates[..., world.field_layout.index('v')])
-        else:
-            self.proj_in = torch.nn.Linear(model.dim_in, model.dim)
-            self.proj_out = torch.nn.Linear(model.dim, model.dim_out)
+        self.positions = torch.nn.Parameter(torch.empty(1, world.num_tokens, model.dim))
+        self.latents = torch.nn.Parameter(torch.empty(1, model.num_latents, model.dim))
+        self.masks = torch.nn.Parameter(torch.empty(1, 1, model.dim))
 
         # Transformer blocks
         self.network = torch.nn.ModuleList([
@@ -38,6 +37,8 @@ class MaskedPredictor(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
         if isinstance(m, torch.nn.Embedding):
             torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+        if isinstance(m, torch.nn.Parameter):
+            torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
         if isinstance(m, torch.nn.LayerNorm):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
@@ -48,11 +49,11 @@ class MaskedPredictor(torch.nn.Module):
 
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         src = self.proj_in(tokens)
-        masked = torch.where(visible, src, self.mask_token.weight)
-        x = masked + self.coordinate_embedding(self.coordinates)
-        latents = self.latent_tokens.weight.expand(tokens.size(0), -1, -1)
+        x = torch.where(visible, src, self.masks)
+        x = x + self.positions
+        z = self.latents.expand(tokens.size(0), -1, -1)
         for block in self.network:
-            x, latents = block(x, latents)
+            x, z = block(x, z)
         out = self.proj_out(x)
         return out
     

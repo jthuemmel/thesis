@@ -204,7 +204,6 @@ class Experiment(DistributedTrainer):
             mask= 'bernoulli',
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
-        prediction = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
         prediction = prediction * self.land_sea_mask[..., None]
         prediction = self.tokens_to_field(prediction)
         return prediction
@@ -217,10 +216,9 @@ class Experiment(DistributedTrainer):
             mask= self.world.mask,
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
-        ensemble = einops.rearrange(prediction, '(b k) ... (d e) -> b ... d (k e)', b = tokens.size(0), d = tokens.size(-1))
-        ensemble = ensemble * self.land_sea_mask[..., None]
-        loss = self.loss_fn(ensemble, tokens, visible, weight)
-        metrics = self.compute_metrics(ens = ensemble, obs = tokens, vis = visible)
+        prediction = prediction * self.land_sea_mask[..., None]
+        loss = self.loss_fn(prediction, tokens, visible, weight)
+        metrics = self.compute_metrics(ens = prediction, obs = tokens, vis = visible)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
         return loss
