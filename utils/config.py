@@ -101,6 +101,7 @@ class WorldConfig:
     timestep: str
     schedule: str
     mask: str
+    num_tails: Optional[int] = 0
     num_ens: Optional[int] = 0
 
     # derived fields

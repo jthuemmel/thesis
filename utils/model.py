@@ -16,7 +16,7 @@ class MaskedPredictor(torch.nn.Module):
         self.proj_out = EinMix(
             pattern = f'b {world.flat_token_pattern} d -> {world.flatland_pattern} e',
             weight_shape = f'v {world.patch_pattern} e d',
-            d = model.dim, e = world.num_ens, **world.patch_sizes, **world.token_sizes
+            d = model.dim, e = world.num_tails, **world.patch_sizes, **world.token_sizes
             )
 
         # learnable tokens
