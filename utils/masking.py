@@ -94,12 +94,17 @@ class Masking:
         )
 
     # TIMESTEPS
+    def zero_tail(self, t, tail: float = 0.):
+        return torch.where(t > tail, (t - tail) / (1 - tail), torch.zeros_like(t))
+    
     def stratification(self, t):
-        return (t + torch.linspace(0, 1, self.optim_cfg.batch_size, device=self.device).view(-1, 1)) % 1
+        return (t + torch.linspace(0, 1, self.optim_cfg.batch_size, device=t.device).view(-1, 1)) % 1
 
     def framewise_timestep(self):
-        t = self.uniform((1, self.world.token_sizes["t"]))
+        T = self.world.token_sizes["t"]
+        t = self.uniform((1, T))
         t = self.stratification(t)
+        t = self.zero_tail(t, tail = 1 / T)
         return t
 
     def single_timestep(self):
@@ -114,7 +119,7 @@ class Masking:
     
     # TOPK 
     def k_from_rates(self, rates):
-        return (self.world.num_tokens * rates).long().clamp(1, self.world.num_tokens - 1)
+        return (self.world.num_tokens * rates).long()
 
     def binary_topk(self, weights, ks):
         index = weights.argsort(dim=-1, descending=True)
@@ -140,15 +145,17 @@ class Masking:
         return 0.5 - 0.5 * torch.cos(torch.pi * t)
 
     @staticmethod
-    def arcsine_weight(t: torch.Tensor):
-        return 0.5 * torch.pi * torch.sin(torch.pi * t)
+    def arcsine_weight(t: torch.Tensor, eps: float = 1e-3):
+        t_adj = t * (1 - 2*eps) + eps  # maps t ∈ [0,1] → [eps, 1-eps]
+        return 0.5 * torch.pi * torch.sin(torch.pi * t_adj)
 
     @staticmethod
     def cosine_schedule(t: torch.Tensor):
         return 1 - torch.cos(torch.pi * t / 2)
 
     @staticmethod
-    def cosine_weight(t: torch.Tensor):
-        return 0.5 * torch.pi * torch.sin(torch.pi * t / 2)
+    def cosine_weight(t: torch.Tensor, eps: float = 1e-3):
+        t_adj = t * (1 - 2*eps) + eps  # maps t ∈ [0,1] → [eps, 1-eps]
+        return 0.5 * torch.pi * torch.sin(torch.pi * t_adj / 2)
 
 
