@@ -204,7 +204,6 @@ class Experiment(DistributedTrainer):
             mask= 'bernoulli',
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
-        prediction = prediction * self.land_sea_mask[..., None]
         prediction = self.tokens_to_field(prediction)
         return prediction
 
@@ -216,7 +215,6 @@ class Experiment(DistributedTrainer):
             mask= self.world.mask,
         )
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
-        prediction = prediction * self.land_sea_mask[..., None]
         loss = self.loss_fn(prediction, tokens, visible, weight)
         metrics = self.compute_metrics(ens = prediction.detach(), obs = tokens, vis = visible)
         metrics['loss'] = loss.item()
@@ -259,6 +257,7 @@ class Experiment(DistributedTrainer):
         #meta data
         meta_data = self.val_dataset.dataset
         time, lat, lon = meta_data.time, meta_data.lat, meta_data.lon
+        lsm = self.get_xr_lsm(meta_data)
         ens = np.arange(pred.shape[-1])
         tau = self.world.tau
         T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
@@ -292,7 +291,16 @@ class Experiment(DistributedTrainer):
             )
             arrays.append(data_array)
         ds = xr.merge(arrays)
+        ds = ds * lsm
         return ds
+
+    def get_xr_lsm(self, data: xr.Dataset):
+        if "sftlf" in data:
+            lsm = data["sftlf"]
+        else:
+            lsm = data[self.data_cfg.variables[0]].isel(time=0).isnull()
+            lsm = lsm.drop_vars(["time", "month"], errors="ignore")
+        return lsm
 
     def get_field_metrics(self, eval_data: xr.Dataset):
         for var in self.data_cfg.variables:

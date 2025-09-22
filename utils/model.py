@@ -40,19 +40,20 @@ class MaskedPredictor(torch.nn.Module):
     
     @staticmethod
     def base_init(m):
+        # linear
         if isinstance(m, torch.nn.Linear):
             torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
-
+        # embedding
         if isinstance(m, torch.nn.Embedding):
             torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
-
+        # einmix
         if isinstance(m, EinMix):
             torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
-
+        # layer norm
         if isinstance(m, torch.nn.LayerNorm):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
