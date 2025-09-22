@@ -218,7 +218,7 @@ class Experiment(DistributedTrainer):
         prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
         prediction = prediction * self.land_sea_mask[..., None]
         loss = self.loss_fn(prediction, tokens, visible, weight)
-        metrics = self.compute_metrics(ens = prediction, obs = tokens, vis = visible)
+        metrics = self.compute_metrics(ens = prediction.detach(), obs = tokens, vis = visible)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
         return loss
@@ -273,8 +273,8 @@ class Experiment(DistributedTrainer):
             
             std = self.val_dataset._stds.sel(variable = var).values
             mean = self.val_dataset._means.sel(variable = var).values
-            p = pred[:, v, history:].float().cpu().numpy() * std + mean
-            o = obs[:, v, history:].float().cpu().numpy() * std + mean
+            p = pred[:, v, history:].float().detach().cpu().numpy() * std + mean
+            o = obs[:, v, history:].float().detach().cpu().numpy() * std + mean
 
             #create xarray
             data_array = xr.Dataset(
@@ -302,17 +302,17 @@ class Experiment(DistributedTrainer):
             pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            self.current_metrics.log_metric(f"{var}_pcc", pcc.values)
-            self.current_metrics.log_metric(f"{var}_ssr", ssr.values)
-            self.current_metrics.log_metric(f"{var}_rmse", rmse.values)
+            self.current_metrics.log_metric(f"{var}_pcc", pcc.item())
+            self.current_metrics.log_metric(f"{var}_ssr", ssr.item())
+            self.current_metrics.log_metric(f"{var}_rmse", rmse.item())
 
     def get_nino_metrics(self, eval_data: xr.Dataset):
         nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
         nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
         nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
         for lag in [3, 9, 15, 21]:
-            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).values)
-            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).values)
+            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).item())
+            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).item())
         
     def log_metrics(self, metrics: dict, task: str = None):
         for key, val in metrics.items():
