@@ -6,6 +6,7 @@ class MaskedPredictor(torch.nn.Module):
     def __init__(self, model, world):
         super().__init__()
         # per-variable linear projections
+        self.norm_in = ConditionalLayerNorm(model.dim)
         self.proj_in = EinMix(
             pattern = f'{world.flatland_pattern} -> b {world.flat_token_pattern} d',
             weight_shape = f'v {world.patch_pattern} d', 
@@ -68,7 +69,7 @@ class MaskedPredictor(torch.nn.Module):
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
         src = self.proj_in(tokens)
         x = torch.where(visible, src, self.masks.weight)
-        x = x + self.positions.weight
+        x = self.norm_in(x) + self.positions.weight
         z = self.latents.weight.expand(tokens.size(0), -1, -1)
         for block in self.network:
             x, z = block(x, z)
