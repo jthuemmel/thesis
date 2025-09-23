@@ -15,6 +15,9 @@ class Masking:
         elif timestep == "framewise":
             t = self.framewise_timestep()
             lhs = 'b t'
+        elif timestep == 'zero_frames':
+            t = self.zero_frames()
+            lhs = 'b t'
         elif timestep == 'history':
             t = self.history_timestep()
             lhs = 't'
@@ -44,13 +47,14 @@ class Masking:
         if mask == "bernoulli":
             visible = torch.bernoulli(rate, generator=self.generator).bool()
         elif mask == "dirichlet_topk":
-            permute = self.dirichlet_permute()
+            D = self.dirichlet_joint()
+            G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
             ks = self.k_from_rates(rate)
-            visible = self.binary_topk(permute, ks=ks)
+            visible = self.binary_topk(G + D, ks=ks)
         elif mask == "uniform_topk":
-            permute = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
+            G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
             ks = self.k_from_rates(rate)
-            visible = self.binary_topk(permute, ks=ks)
+            visible = self.binary_topk(G, ks=ks)
         else:
             raise ValueError(f"Unknown mask: {mask}")
         return visible
@@ -79,6 +83,15 @@ class Masking:
     def gumbel_noise(self, shape: tuple):
         return -torch.log(-torch.log(self.uniform(shape)))
 
+    # DIRICHLET
+    def dirichlet_joint(self):
+        D = einops.reduce(
+            [self.dirichlet_marginal(ax).log() for ax in self.world.alphas.keys()],
+            "factors ... -> ...",
+            "sum",
+        )
+        return D
+    
     def dirichlet_marginal(self, ax: str):
         concentration = torch.full(
             (self.optim_cfg.batch_size, self.world.token_sizes[ax]),
@@ -94,9 +107,6 @@ class Masking:
         )
 
     # TIMESTEPS
-    def zero_tail(self, t, tail: float = 0.):
-        return torch.where(t > tail, (t - tail) / (1 - tail), torch.zeros_like(t))
-    
     def stratification(self, t):
         return (t + torch.linspace(0, 1, self.optim_cfg.batch_size, device=t.device).view(-1, 1)) % 1
 
@@ -104,7 +114,14 @@ class Masking:
         T = self.world.token_sizes["t"]
         t = self.uniform((1, T))
         t = self.stratification(t)
-        t = self.zero_tail(t, tail = 1 / T)
+        return t
+
+    def zero_frames(self):
+        T = self.world.token_sizes["t"]
+        t = self.uniform((1, T))
+        t = self.stratification(t)
+        tail = 1 / T
+        t = torch.where(t > tail, (t - tail) / (1 - tail), torch.zeros_like(t))
         return t
 
     def single_timestep(self):
@@ -128,16 +145,6 @@ class Masking:
         pos = einops.rearrange(pos, "n -> 1 n 1")
         binary = torch.zeros_like(index, dtype=torch.bool, device=self.device).scatter(1, index, ks > pos)
         return binary
-
-    # DIRICHLET
-    def dirichlet_permute(self):
-        G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
-        D = einops.reduce(
-            [self.dirichlet_marginal(ax).log() for ax in self.world.alphas.keys()],
-            "factors ... -> ...",
-            "sum",
-        )
-        return G + D
 
     # SCHEDULES
     @staticmethod
