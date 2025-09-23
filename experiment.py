@@ -64,6 +64,7 @@ class Experiment(DistributedTrainer):
     def godas_data(self):
         if not hasattr(self, "_godas_data"):
             godas_config = self.data_cfg
+            godas_config = replace(godas_config, stats = default(self.data_cfg.stats, cfg.GODAS_STATS))
             godas_config = replace(godas_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
             self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
@@ -71,6 +72,7 @@ class Experiment(DistributedTrainer):
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
             picontrol_config = self.data_cfg
+            picontrol_config = replace(picontrol_config, stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
             picontrol_config = replace(picontrol_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
