@@ -51,7 +51,11 @@ class Experiment(DistributedTrainer):
     def world(self):
         return self._cfg.world
     
-        # DATA
+    @property
+    def masking_cfg(self):
+        return self._cfg.masking        
+    
+    # DATA
     
     def lens_data(self):
         if not hasattr(self, "_lens_data"):
@@ -164,8 +168,10 @@ class Experiment(DistributedTrainer):
             )
     
     def create_model(self):
-        self.mask_generator = Masking(world_cfg= self.world, optim_cfg= self.optim_cfg, device= self.device, generator= self.generator)
-        model = MaskedPredictor(self.model_cfg, self.world, generator= self.generator)
+        model = MaskedPredictor(
+            self.model_cfg, self.world, 
+            generator= self.generator
+            )
         count = count_parameters(model)
         print(f'Created model with {count:,} parameters')
         self.misc_metrics.log_python_object("num_params", count)
@@ -178,6 +184,12 @@ class Experiment(DistributedTrainer):
             loss = (score * mask_weight)[mask].mean()
             return loss 
         return loss_fn        
+
+    def setup_misc(self):
+        self.mask_generator = Masking(
+            masking_cfg = self.masking_cfg, world_cfg= self.world, optim_cfg= self.optim_cfg, 
+            device= self.device, generator= self.generator
+            )
 
     def per_variable_weights(self):
         weights = {
@@ -217,9 +229,9 @@ class Experiment(DistributedTrainer):
     def forward_step(self, batch_idx, batch):
         tokens = self.field_to_tokens(batch.to(self.device))
         visible, weight = self.mask_generator(
-            timestep= self.world.masking_kwargs['timestep'],
-            schedule= self.world.masking_kwargs['schedule'],
-            mask= self.world.masking_kwargs['mask'],
+            timestep= self.masking_cfg.timestep,
+            schedule= self.masking_cfg.schedule,
+            mask= self.masking_cfg.mask,
         )
         if self.mode == 'train' or not self.cfg.use_ema:
             prediction = self.model(tokens, visible)  

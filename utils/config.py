@@ -73,7 +73,6 @@ GODAS_STATS = {'temp_ocn_0a': {'mean': -2.2515301306437936e-16, 'std': 0.5806380
                 'tauxa': {'mean': 7.085307169190875e-06, 'std': 0.02265642542041636}, 
                 'tauya': {'mean': -7.363466657744754e-06, 'std': 0.015571367609252504}}
 
-
 @dataclass
 class NetworkConfig:
     dim: int
@@ -116,14 +115,22 @@ class DatasetConfig:
     max_dirs: int = 100
 
 @dataclass
+class MaskingConfig:
+    alphas: dict = field(default_factory=dict) # ax: alpha_per_ax
+    stratification: bool = True
+    tail_frac: float = 0.0
+    rate_min: float = 0.0
+    rate_max: float = 1.0
+    timestep: str = "framewise" # uniform | framewise | history
+    schedule: str = "cosine" # arcsine | cosine | uniform (with bounds)
+    mask: str = "bernoulli" # bernoulli | topk
+    eps: float = 1e-3
+
+@dataclass
 class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
     tau: int
-    masking_kwargs: dict
-    timestep: str
-    schedule: str
-    mask: str
     num_tails: Optional[int] = 0
     num_ens: Optional[int] = 0
 
@@ -204,6 +211,7 @@ class MTMConfig:
     model: NetworkConfig
     optim: OptimConfig
     world: WorldConfig
+    masking: MaskingConfig
 
     @classmethod
     def from_omegaconf(cls, cfg: dict | OmegaConf):
@@ -218,5 +226,6 @@ class MTMConfig:
             data=DatasetConfig(**cfg.data),
             model =  NetworkConfig(**cfg.model),
             optim =OptimConfig(**cfg.optim),
-            world=WorldConfig(**cfg.world) 
+            world=WorldConfig(**cfg.world),
+            masking=MaskingConfig(**cfg.masking)
         )

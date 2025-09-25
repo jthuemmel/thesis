@@ -2,7 +2,8 @@ import torch
 import einops
 
 class Masking:
-    def __init__(self, world_cfg, optim_cfg, device, generator=None):
+    def __init__(self, masking_cfg, world_cfg, optim_cfg, device, generator=None):
+        self.masking = masking_cfg
         self.world = world_cfg
         self.optim_cfg = optim_cfg
         self.device = device
@@ -15,9 +16,6 @@ class Masking:
         elif timestep == "framewise":
             t = self.framewise_timestep()
             lhs = 'b t'
-        elif timestep == 'zero_frames':
-            t = self.zero_frames()
-            lhs = 'b t'
         elif timestep == 'history':
             t = self.history_timestep()
             lhs = 't'
@@ -28,17 +26,12 @@ class Masking:
     def get_schedule(self, t, schedule: str):
         if schedule == "cosine":
             rate = self.cosine_schedule(t)
-            weight = self.cosine_weight(t)
+            weight = self.cosine_weight(t, self.masking.eps)
         elif schedule == "arcsine":
             rate = self.arcsine_schedule(t)
-            weight = self.arcsine_weight(t)
+            weight = self.arcsine_weight(t, self.masking.eps)
         elif schedule == "uniform":
-            rate = t
-            weight = 1.
-        elif schedule == 'minmax':
-            min_val = self.world.masking_kwargs.get('minmax_min', 0.)
-            max_val = self.world.masking_kwargs.get('minmax_max', 1.)
-            rate = (max_val - min_val) * t + min_val
+            rate = (self.masking.rate_max - self.masking.rate_min) * t + self.masking.rate_min
             weight = 1.
         else:
             raise ValueError(f"Unknown schedule: {schedule}")
@@ -50,7 +43,7 @@ class Masking:
         elif mask == "topk":
             G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
             ks = self.k_from_rates(rate)
-            if any(k.startswith("alpha_") for k in self.world.masking_kwargs):
+            if self.masking.alphas:
                 G = G + self.dirichlet_joint()
             visible = self.binary_topk(G, ks=ks)
         else:
@@ -83,9 +76,8 @@ class Masking:
 
     # DIRICHLET
     def dirichlet_joint(self):
-        axes = [s.split('_')[-1] for s in self.world.masking_kwargs if 'alpha' in s]
         D = einops.reduce(
-            [self.dirichlet_marginal(ax).log() for ax in axes],
+            [self.dirichlet_marginal(ax).log() for ax in self.masking.alphas.keys()],
             "factors ... -> ...",
             "sum",
         )
@@ -94,7 +86,7 @@ class Masking:
     def dirichlet_marginal(self, ax: str):
         concentration = torch.full(
             (self.optim_cfg.batch_size, self.world.token_sizes[ax]),
-            self.world.masking_kwargs[f'alpha_{ax}'],
+            self.masking.alphas[ax],
             device=self.device,
         )
         probs = torch._sample_dirichlet(concentration, generator=self.generator)
@@ -107,14 +99,16 @@ class Masking:
 
     # TIMESTEPS
     def stratification(self, t):
-        return (t + torch.linspace(0, 1, self.optim_cfg.batch_size, device=t.device).view(-1, 1)) % 1
+        if self.masking.stratification:
+            t = (t + torch.linspace(0, 1, self.optim_cfg.batch_size, device=t.device).view(-1, 1)) % 1
+        return t
 
     def framewise_timestep(self):
         T = self.world.token_sizes["t"]
         t = self.uniform((1, T))
         t = self.stratification(t)
-        tail = self.world.masking_kwargs.get('tail_frac', 0.)
-        t = torch.where(t > tail, (t - tail) / (1 - tail), torch.zeros_like(t))
+        f = self.masking.tail_frac
+        t = torch.where(t > f, (t - f) / (1 - f), torch.zeros_like(t))
         return t
 
     def single_timestep(self):
