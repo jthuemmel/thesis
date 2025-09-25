@@ -120,7 +120,7 @@ class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
     tau: int
-    alphas: dict
+    masking_kwargs: dict
     timestep: str
     schedule: str
     mask: str

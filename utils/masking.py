@@ -36,8 +36,9 @@ class Masking:
             rate = t
             weight = 1.
         elif schedule == 'minmax':
-            min, max = 0.05, 0.25
-            rate = (max - min) * t + min
+            min_val = self.world.masking_kwargs.get('minmax_min', 0.)
+            max_val = self.world.masking_kwargs.get('minmax_max', 1.)
+            rate = (max_val - min_val) * t + min_val
             weight = 1.
         else:
             raise ValueError(f"Unknown schedule: {schedule}")
@@ -46,14 +47,11 @@ class Masking:
     def get_mask(self, rate, mask: str):
         if mask == "bernoulli":
             visible = torch.bernoulli(rate, generator=self.generator).bool()
-        elif mask == "dirichlet_topk":
-            D = self.dirichlet_joint()
+        elif mask == "topk":
             G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
             ks = self.k_from_rates(rate)
-            visible = self.binary_topk(G + D, ks=ks)
-        elif mask == "uniform_topk":
-            G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
-            ks = self.k_from_rates(rate)
+            if any(k.startswith("alpha_") for k in self.world.masking_kwargs):
+                G = G + self.dirichlet_joint()
             visible = self.binary_topk(G, ks=ks)
         else:
             raise ValueError(f"Unknown mask: {mask}")
@@ -85,8 +83,9 @@ class Masking:
 
     # DIRICHLET
     def dirichlet_joint(self):
+        axes = [s.split('_')[-1] for s in self.world.masking_kwargs if 'alpha' in s]
         D = einops.reduce(
-            [self.dirichlet_marginal(ax).log() for ax in self.world.alphas.keys()],
+            [self.dirichlet_marginal(ax).log() for ax in axes],
             "factors ... -> ...",
             "sum",
         )
@@ -95,7 +94,7 @@ class Masking:
     def dirichlet_marginal(self, ax: str):
         concentration = torch.full(
             (self.optim_cfg.batch_size, self.world.token_sizes[ax]),
-            self.world.alphas[ax],
+            self.world.masking_kwargs[f'alpha_{ax}'],
             device=self.device,
         )
         probs = torch._sample_dirichlet(concentration, generator=self.generator)
@@ -114,13 +113,7 @@ class Masking:
         T = self.world.token_sizes["t"]
         t = self.uniform((1, T))
         t = self.stratification(t)
-        return t
-
-    def zero_frames(self):
-        T = self.world.token_sizes["t"]
-        t = self.uniform((1, T))
-        t = self.stratification(t)
-        tail = 1 / T
+        tail = self.world.masking_kwargs.get('tail_frac', 0.)
         t = torch.where(t > tail, (t - tail) / (1 - tail), torch.zeros_like(t))
         return t
 
