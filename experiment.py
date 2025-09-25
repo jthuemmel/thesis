@@ -164,7 +164,11 @@ class Experiment(DistributedTrainer):
             )
     
     def create_model(self):
-        model = MaskedPredictor(self.model_cfg, self.world)
+        self.mask_generator = Masking(world_cfg= self.world, optim_cfg= self.optim_cfg, device= self.device, generator= self.generator)
+        model = MaskedPredictor(self.model_cfg, self.world, generator= self.generator)
+        count = count_parameters(model)
+        print(f'Created model with {count:,} parameters')
+        self.misc_metrics.log_python_object("num_params", count)
         return model
     
     def create_loss(self):
@@ -173,10 +177,7 @@ class Experiment(DistributedTrainer):
             score = f_kernel_crps(obs, ens, fair = self.world.num_ens > 1) * self.per_variable_weights()
             loss = (score * mask_weight)[mask].mean()
             return loss 
-        return loss_fn
-    
-    def setup_misc(self):
-        self.mask_generator = Masking(world_cfg= self.world, optim_cfg= self.optim_cfg, device= self.device, generator= self.generator)
+        return loss_fn        
 
     def per_variable_weights(self):
         weights = {
@@ -216,9 +217,9 @@ class Experiment(DistributedTrainer):
     def forward_step(self, batch_idx, batch):
         tokens = self.field_to_tokens(batch.to(self.device))
         visible, weight = self.mask_generator(
-            timestep= self.world.timestep,
-            schedule= self.world.schedule,
-            mask= self.world.mask,
+            timestep= self.world.masking_kwargs['timestep'],
+            schedule= self.world.masking_kwargs['schedule'],
+            mask= self.world.masking_kwargs['mask'],
         )
         if self.mode == 'train' or not self.cfg.use_ema:
             prediction = self.model(tokens, visible)  
