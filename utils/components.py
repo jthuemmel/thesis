@@ -8,6 +8,15 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from typing import Optional, Tuple, List
 
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 def get_weight_std(weight: torch.Tensor):
     return 1 / weight.size(-1)**0.5
 
@@ -25,7 +34,7 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
         # register buffer and optional projection
         self.register_buffer("freqs", freqs)  # shape (n_coords, dim_per_coord // 2)
         self.embedding_dim = len(wavelengths) * (d_half * 2) #make sure the embedding dim is correct even if d_half rounds
-        self.proj = torch.nn.Identity() if model_dim is None else torch.nn.Linear(self.embedding_dim, model_dim)
+        self.proj = torch.nn.Identity() if exists(model_dim) else torch.nn.Linear(self.embedding_dim, model_dim)
 
     def forward(self, coordinates: torch.Tensor):
         with torch.amp.autocast(enabled = False, device_type = coordinates.device.type): # overflows fp16 if not careful
@@ -95,14 +104,14 @@ class Attention(torch.nn.Module):
 class ConditionalLayerNorm(torch.nn.Module):
     def __init__(self, dim: int, dim_ctx: Optional[int] = None):
         super().__init__()
-        self.norm = torch.nn.LayerNorm(dim, elementwise_affine= dim_ctx is None)
-        if dim_ctx is None:
-            self.linear = None
-        else:
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine= not exists(dim_ctx))
+        if exists(dim_ctx):
             self.linear = torch.nn.Linear(dim_ctx, dim * 2, bias=True)
+        else:
+            self.linear = None
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.linear is None: 
+        if not exists(self.linear): 
             return self.norm(x)
         scale, shift = self.linear(ctx).chunk(2, dim = -1)
         x = (1. + scale) * self.norm(x) + shift
@@ -123,7 +132,7 @@ class InterfaceBlock(torch.nn.Module):
                 z: torch.Tensor, 
                 query: Optional[torch.Tensor] = None, 
                 ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        q = x if query is None else query
+        q = query if exists(query) else x
         z = checkpoint(self.read, z, x, ctx, use_reentrant=False) if self.use_checkpoint else self.read(z, x, ctx)
         for block in self.compute:
             z = block(z, ctx = ctx)

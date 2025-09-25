@@ -170,7 +170,7 @@ class Experiment(DistributedTrainer):
     def create_loss(self):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
             mask = torch.logical_and(self.land_sea_mask, ~visible)
-            score = f_kernel_crps(obs, ens) * self.per_variable_weights()
+            score = f_kernel_crps(obs, ens, fair = self.world.num_ens > 1) * self.per_variable_weights()
             loss = (score * mask_weight)[mask].mean()
             return loss 
         return loss_fn
@@ -205,7 +205,10 @@ class Experiment(DistributedTrainer):
             schedule= 'uniform',
             mask= 'bernoulli',
         )
-        prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
+        if self.mode == 'train' or not self.cfg.use_ema:
+            prediction = self.model(tokens, visible)  
+        else:
+            prediction = self.ema_model(tokens, visible)  
         prediction = prediction * self.land_sea_mask[..., None]
         prediction = self.tokens_to_field(prediction)
         return prediction
@@ -217,7 +220,10 @@ class Experiment(DistributedTrainer):
             schedule= self.world.schedule,
             mask= self.world.mask,
         )
-        prediction = self.model(tokens, visible) if self.mode == 'train' or not self.cfg.use_ema else self.ema_model(tokens, visible)
+        if self.mode == 'train' or not self.cfg.use_ema:
+            prediction = self.model(tokens, visible)  
+        else:
+            prediction = self.ema_model(tokens, visible)
         prediction = prediction * self.land_sea_mask[..., None]
         loss = self.loss_fn(prediction, tokens, visible, weight)
         metrics = self.compute_metrics(ens = prediction.detach(), obs = tokens, vis = visible)
