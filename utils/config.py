@@ -99,6 +99,8 @@ class OptimConfig:
     total_steps: Optional[int] = 100000
     warmup_steps: Optional[int] = 1000
     weight_decay: Optional[float] = 0.01
+    div_factor: Optional[float] = 25
+    final_div_factor: Optional[float] = 1e4
     eta_min: Optional[float] = 1e-5
 
 @dataclass
