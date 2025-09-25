@@ -1,122 +1,140 @@
+import torch
+
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from torch.nn.functional import scaled_dot_product_attention, silu
+from torch.utils.checkpoint import checkpoint
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from torch import Tensor, zeros_like
-from torch.nn import Linear, Module, ModuleList, init, LayerNorm
-from torch.nn.functional import normalize, scaled_dot_product_attention, silu
+from typing import Optional, Tuple, List
 
-from typing import Optional, Tuple
+def exists(val):
+    return val is not None
 
+def default(val, d):
+    return val if exists(val) else d
 
-def get_weight_std(weight: Tensor):
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def get_weight_std(weight: torch.Tensor):
     return 1 / weight.size(-1)**0.5
 
-class Interface(Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None):
-        """
-        dim: block dimension
-        num_blocks: number of latent transformer blocks
-        dim_heads: dimension of heads in attention
-        """
+class ContinuousPositionalEmbedding(torch.nn.Module):
+    def __init__(self, dim_per_coord: int, wavelengths: List[Tuple[int, int]] = [(1., 256)], model_dim: Optional[int] = None):
         super().__init__()
-        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-        self.compute = ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
-        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
+        d_half = dim_per_coord // 2
 
-    def forward(self, x: Tensor, z: Tensor, ctx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """
-        x: tensor of shape (B, *, N, D)
-        z: tensor of shape (B, *, M, D)
-        ctx: (optional) conditioning tensor of shape (B, D)
-        returns tuple of (x, z) 
-        """
-        z = self.read(q = z, kv = x, ctx = ctx)
-        for block in self.compute:
-            z = block(z, ctx = ctx)
-        x = self.write(q = x, kv = z, ctx = ctx)
-        return x, z
+        # Precompute per-coordinate frequency factors
+        freqs = torch.stack([
+            torch.exp((2 * torch.pi / lmin).log() - torch.linspace(0, 1, d_half) * (lmax.log() - lmin.log()))
+            for lmin, lmax in torch.as_tensor(wavelengths)
+            ])
 
-class TransformerBlock(Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, **kwargs):
+        # register buffer and optional projection
+        self.register_buffer("freqs", freqs)  # shape (n_coords, dim_per_coord // 2)
+        self.embedding_dim = len(wavelengths) * (d_half * 2) #make sure the embedding dim is correct even if d_half rounds
+        self.proj = torch.nn.Identity() if exists(model_dim) else torch.nn.Linear(self.embedding_dim, model_dim)
+
+    def forward(self, coordinates: torch.Tensor):
+        with torch.amp.autocast(enabled = False, device_type = coordinates.device.type): # overflows fp16 if not careful
+            angles = torch.einsum("...i, i d -> ...i d", coordinates, self.freqs)
+            emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
+        emb = rearrange(emb, "... n d two -> ... (n d two)")
+        return self.proj(emb)
+
+class SwiGLU(torch.nn.Module):
+    def forward(self, x: torch.Tensor):
+        x1, x2 = x.chunk(2, dim=-1) 
+        return silu(x1) * x2
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.att = Attention(dim, dim_heads)
         self.ffn = GatedFFN(dim)
+        self.has_skip = has_skip
 
-    def forward(self, q: Tensor, kv: Optional[Tensor] = None, ctx: Optional[Tensor] = None, **attn_kwargs):
-        """
-        q: query tensor of shape (B, N, D)
-        kv: (optional) key-value tensor of shape (B, M, D)
-        ctx: (optional) conditioning tensor of shape (*, D) where * must broadcast with q
-        returns: tensor of shape (B, N, D)
-        """
-        skip = q
+    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
+        skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
         kv = kv if kv is not None else q
         q = skip + self.att(q, kv, kv, **attn_kwargs)
         q = q + self.ffn(self.ffn_norm(q, ctx))
         return q
 
-class GatedFFN(Module):
+class GatedFFN(torch.nn.Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
         hidden_dim = dim * expansion_factor
-        self.to_hidden = Linear(dim, 2 * hidden_dim, bias = bias)
-        self.to_out = Linear(hidden_dim, dim, bias = bias)
+        self.to_hidden = torch.nn.Linear(dim, 2 * hidden_dim, bias = bias)
+        self.swiglu = SwiGLU()
+        self.to_out = torch.nn.Linear(hidden_dim, dim, bias = bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.to_hidden(x)
-        x, g = x.chunk(2, dim = -1)
-        x = x * silu(g)
+        x = self.swiglu(x)
         x = self.to_out(x)
         return x
     
-class Attention(Module):
-    def __init__(self, dim: int, dim_heads: int = 64, bias: bool = True):
+class Attention(torch.nn.Module):
+    def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False):
         super().__init__()
         self.split_heads = Rearrange('... n (h d) -> (...) h n d', d = dim_heads)
-        self.to_q = Linear(dim, dim, bias = bias)
-        self.to_k = Linear(dim, dim, bias = bias)
-        self.to_v = Linear(dim, dim, bias = bias)
-        self.to_out = Linear(dim, dim, bias = bias)
+        self.to_q = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_k = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_v = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, **attn_kwargs) -> Tensor:
+    @property
+    def backend(self):
+         return SDPBackend.FLASH_ATTENTION if torch.cuda.get_device_capability()[0] >= 8 else SDPBackend.EFFICIENT_ATTENTION
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
         B = q.size(0) #remember the original batch size
-        q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
-        q, k, v = map(self.split_heads, (q, k, v)) # split heads and merge any leading dimensions into the batch
-        attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
+        q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
+        with sdpa_kernel(self.backend): attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = rearrange(attn, '(b g) h n d ->  b g n (h d)', b = B).squeeze(1) # if there was no leading dimension, we simply squeeze the empty dimension
         out = self.to_out(out)
         return out
 
-class ConditionalLayerNorm(Module):
+class ConditionalLayerNorm(torch.nn.Module):
     def __init__(self, dim: int, dim_ctx: Optional[int] = None):
         super().__init__()
-        self.norm = LayerNorm(dim, elementwise_affine= dim_ctx is None)
-        if dim_ctx is None:
-            self.linear = None
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine= not exists(dim_ctx))
+        if exists(dim_ctx):
+            self.linear = torch.nn.Linear(dim_ctx, dim * 2, bias=True)
         else:
-            self.linear = Linear(dim_ctx, dim * 2, bias=True)
+            self.linear = None
 
-    def forward(self, x: Tensor, ctx: Optional[Tensor] = None) -> Tensor:
-        if self.linear is None: 
+    def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if not exists(self.linear): 
             return self.norm(x)
         scale, shift = self.linear(ctx).chunk(2, dim = -1)
         x = (1. + scale) * self.norm(x) + shift
         return x
-    
-class ConditioningNetwork(Module):
-    '''Self-conditioning network from Jabri et al. 2023'''
-    def __init__(self, dim: int):
+
+class InterfaceBlock(torch.nn.Module):
+    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, 
+                 write_has_skip: bool = True, 
+                 use_checkpoint: bool = False):
         super().__init__()
-        self.ffn = GatedFFN(dim)
-        self.norm = LayerNorm(dim, elementwise_affine=True)
+        self.use_checkpoint = use_checkpoint
+        self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
+        self.compute = torch.nn.ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
+        self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
 
-        # Initialization
-        init.zeros_(self.norm.weight)
-        init.zeros_(self.norm.bias)
-
-    def forward(self, initial: Tensor, previous: Tensor):
-        previous = zeros_like(initial) if previous is None else previous
-        return self.norm(previous + self.ffn(previous)) + initial
+    def forward(self, 
+                x: torch.Tensor,
+                z: torch.Tensor, 
+                query: Optional[torch.Tensor] = None, 
+                ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        q = query if exists(query) else x
+        z = checkpoint(self.read, z, x, ctx, use_reentrant=False) if self.use_checkpoint else self.read(z, x, ctx)
+        for block in self.compute:
+            z = block(z, ctx = ctx)
+        query = checkpoint(self.write, q, z, ctx, use_reentrant=False) if self.use_checkpoint else self.write(q, z, ctx)
+        return query, z

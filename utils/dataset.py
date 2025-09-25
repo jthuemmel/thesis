@@ -45,7 +45,6 @@ class NinoData(Dataset):
         return ds
     
     def _preprocess(self, sliced_data: xr.Dataset) -> dict:
-
         # Compute data dependent attributes
         self.compute_means(sliced_data)
         self.compute_stds(sliced_data)
@@ -65,7 +64,7 @@ class NinoData(Dataset):
         for key in self.config.variables:
             data[key] = (data[key] - self._means.sel(variable=key)) / self._stds.sel(variable=key)
         return data
-
+    
     def compute_means(self, data: xr.Dataset) -> None:
         if self.config.stats is None:
             values = [data[key].mean().values for key in self.variables]

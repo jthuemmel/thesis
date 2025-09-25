@@ -1,6 +1,7 @@
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Sequence
+from typing import List, Optional
+
 from omegaconf import OmegaConf
 from math import prod
 
@@ -13,6 +14,12 @@ OmegaConf.register_new_resolver(
 OmegaConf.register_new_resolver(
     "len",
     lambda x: len(x),
+    replace=True,
+)
+
+OmegaConf.register_new_resolver(
+    "div",
+    lambda a,b: a/b,
     replace=True,
 )
 
@@ -44,13 +51,33 @@ LENS_STATS = {
         'tauya': {'mean': 1.7936438524139273e-20, 'std': 0.1323912433010137},
         }
 
+PICONTROL_STATS = {
+                'temp_ocn_0a': {'mean': 5.32304118e-18, 'std': 0.63290073}, 
+                'temp_ocn_1a': {'mean': 1.02516498e-17, 'std': 0.63289313}, 
+                'temp_ocn_3a': {'mean': 7.99551042e-18, 'std': 0.68246464}, 
+                'temp_ocn_5a': {'mean': 1.66074617e-18, 'std': 0.80192137}, 
+                'temp_ocn_8a': {'mean': -6.57904015e-18, 'std': 0.87488439}, 
+                'temp_ocn_11a': {'mean': -4.43419892e-18, 'std': 0.90941989}, 
+                'temp_ocn_14a': {'mean': -5.75602839e-18, 'std': 0.86523064}, 
+                'tauxa': {'mean': -4.03492854e-19, 'std': 0.19840702}, 
+                'tauya': {'mean': 1.71288663e-19, 'std': 0.13144593}
+            }
+
+GODAS_STATS = {'temp_ocn_0a': {'mean': -2.2515301306437936e-16, 'std': 0.5806380769447685}, 
+                'temp_ocn_1a': {'mean': -6.582094131922381e-17, 'std': 0.6208909573494896}, 
+                'temp_ocn_3a': {'mean': -4.743647150247509e-17, 'std': 0.8264447254204249}, 
+                'temp_ocn_5a': {'mean': -2.235642317221912e-17, 'std': 1.0546172785963273}, 
+                'temp_ocn_8a': {'mean': -8.477297408057756e-17, 'std': 1.2049644188990674}, 
+                'temp_ocn_11a': {'mean': 3.353351510613191e-16, 'std': 1.1811549404412836}, 
+                'temp_ocn_14a': {'mean': -4.672355811870539e-16, 'std': 1.062448117706782}, 
+                'tauxa': {'mean': 7.085307169190875e-06, 'std': 0.02265642542041636}, 
+                'tauya': {'mean': -7.363466657744754e-06, 'std': 0.015571367609252504}}
+
 @dataclass
 class NetworkConfig:
     dim: int
     num_layers: Optional[int] = None
-    num_tokens: Optional[int] = None
     num_latents: Optional[int] = None
-    num_features: Optional[int] = None
     num_compute_blocks: Optional[int] = None
     num_cls: Optional[int] = None
     dim_in: Optional[int] = None
@@ -58,9 +85,9 @@ class NetworkConfig:
     dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
-    drop_prob: Optional[float] = 0.
     expansion_factor: Optional[int] = 2
-    architecture: str = "vit"
+    wavelengths: Optional[List] = None
+    use_checkpoint: Optional[bool] = True
 
 @dataclass
 class OptimConfig:
@@ -69,6 +96,8 @@ class OptimConfig:
     lr: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.99
+    total_steps: Optional[int] = 100000
+    warmup_steps: Optional[int] = 1000
     weight_decay: Optional[float] = 0.01
     eta_min: Optional[float] = 1e-5
 
@@ -76,32 +105,71 @@ class OptimConfig:
 class DatasetConfig:
     sequence_length: int = 1
     variables: List[str] = field(default_factory=lambda: VARS)
-    weights: Optional[list] = None
+    eval_variables: List[str] = field(default_factory=lambda: VARS)
     time_slice: Optional[dict] = None
     lat_slice: Optional[dict] = None
     lon_slice: Optional[dict] = None
     stats: Optional[dict] = None
-    frcst_tasks: Optional[dict] = None
-    grid_size: dict = field(default_factory=lambda: {"lat": 64, "lon": 120})
     return_type: str = "tensor"
     eval_data: str = "picontrol"
     max_dirs: int = 100
 
 @dataclass
-class WorldConfig:
-    mask_rates_src: dict = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    mask_rates_tgt: Optional[dict] = field(default_factory=lambda: {"mean": 0.0, "std": 1.0, "a": 0.0, "b": 1.0})
-    tau: Optional[int] = None
-    num_ens: Optional[int] = None
-    alpha: float = 1.
-    num_tokens: int = 768
-    patch_size: dict = field(default_factory=lambda: {"tt": 2, "hh": 4, "ww": 4})
+class MaskingConfig:
+    alphas: dict = field(default_factory=dict) # ax: alpha_per_ax
+    stratification: bool = True
+    tail_frac: float = 0.0
+    rate_min: float = 0.0
+    rate_max: float = 1.0
+    timestep: str = "framewise" # uniform | framewise | history
+    schedule: str = "cosine" # arcsine | cosine | uniform (with bounds)
+    mask: str = "bernoulli" # bernoulli | topk
+    eps: float = 1e-3
 
 @dataclass
-class ModelConfig:
-    decoder: Optional[NetworkConfig] = None
-    modal: Optional[NetworkConfig] = None
-    encoder: Optional[NetworkConfig] = None
+class WorldConfig:
+    field_sizes: dict
+    patch_sizes: dict
+    tau: int
+    num_tails: Optional[int] = 0
+    num_ens: Optional[int] = 0
+
+    # derived fields
+    field_layout: tuple = field(init=False)
+    patch_layout: tuple = field(init=False)
+    token_sizes: dict = field(init=False)
+    token_shape: tuple = field(init=False)
+    num_tokens: int = field(init=False)
+    num_elements: int = field(init=False)
+    dim_tokens: int = field(init=False)
+    field_pattern: str = field(init=False)
+    token_pattern: str = field(init=False)
+    patch_pattern: str = field(init=False)
+    flat_token_pattern: str = field(init=False)
+    flat_patch_pattern: str = field(init=False)
+    flatland_pattern: str = field(init=False)
+
+    def __post_init__(self):
+        self.field_layout = tuple(self.field_sizes.keys())
+        self.patch_layout = tuple(self.patch_sizes.keys())
+
+        self.token_sizes = {
+            ax: (self.field_sizes[ax] // self.patch_sizes[f'{ax*2}'])
+            for ax in self.field_layout
+        }
+        self.token_shape = tuple(self.token_sizes[ax] for ax in self.field_layout)
+        
+        self.num_tokens = prod(self.token_sizes.values())
+        self.num_elements = prod(self.field_sizes.values())
+        self.dim_tokens = prod(self.patch_sizes.values())
+
+        field = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
+        self.field_pattern = f"b {field}"
+        self.patch_pattern = ' '.join(self.patch_layout)
+        self.token_pattern = ' '.join(self.field_layout)
+        self.flat_token_pattern = f"({self.token_pattern})"
+        self.flat_patch_pattern = f"({self.patch_pattern})"
+        self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"
 
 @dataclass
 class TrainerConfig:
@@ -121,9 +189,10 @@ class TrainerConfig:
     val_loss_name: str = "loss"
     mixed_precision: bool = True
     use_ema: bool = False
+    ema_decay: float = 0.9999
     use_zero: bool = False
-    use_compile: bool = False
     clip_gradients: bool = True
+    clip_value: float = 1.
     scheduler_step: str = "epoch"
     num_workers: int = 4
 
@@ -139,9 +208,10 @@ class TrainerConfig:
 class MTMConfig:
     trainer: TrainerConfig
     data: DatasetConfig
-    model: ModelConfig
+    model: NetworkConfig
     optim: OptimConfig
     world: WorldConfig
+    masking: MaskingConfig
 
     @classmethod
     def from_omegaconf(cls, cfg: dict | OmegaConf):
@@ -154,11 +224,8 @@ class MTMConfig:
         return cls(
             trainer=TrainerConfig(**cfg.trainer),
             data=DatasetConfig(**cfg.data),
-            model = ModelConfig(
-                decoder = NetworkConfig(**cfg.model.decoder) if exists(cfg.model.decoder) else None,
-                encoder = NetworkConfig(**cfg.model.encoder) if exists(cfg.model.encoder) else None,
-                modal = NetworkConfig(**cfg.model.modal) if exists(cfg.model.modal) else None
-            ),
+            model =  NetworkConfig(**cfg.model),
             optim =OptimConfig(**cfg.optim),
-            world=WorldConfig(**cfg.world) 
+            world=WorldConfig(**cfg.world),
+            masking=MaskingConfig(**cfg.masking)
         )

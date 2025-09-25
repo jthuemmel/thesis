@@ -17,15 +17,19 @@ from dataclasses import asdict, is_dataclass
 from utils.metrics import MetricSaver
 
 ###  HELPERS ###
-def wandb_set_startup_timeout(seconds: int):
-    assert isinstance(seconds, int)
-    os.environ['WANDB__SERVICE_WAIT'] = f'{seconds}'
-
 def exists(val):
     return val is not None
 
 def default(val, d):
     return val if exists(val) else d
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def wandb_set_startup_timeout(seconds: int):
+    assert isinstance(seconds, int)
+    os.environ['WANDB__SERVICE_WAIT'] = f'{seconds}'
+
 
 ### TRAINER INTERFACE ###
 class TrainerInterface:
@@ -228,14 +232,18 @@ class DistributedTrainer(TrainerInterface):
 
     def setup_model(self):
         model = self.create_model().to(self.device)
-        compiled = torch.compile(model, dynamic = True, disable = not self.cfg.use_compile)
-        self.model = DistributedDataParallel(compiled, 
+        count = count_parameters(model)
+        
+        self.model = DistributedDataParallel(model, 
                                              device_ids=[self.local_rank], 
                                              output_device=self.local_rank, 
-                                             find_unused_parameters=hasattr(model, 'stage') # need to set this for multi-stage models
                                              )
         if self.cfg.use_ema:
-            self.ema_model = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn())
+            self.ema_model = AveragedModel(self.model.module, multi_avg_fn=get_ema_multi_avg_fn(self.cfg.ema_decay))
+        
+        if self.is_root:
+            print(f'Created model with {count:,} parameters')
+            self.misc_metrics.log_python_object("num_params", count)
         
     def create_seed(self):
         """
@@ -277,11 +285,9 @@ class DistributedTrainer(TrainerInterface):
     def create_device(self):
         if torch.cuda.is_available():
             self.device = torch.device(type = 'cuda', index = int(self.local_rank))
-            self.device_type = 'cuda'
             torch.cuda.set_device(device = self.device)
             print(f"Rank {self.rank} set device to {torch.cuda.current_device()}", flush=True)
         else:
-            self.device_type = 'cpu'
             self.device = torch.device(type = 'cpu')
             print(f"Rank {self.rank} set device to {self.device}", flush=True)
     
@@ -354,46 +360,38 @@ class DistributedTrainer(TrainerInterface):
 
     def train_epoch(self):
         self.switch_mode(train=True)
-        #Join context manager prevents hangups due to uneven sharding
-        joinables = [self.model, self.optimizer] if self.cfg.use_zero else [self.model]
-        with Join(joinables):
-            for batch_idx, batch in enumerate(self.train_dl):
-                self.optimizer.zero_grad()
-                #automatic mixed precision
-                with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
-                    loss = self.forward_step(batch_idx, batch)
-                #backpropagation
-                self.grad_scaler.scale(loss).backward()
-                #manual unscaling to enable clipping
-                self.grad_scaler.unscale_(self.optimizer)
-                if self.cfg.clip_gradients:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_gradients)
-                #optimizer step
-                self.grad_scaler.step(self.optimizer)
-                if self.cfg.use_ema:
-                    self.ema_model.update_parameters(self.model)
-                self.grad_scaler.update()
-                #scheduler step
-                if self.cfg.scheduler_step == "batch" and exists(self.scheduler):
-                    self.scheduler.step()                
+        for batch_idx, batch in enumerate(self.train_dl):
+            self.optimizer.zero_grad()
+            #automatic mixed precision
+            with autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+                loss = self.forward_step(batch_idx, batch)
+            #backpropagation
+            self.grad_scaler.scale(loss).backward()
+            #manual unscaling to enable clipping
+            self.grad_scaler.unscale_(self.optimizer)
+            if self.cfg.clip_gradients:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_value)
+            #optimizer step
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            # ema step
+            if self.cfg.use_ema:
+                self.ema_model.update_parameters(self.model.module)
+            #scheduler step
+            if self.cfg.scheduler_step == "batch" and exists(self.scheduler):
+                self.scheduler.step()                
 
-            if self.cfg.scheduler_step == "epoch" and exists(self.scheduler):
-                self.scheduler.step()
-
-            if self.cfg.use_zero:
-                self.optimizer.consolidate_state_dict()
+        if self.cfg.scheduler_step == "epoch" and exists(self.scheduler):
+            self.scheduler.step()
 
     def evaluate_epoch(self):
         self.switch_mode(train=False)
         if not exists(self.val_dl):
             return
-        #Join context manager prevents hangups due to uneven sharding
-        with Join([self.model]):
-            for batch_idx, batch in enumerate(self.val_dl):
-                #no gradients needed for evaluation
-                with torch.no_grad():
-                    with autocast(device_type = self.device_type, enabled=self.cfg.mixed_precision):
-                        _ = self.forward_step(batch_idx, batch)
+        for batch_idx, batch in enumerate(self.val_dl):
+            with torch.no_grad():
+                with autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+                    _ = self.forward_step(batch_idx, batch)
                 
     def post_training(self):
         self.end_time = datetime.now(UTC)
@@ -414,22 +412,22 @@ class DistributedTrainer(TrainerInterface):
         self.destroy_process_group()
 
     def log_wandb(self):
-            metrics = {}
-            for key, value in self.train_metrics.scalar_metrics()[-1].items():
-                metrics[f'train/{key}'] = value
+        metrics = {}
+        for key, value in self.train_metrics.scalar_metrics()[-1].items():
+            metrics[f'train/{key}'] = value
 
-            for key, value in self.val_metrics.scalar_metrics()[-1].items():
-                metrics[f'val/{key}'] = value
+        for key, value in self.val_metrics.scalar_metrics()[-1].items():
+            metrics[f'val/{key}'] = value
 
-            for key, value in self.misc_metrics.scalar_metrics()[-1].items():
-                metrics[f'misc/{key}'] = value
+        for key, value in self.misc_metrics.scalar_metrics()[-1].items():
+            metrics[f'misc/{key}'] = value
 
-            wandb.log(metrics)
-            if self.is_best_epoch():
-                wandb.run.summary['best/epoch'] = self.current_epoch
-                for key, value in metrics.items():
-                    if not key.startswith('misc'):
-                        wandb.run.summary[f'best/{key}'] = value
+        wandb.log(metrics)
+        if self.is_best_epoch():
+            wandb.run.summary['best/epoch'] = self.current_epoch
+            for key, value in metrics.items():
+                if not key.startswith('misc'):
+                    wandb.run.summary[f'best/{key}'] = value
 
     def load_state_dict(self, state_dict):
         self.current_epoch = state_dict['epoch']
@@ -449,7 +447,7 @@ class DistributedTrainer(TrainerInterface):
             self.scheduler.load_state_dict(state_dict['scheduler_state'])
         self.grad_scaler.load_state_dict(state_dict['scaler_state'])
 
-        if hasattr(self, 'ema_model'):
+        if self.cfg.use_ema:
             self.ema_model.load_state_dict(state_dict['ema_model_state'])
 
     def state_dict(self):
@@ -458,14 +456,14 @@ class DistributedTrainer(TrainerInterface):
             'train_metrics': self.train_metrics.epochs,
             'val_metrics': self.val_metrics.epochs,
             'misc_metrics': self.misc_metrics.epochs,
-            'model_state': self.model.state_dict(),
+            'model_state': self.model.module.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'scheduler_state': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state': self.grad_scaler.state_dict(),
             'generator_state': self.generator.get_state(),
         }
         if self.cfg.use_ema:
-            state_dict['ema_model_state'] = self.ema_model.state_dict()
+            state_dict['ema_model_state'] = self.ema_model.module.state_dict()
         return state_dict
     
     def load_checkpoint(self, path: Path):
@@ -495,11 +493,13 @@ class DistributedTrainer(TrainerInterface):
         # save config
         self.save_config()
         # save model
+        if self.cfg.use_zero:
+            self.optimizer.consolidate_state_dict()
+
         torch.save(self.state_dict(), self.ckpt_path)
+
         if self.is_best_epoch():
             torch.save(self.state_dict(), self.best_path)
-            #if exists(wandb.run):
-            #    wandb.save(str(self.best_path), policy='now', base_path=str(self.model_dir))
 
         self.train_metrics.scalars_to_csv(self.model_dir / 'train_metrics.csv')
         self.val_metrics.scalars_to_csv(self.model_dir / 'val_metrics.csv')

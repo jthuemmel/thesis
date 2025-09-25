@@ -87,6 +87,9 @@ class MetricSaver:
                     dct[name] = value.item()
                 elif not isinstance(value, torch.Tensor):
                     dct[name] = value
+                elif isinstance(value, list):
+                    dct[name] = value
+                
             scalars.append(dct)
 
         return scalars
