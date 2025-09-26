@@ -173,9 +173,6 @@ class Experiment(DistributedTrainer):
             self.model_cfg, self.world, 
             generator= self.generator
             )
-        count = count_parameters(model)
-        print(f'Created model with {count:,} parameters')
-        self.misc_metrics.log_python_object("num_params", count)
         return model
     
     def create_loss(self):
