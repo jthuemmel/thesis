@@ -12,7 +12,6 @@ class MaskedPredictor(torch.nn.Module):
         
         # noise
         if exists(model.dim_noise):
-            #self.noise_embedding = ContinuousPositionalEmbedding(model.dim_noise, model.wavelengths, model.dim_noise)
             self.noise_embedding = torch.nn.Linear(model.dim_noise, model.dim_noise)
         else:
             self.noise_embedding = None
@@ -83,9 +82,6 @@ class MaskedPredictor(torch.nn.Module):
         B, E = tokens.size(0), self.world_cfg.num_ens
         if E < 2:
             return self.step(tokens, visible)
-        #u = torch.rand((B, E), device = tokens.device, generator = self.generator)
-        #u = (u + torch.linspace(0, 1, B, device = tokens.device).view(-1, 1)) % 1 # stratification
-        #u = einops.rearrange(u, 'b e -> (b e) 1 1')
         noise = torch.randn((B * E, 1, self.model_cfg.dim_noise), device = tokens.device, generator = self.generator)
         tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
         visible = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
