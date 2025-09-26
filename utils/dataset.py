@@ -1,6 +1,6 @@
 import xarray as xr
 from pathlib import Path
-from torch import from_numpy
+from torch import from_numpy, cat
 from torch.utils.data import Dataset, ConcatDataset
 from utils.config import DatasetConfig
 
@@ -17,6 +17,8 @@ class NinoData(Dataset):
         self._parse_slices(config)
         self.dataset = ds.sel(time = self.time_slice, lat = self.lat_slice, lon = self.lon_slice)
         
+        assert list(ds.to_array(dim="variable").coords["variable"].values) == list(self.variables), "Variable order mismatch"
+    
         # Preprocess and load the dataset into RAM
         self.tensor_data = self._preprocess(self.dataset)
 
@@ -42,7 +44,7 @@ class NinoData(Dataset):
         except ValueError:
             ds = xr.merge(data_arrays, join='inner')
             print("Warning: Inner merge")
-        return ds
+        return xr.merge([ds[var] for var in self.variables])
     
     def _preprocess(self, sliced_data: xr.Dataset) -> dict:
         # Compute data dependent attributes
@@ -54,11 +56,11 @@ class NinoData(Dataset):
         # Standardize the data 
         standardized_data = self._standardize(sliced_data)
 
-        # Transform the data to a dictionary of tensors
+        # Transform the data to tensor
         if self.config.return_type == "dict":
-            return {key: self._to_tensor(standardized_data[key]) for key in self.config.variables}
+            return {key: self._to_tensor(standardized_data[key]) for key in self.variables}
         else:
-            return self._to_tensor(standardized_data)
+            return cat([self._to_tensor(standardized_data[key]) for key in self.variables], dim = 0)
     
     def _standardize(self, data: xr.Dataset) -> xr.Dataset:
         for key in self.config.variables:
@@ -102,12 +104,12 @@ class NinoData(Dataset):
     
     @staticmethod
     def _to_tensor(data: xr.Dataset) :
-        # Convert the data to a tensors
+        # Convert the data to a tensor
         data = data.fillna(0.0) #replace nan values with 0
         if isinstance(data, xr.Dataset):
-            np_arr = data.to_array(dim='variable').values # add variable dimension 
+            np_arr = data.to_array(dim='variable').values # add variable dimension in front
         elif isinstance(data, xr.DataArray):
-            np_arr = data.values[None, :] # add empty variable dimension
+            np_arr = data.values[None, :] # add empty variable dimension on front
         return from_numpy(np_arr).float().share_memory_() # share memory for multiprocessing
     
     @staticmethod
