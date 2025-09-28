@@ -77,7 +77,7 @@ class Experiment(DistributedTrainer):
         if not hasattr(self, "_picontrol_data"):
             picontrol_config = self.data_cfg
             picontrol_config = replace(picontrol_config, stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
-            picontrol_config = replace(picontrol_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
+            picontrol_config = replace(picontrol_config, time_slice = {"start": "1900", "stop": "2000", "step": None})
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
@@ -217,9 +217,9 @@ class Experiment(DistributedTrainer):
             mask= 'bernoulli',
         )
         if self.mode == 'train' or not self.cfg.use_ema:
-            prediction = self.model(tokens, visible)  
+            prediction = self.model(tokens, visible, num_ens = 16)  
         else:
-            prediction = self.ema_model(tokens, visible)  
+            prediction = self.ema_model(tokens, visible, num_ens = 16)  
         prediction = prediction * self.land_sea_mask[..., None]
         prediction = self.tokens_to_field(prediction)
         return prediction

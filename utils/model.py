@@ -12,7 +12,7 @@ class MaskedPredictor(torch.nn.Module):
         
         # noise
         if exists(model.dim_noise):
-            self.noise_embedding = torch.nn.Linear(model.dim_noise, model.dim_noise)
+            self.noise_embedding = GatedFFN(dim=model.dim_noise)
         else:
             self.noise_embedding = None
 
@@ -78,10 +78,10 @@ class MaskedPredictor(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm) and m.linear is not None:
             torch.nn.init.trunc_normal_(m.linear.weight, std = 1e-8)
 
-    def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
-        B, E = tokens.size(0), self.world_cfg.num_ens
-        if E < 2:
-            return self.step(tokens, visible)
+    def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor, num_ens: int = None) -> torch.FloatTensor:
+        B = tokens.size(0)
+        E = default(num_ens, self.world_cfg.num_ens)
+        if E < 2: return self.step(tokens, visible)
         noise = torch.randn((B * E, 1, self.model_cfg.dim_noise), device = tokens.device, generator = self.generator)
         tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
         visible = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
@@ -95,9 +95,8 @@ class MaskedPredictor(torch.nn.Module):
         x = torch.where(visible, src, self.masks.weight)
         x = self.norm_in(x) + self.positions.weight
         z = self.latents.weight.expand(tokens.size(0), -1, -1)
-        ctx = self.noise_embedding(noise) if exists(self.noise_embedding) else None
-        for block in self.network:
-            x, z = block(x, z, ctx = ctx)
+        ctx = noise + self.noise_embedding(noise) if exists(self.noise_embedding) else None
+        for block in self.network: x, z = block(x, z, ctx = ctx)
         out = self.proj_out(x)
         return out
     
