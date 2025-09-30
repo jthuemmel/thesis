@@ -53,7 +53,11 @@ class Experiment(DistributedTrainer):
     
     @property
     def masking_cfg(self):
-        return self._cfg.masking        
+        return self._cfg.masking       
+
+    @property
+    def use_fair_crps(self):
+        return self.world.num_ens > 1 
     
     # DATA
     
@@ -116,15 +120,14 @@ class Experiment(DistributedTrainer):
             shuffle=False
         )
         return train_dl, val_dl
-
-    @property
-    def land_sea_mask(self):
-        lsm = self._train_lsm if self.mode == "train" else self._val_lsm
-        return einops.repeat(lsm, 
-                             f"1 (h hh) (w ww) -> {self.world.flatland_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
     
     # SETUP
+    def setup_misc(self):
+        self.mask_generator = Masking(
+            masking_cfg = self.masking_cfg, world_cfg= self.world, optim_cfg= self.optim_cfg, 
+            device= self.device, generator= self.generator
+            )
+        
     def create_job_name(self):
         if exists(self.cfg.job_name):
             base_name = str(self.cfg.job_name).replace('/', '_')
@@ -176,18 +179,16 @@ class Experiment(DistributedTrainer):
         return model
     
     def create_loss(self):
-        def loss_fn(ens: torch.Tensor, obs: torch.Tensor, visible: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-            mask = torch.logical_and(self.land_sea_mask, ~visible)
-            score = f_kernel_crps(obs, ens, fair = self.world.num_ens > 1)
-            loss = (score * mask_weight * self.per_variable_weights())[mask].mean()
+        def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
+            w_spectral = self.world.spectral_loss_weight
+            if w_spectral > 0:
+                spectral_loss = self.spectral_crps(ens, obs, mask, mask_weight)
+                node_loss = self.node_crps(ens, obs, mask, mask_weight)
+                loss = w_spectral * spectral_loss + node_loss  
+            else:
+                loss = self.node_crps(ens, obs, mask, mask_weight)
             return loss 
-        return loss_fn        
-
-    def setup_misc(self):
-        self.mask_generator = Masking(
-            masking_cfg = self.masking_cfg, world_cfg= self.world, optim_cfg= self.optim_cfg, 
-            device= self.device, generator= self.generator
-            )
+        return loss_fn
 
     def per_variable_weights(self):
         weights = {
@@ -202,11 +203,32 @@ class Experiment(DistributedTrainer):
             'tauya': 0.01,
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
-        return einops.repeat(w, f"(v vv) -> {self.world.flatland_pattern}", 
-                             **self.world.token_sizes, 
-                             **self.world.patch_sizes, 
-                             b = self.optim_cfg.batch_size)
+        return einops.repeat(w, 
+                             f"(v vv) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
     
+    @property
+    def land_sea_mask(self):
+        lsm = self._train_lsm if self.mode == "train" else self._val_lsm
+        return einops.repeat(lsm, 
+                             f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
+    
+    def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
+        score = f_kernel_crps(obs, ens, fair = self.use_fair_crps)
+        score = score * self.per_variable_weights()
+        loss = (score * mask_weight)[mask].mean()
+        return loss
+
+    def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
+        m, w_m, w_v = map(lambda x: x.float().mean(dim = (-1, -2)), (mask, mask_weight, self.per_variable_weights()))
+        with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
+            e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
+            o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
+        score = f_kernel_crps(o_fft, e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2)) #[B, V, T]
+        correction = w_v * w_m / (1.0 - m.clamp(max = 1 / self.world.num_elements))
+        return (score * correction).mean()
+
     #FORWARD       
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
@@ -217,27 +239,35 @@ class Experiment(DistributedTrainer):
             mask= 'bernoulli',
         )
         if self.mode == 'train' or not self.cfg.use_ema:
-            prediction = self.model(tokens, visible, num_ens = 16)  
+            prediction = self.model(tokens, visible, num_ens = 8)  
         else:
-            prediction = self.ema_model(tokens, visible, num_ens = 16)  
-        prediction = prediction * self.land_sea_mask[..., None]
-        prediction = self.tokens_to_field(prediction)
+            prediction = self.ema_model(tokens, visible, num_ens = 8)  
+        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
 
     def forward_step(self, batch_idx, batch):
-        tokens = self.field_to_tokens(batch.to(self.device))
+        batch = batch.to(self.device)
+        tokens = self.field_to_tokens(batch)
+
         visible, weight = self.mask_generator(
             timestep= self.masking_cfg.timestep,
             schedule= self.masking_cfg.schedule,
             mask= self.masking_cfg.mask,
         )
+
         if self.mode == 'train' or not self.cfg.use_ema:
             prediction = self.model(tokens, visible)  
         else:
             prediction = self.ema_model(tokens, visible)
-        prediction = prediction * self.land_sea_mask[..., None]
-        loss = self.loss_fn(prediction, tokens, visible, weight)
-        metrics = self.compute_metrics(ens = prediction.detach(), obs = tokens, vis = visible)
+        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
+
+        vis, weight = map(lambda x: self.tokens_to_field(x.expand(-1, -1, self.world.dim_tokens)), 
+                          (visible, weight))
+        mask = torch.logical_and(self.land_sea_mask, ~vis)
+        
+        loss = self.loss_fn(prediction, batch, mask, weight)
+
+        metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
         return loss
@@ -346,8 +376,7 @@ class Experiment(DistributedTrainer):
             name = f"{task}_{key}" if exists(task) and task != 'prior' else key
             self.current_metrics.log_metric(name, val)
 
-    def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, vis: torch.Tensor):
-        mask = torch.logical_and(self.land_sea_mask, ~vis)
+    def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
         ens = ens[mask]
         obs = obs[mask]
         metrics = {
