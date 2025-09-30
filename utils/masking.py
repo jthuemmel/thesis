@@ -32,7 +32,7 @@ class Masking:
             weight = self.arcsine_weight(t, self.masking.eps)
         elif schedule == "uniform":
             rate = (self.masking.rate_max - self.masking.rate_min) * t + self.masking.rate_min
-            weight = 1.
+            weight = torch.ones_like(rate)
         else:
             raise ValueError(f"Unknown schedule: {schedule}")
         return rate, weight
