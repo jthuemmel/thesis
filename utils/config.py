@@ -135,6 +135,7 @@ class WorldConfig:
     tau: int
     num_tails: Optional[int] = 0
     num_ens: Optional[int] = 0
+    spectral_loss_weight: float = 0.0
 
     # derived fields
     field_layout: tuple = field(init=False)
