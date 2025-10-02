@@ -81,7 +81,7 @@ class MaskedPredictor(torch.nn.Module):
     def forward(self, tokens: torch.FloatTensor, visible: torch.BoolTensor, num_ens: int = None) -> torch.FloatTensor:
         B = tokens.size(0)
         E = default(num_ens, self.world_cfg.num_ens)
-        if E < 2: return self.step(tokens, visible)
+        if self.world_cfg.num_ens < 2: return self.step(tokens, visible)
         noise = torch.randn((B * E, 1, self.model_cfg.dim_noise), device = tokens.device, generator = self.generator)
         tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
         visible = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
