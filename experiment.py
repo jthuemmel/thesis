@@ -178,6 +178,7 @@ class Experiment(DistributedTrainer):
             )
         return model
     
+    # LOSS
     def create_loss(self):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
             w_spectral = self.world.spectral_loss_weight
@@ -190,6 +191,7 @@ class Experiment(DistributedTrainer):
             return loss 
         return loss_fn
 
+    @property
     def per_variable_weights(self):
         weights = {
             'temp_ocn_0a': 1.,
@@ -216,12 +218,12 @@ class Experiment(DistributedTrainer):
     
     def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
         score = f_kernel_crps(obs, ens, fair = self.use_fair_crps)
-        score = score * self.per_variable_weights()
+        score = score * self.per_variable_weights
         loss = (score * mask_weight)[mask].mean()
         return loss
 
     def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-        m, w_m, w_v = map(lambda x: x.float().mean(dim = (-1, -2)), (mask, mask_weight, self.per_variable_weights()))
+        m, w_m, w_v = map(lambda x: x.float().mean(dim = (-1, -2)), (mask, mask_weight, self.per_variable_weights))
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
