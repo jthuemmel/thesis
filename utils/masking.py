@@ -98,22 +98,25 @@ class Masking:
         )
 
     # TIMESTEPS
-    def stratification(self, t):
-        if self.masking.stratification:
-            t = (t + torch.linspace(0, 1, self.optim_cfg.batch_size, device=t.device).view(-1, 1)) % 1
-        return t
-
     def framewise_timestep(self):
         T = self.world.token_sizes["t"]
-        t = self.uniform((1, T))
-        t = self.stratification(t)
+        B = self.optim_cfg.batch_size
+        if self.masking.stratification:
+            t = self.uniform((1, T))
+            t = (t + torch.linspace(0, 1, B, device=t.device).view(-1, 1)) % 1
+        else:
+            t = self.uniform((B, T))
         f = self.masking.tail_frac
         t = torch.where(t > f, (t - f) / (1 - f), torch.zeros_like(t))
         return t
 
     def single_timestep(self):
-        t = self.uniform((1, 1))
-        t = self.stratification(t)
+        B = self.optim_cfg.batch_size
+        if self.masking.stratification:
+            t = self.uniform((1,))
+            t = (t + torch.linspace(0, 1, B, device=t.device).view(-1, 1)) % 1
+        else:
+            t = self.uniform((B, 1))
         return t
     
     def history_timestep(self):
