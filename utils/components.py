@@ -48,23 +48,6 @@ class SwiGLU(torch.nn.Module):
         x1, x2 = x.chunk(2, dim=-1) 
         return silu(x1) * x2
 
-class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
-        super().__init__()
-        self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
-        self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
-        self.att = Attention(dim, dim_heads)
-        self.ffn = GatedFFN(dim)
-        self.has_skip = has_skip
-
-    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
-        skip = q if self.has_skip else 0.
-        q = self.att_norm(q, ctx)
-        kv = kv if kv is not None else q
-        q = skip + self.att(q, kv, kv, **attn_kwargs)
-        q = q + self.ffn(self.ffn_norm(q, ctx))
-        return q
-
 class GatedFFN(torch.nn.Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
@@ -102,20 +85,46 @@ class Attention(torch.nn.Module):
         return out
 
 class ConditionalLayerNorm(torch.nn.Module):
-    def __init__(self, dim: int, dim_ctx: Optional[int] = None):
+    def __init__(self, dim: int, dim_ctx: int = 1):
         super().__init__()
-        self.norm = torch.nn.LayerNorm(dim, elementwise_affine= not exists(dim_ctx))
-        if exists(dim_ctx):
-            self.linear = torch.nn.Linear(dim_ctx, dim * 2, bias=True)
-        else:
-            self.linear = None
+        self.dim_ctx = dim_ctx
+        self.weight = torch.nn.Parameter(torch.zeros(dim_ctx, dim * 2))
+        self.bias = torch.nn.Parameter(torch.zeros(dim * 2))
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if not exists(self.linear): 
-            return self.norm(x)
-        scale, shift = self.linear(ctx).chunk(2, dim = -1)
-        x = (1. + scale) * self.norm(x) + shift
+        ctx = default(ctx, x.new_ones(1, 1, self.dim_ctx))
+        out = torch.einsum('bnd,dc->bnc', ctx, self.weight) + self.bias
+        scale, shift = out.chunk(2, dim=-1)
+        x = (1. + scale) * torch.nn.functional.normalize(x, dim=-1) + shift
         return x
+
+class SelfConditioning(torch.nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.ffn = GatedFFN(dim)
+        self.scale = torch.nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.nn.FloatTensor, ctx: torch.nn.FloatTensor = None):
+        ctx = default(ctx, torch.zeros_like(x))
+        ctx = ctx + self.ffn(ctx)
+        return x + self.scale * torch.nn.functional.normalize(ctx, dim = -1)
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
+        super().__init__()
+        self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
+        self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
+        self.att = Attention(dim, dim_heads)
+        self.ffn = GatedFFN(dim)
+        self.has_skip = has_skip
+
+    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
+        skip = q if self.has_skip else 0.
+        q = self.att_norm(q, ctx)
+        kv = kv if kv is not None else q
+        q = skip + self.att(q, kv, kv, **attn_kwargs)
+        q = q + self.ffn(self.ffn_norm(q, ctx))
+        return q
 
 class InterfaceBlock(torch.nn.Module):
     def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, 
