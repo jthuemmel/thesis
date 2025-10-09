@@ -2,7 +2,7 @@ import torch
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from torch.nn.functional import scaled_dot_product_attention, silu
+from torch.nn.functional import scaled_dot_product_attention, silu, normalize
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -95,7 +95,7 @@ class ConditionalLayerNorm(torch.nn.Module):
         ctx = default(ctx, x.new_ones(1, 1, self.dim_ctx))
         out = torch.einsum('bnd,dc->bnc', ctx, self.weight) + self.bias
         scale, shift = out.chunk(2, dim=-1)
-        x = (1. + scale) * torch.nn.functional.normalize(x, dim=-1) + shift
+        x = (1. + scale) * normalize(x, dim=-1) + shift
         return x
 
 class SelfConditioning(torch.nn.Module):
@@ -106,8 +106,7 @@ class SelfConditioning(torch.nn.Module):
 
     def forward(self, x: torch.nn.FloatTensor, ctx: torch.nn.FloatTensor = None):
         ctx = default(ctx, torch.zeros_like(x))
-        ctx = ctx + self.ffn(ctx)
-        return x + self.scale * torch.nn.functional.normalize(ctx, dim = -1)
+        return x + self.scale * normalize(ctx + self.ffn(ctx), dim = -1)
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
