@@ -21,7 +21,7 @@ class Masking:
             lhs = 't'
         else:
             raise ValueError(f"Unknown timestep: {timestep}")
-        return einops.repeat(t, f"{lhs} -> b {self.world.flat_token_pattern} ()", **self.world.token_sizes,b=self.optim_cfg.batch_size,)
+        return einops.repeat(t, f"{lhs} -> {self.world.flat_mask_pattern}", **self.world.token_sizes,b=self.optim_cfg.batch_size,)
 
     def get_schedule(self, t, schedule: str):
         if schedule == "cosine":
