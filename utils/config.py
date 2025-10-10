@@ -170,9 +170,11 @@ class WorldConfig:
         self.field_pattern = f"b {field}"
         self.patch_pattern = ' '.join(self.patch_layout)
         self.token_pattern = ' '.join(self.field_layout)
+        
         self.flat_token_pattern = f"({self.token_pattern})"
         self.flat_patch_pattern = f"({self.patch_pattern})"
         self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"
+        self.flat_mask_pattern = f'b {self.flat_token_pattern} ()'
 
 @dataclass
 class TrainerConfig:
