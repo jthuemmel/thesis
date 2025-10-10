@@ -79,7 +79,8 @@ class Attention(torch.nn.Module):
         B = q.size(0) #remember the original batch size
         q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
-        with sdpa_kernel(self.backend): attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        with sdpa_kernel(self.backend): 
+            attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = rearrange(attn, '(b g) h n d ->  b g n (h d)', b = B).squeeze(1) # if there was no leading dimension, we simply squeeze the empty dimension
         out = self.to_out(out)
         return out
@@ -104,7 +105,7 @@ class SelfConditioning(torch.nn.Module):
         self.ffn = GatedFFN(dim)
         self.scale = torch.nn.Parameter(torch.zeros(dim))
 
-    def forward(self, x: torch.nn.FloatTensor, ctx: torch.nn.FloatTensor = None):
+    def forward(self, x: torch.FloatTensor, ctx: torch.FloatTensor = None):
         ctx = default(ctx, torch.zeros_like(x))
         return x + self.scale * normalize(ctx + self.ffn(ctx), dim = -1)
 
