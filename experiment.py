@@ -60,7 +60,6 @@ class Experiment(DistributedTrainer):
         return self.world.num_ens > 1 
     
     # DATA
-    
     def lens_data(self):
         if not hasattr(self, "_lens_data"):
             lens_config = self.data_cfg
@@ -235,21 +234,30 @@ class Experiment(DistributedTrainer):
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
+        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
+
         visible, _ = self.mask_generator(
             timestep= 'history',
             schedule= 'uniform',
             mask= 'bernoulli',
         )
-        if self.mode == 'train' or not self.cfg.use_ema:
-            prediction = self.model(tokens, visible, num_ens = 8)  
+
+        E = self.world.num_ens
+        if E > 1:
+            tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
+            vis = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
+            prediction = model(tokens, vis)
+            prediction = einops.rearrange(prediction, '(b e) ... k -> b ... (e k)', e = E)
         else:
-            prediction = self.ema_model(tokens, visible, num_ens = 8)  
+            prediction = model(tokens, visible)
+
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
 
     def forward_step(self, batch_idx, batch):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
+        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
         visible, weight = self.mask_generator(
             timestep= self.masking_cfg.timestep,
@@ -257,16 +265,19 @@ class Experiment(DistributedTrainer):
             mask= self.masking_cfg.mask,
         )
 
-        if self.mode == 'train' or not self.cfg.use_ema:
-            prediction = self.model(tokens, visible)  
+        E = self.world.num_ens
+        if E > 1:
+            tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
+            vis = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
+            prediction = model(tokens, vis)
+            prediction = einops.rearrange(prediction, '(b e) ... k -> b ... (e k)', e = E)
         else:
-            prediction = self.ema_model(tokens, visible)
-        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
+            prediction = model(tokens, visible)
 
-        vis, weight = map(lambda x: self.tokens_to_field(x.expand(-1, -1, self.world.dim_tokens)), 
-                          (visible, weight))
+        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
+        vis, weight = self.mask_to_field(visible), self.mask_to_field(weight)
+
         mask = torch.logical_and(self.land_sea_mask, ~vis)
-        
         loss = self.loss_fn(prediction, batch, mask, weight)
 
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
@@ -274,7 +285,7 @@ class Experiment(DistributedTrainer):
         self.log_metrics(metrics)
         return loss
     
-    # Tokenizer
+    # Tokenizers
     def field_to_tokens(self, field):
         return einops.rearrange(field, 
                                 f'{self.world.field_pattern} -> {self.world.flatland_pattern}',
@@ -285,6 +296,11 @@ class Experiment(DistributedTrainer):
                                 f"{self.world.flatland_pattern} ... -> {self.world.field_pattern} ...",
                                 **self.world.token_sizes, **self.world.patch_sizes)
     
+    def mask_to_field(self, mask):
+        return einops.repeat(mask,
+                             f"{self.world.flat_mask_pattern} -> {self.world.field_pattern}",
+                                **self.world.token_sizes, **self.world.patch_sizes)
+
     # EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
