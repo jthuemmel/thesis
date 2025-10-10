@@ -105,9 +105,9 @@ class SelfConditioning(torch.nn.Module):
         self.ffn = GatedFFN(dim)
         self.scale = torch.nn.Parameter(torch.zeros(dim))
 
-    def forward(self, x: torch.FloatTensor, ctx: torch.FloatTensor = None):
-        ctx = default(ctx, torch.zeros_like(x))
-        return x + self.scale * normalize(ctx + self.ffn(ctx), dim = -1)
+    def forward(self, initial: torch.FloatTensor, previous: torch.FloatTensor = None):
+        previous = default(previous, torch.zeros_like(initial))
+        return initial + self.scale * normalize(previous + self.ffn(previous), dim = -1)
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
