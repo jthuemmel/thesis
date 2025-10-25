@@ -72,3 +72,6 @@ class MaskedDiffusion(torch.nn.Module):
         mask = self.binary_topk(G + D, ks)
         out = self.model(batch, mask)
         return out, w, mask
+    
+    git config --global user.email "you@example.com"
+  git config --global user.name "Your Name"
