@@ -36,10 +36,6 @@ class Experiment(DistributedTrainer):
         return self._cfg.trainer
     
     @property
-    def optim_cfg(self):
-        return self._cfg.optim
-
-    @property
     def data_cfg(self):
         return self._cfg.data
 
@@ -103,7 +99,7 @@ class Experiment(DistributedTrainer):
         # dataloaders
         train_dl = torch.utils.data.DataLoader(
             self.train_dataset,
-            batch_size=self.optim_cfg.batch_size,
+            batch_size=self.world.batch_size,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             drop_last=True,
@@ -112,7 +108,7 @@ class Experiment(DistributedTrainer):
 
         val_dl = torch.utils.data.DataLoader(
             self.val_dataset,
-            batch_size=self.optim_cfg.batch_size,
+            batch_size=self.world.batch_size,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
             drop_last=True,
@@ -122,10 +118,7 @@ class Experiment(DistributedTrainer):
     
     # SETUP
     def setup_misc(self):
-        self.mask_generator = Masking(
-            masking_cfg = self.masking_cfg, world_cfg= self.world, optim_cfg= self.optim_cfg, 
-            device= self.device, generator= self.generator
-            )
+        pass
         
     def create_job_name(self):
         if exists(self.cfg.job_name):
@@ -140,33 +133,33 @@ class Experiment(DistributedTrainer):
             return ZeroRedundancyOptimizer(
                 [{'params': p} for n, p in named_params],
                 torch.optim.AdamW,
-                lr=self.optim_cfg.lr,
-                weight_decay=self.optim_cfg.weight_decay,
-                betas=(self.optim_cfg.beta1, self.optim_cfg.beta2)
+                lr=self.cfg.lr,
+                weight_decay=self.cfg.weight_decay,
+                betas=(self.cfg.beta1, self.cfg.beta2)
             )
         else:
             return torch.optim.AdamW(
                 named_params,
-                lr=self.optim_cfg.lr,
-                weight_decay=self.optim_cfg.weight_decay,
-                betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+                lr=self.cfg.lr,
+                weight_decay=self.cfg.weight_decay,
+                betas=(self.cfg.beta1, self.cfg.beta2),
             )
 
     def create_scheduler(self, optimizer):
         if self.cfg.scheduler_step == 'batch':
             return torch.optim.lr_scheduler.OneCycleLR(
                 optimizer = optimizer,
-                max_lr = self.optim_cfg.lr,
-                total_steps = self.optim_cfg.total_steps,
-                pct_start = self.optim_cfg.warmup_steps / self.optim_cfg.total_steps,
+                max_lr = self.cfg.lr,
+                total_steps = self.cfg.total_steps,
+                pct_start = self.cfg.warmup_steps / self.cfg.total_steps,
                 cycle_momentum = False,
-                div_factor = self.optim_cfg.div_factor,
-                final_div_factor = self.optim_cfg.final_div_factor,
+                div_factor = self.cfg.div_factor,
+                final_div_factor = self.cfg.final_div_factor,
             )
         return torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=self.optim_cfg.num_epochs,
-                eta_min=self.optim_cfg.eta_min,
+                T_max=self.cfg.epochs,
+                eta_min=self.cfg.eta_min,
                 last_epoch=-1,
             )
     
@@ -206,14 +199,14 @@ class Experiment(DistributedTrainer):
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w, 
                              f"(v vv) -> {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
+                             **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
     
     @property
     def land_sea_mask(self):
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
         return einops.repeat(lsm, 
                              f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes, b = self.optim_cfg.batch_size)
+                             **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
     
     def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
         score = f_kernel_crps(obs, ens, fair = self.use_fair_crps)
@@ -350,7 +343,7 @@ class Experiment(DistributedTrainer):
                     f"{var}_tgt": (["time", "lag", "lat", "lon"], o),
                 },
                 coords = {
-                    "time": time[batch_idx * self.optim_cfg.batch_size: (batch_idx + 1) * self.optim_cfg.batch_size],
+                    "time": time[batch_idx * self.world.batch_size: (batch_idx + 1) * self.world.batch_size],
                     "lag": lag,
                     "lat": lat,
                     "lon": lon,

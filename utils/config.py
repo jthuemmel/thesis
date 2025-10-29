@@ -90,20 +90,6 @@ class NetworkConfig:
     use_checkpoint: Optional[bool] = True
 
 @dataclass
-class OptimConfig:
-    batch_size: int = 64
-    num_epochs: int = 1
-    lr: float = 1e-4
-    beta1: float = 0.9
-    beta2: float = 0.99
-    total_steps: Optional[int] = 100000
-    warmup_steps: Optional[int] = 1000
-    weight_decay: Optional[float] = 0.01
-    div_factor: Optional[float] = 25
-    final_div_factor: Optional[float] = 1e4
-    eta_min: Optional[float] = 1e-5
-
-@dataclass
 class DatasetConfig:
     sequence_length: int = 1
     variables: List[str] = field(default_factory=lambda: VARS)
@@ -132,6 +118,7 @@ class MaskingConfig:
 class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
+    batch_size: int
     tau: int
     num_tails: Optional[int] = 0
     num_ens: Optional[int] = 0
@@ -182,16 +169,25 @@ class TrainerConfig:
     seed: Optional[int] = 42
     job_name: Optional[str] = None # for resuming training
     stage1_id: Optional[str] = None # for loading pre-trained model
-    epochs: int = 1
-
+    resume_training: bool = True
+    val_loss_name: str = "loss"
+    
     # Logging
     use_wandb: bool = True
     wb_project: Optional[str] = None
     wb_tags: Optional[List[str]] = None
 
-    # Trainer configs
-    resume_training: bool = True
-    val_loss_name: str = "loss"
+    # Optimization
+    epochs: int = 1
+    lr: float = 1e-4
+    beta1: float = 0.9
+    beta2: float = 0.99
+    total_steps: Optional[int] = 100000
+    warmup_steps: Optional[int] = 1000
+    weight_decay: Optional[float] = 0.01
+    div_factor: Optional[float] = 25
+    final_div_factor: Optional[float] = 1e4
+    eta_min: Optional[float] = 1e-5
     mixed_precision: bool = True
     use_ema: bool = False
     ema_decay: float = 0.9999
@@ -214,7 +210,6 @@ class MTMConfig:
     trainer: TrainerConfig
     data: DatasetConfig
     model: NetworkConfig
-    optim: OptimConfig
     world: WorldConfig
     masking: MaskingConfig
 
@@ -230,7 +225,6 @@ class MTMConfig:
             trainer=TrainerConfig(**cfg.trainer),
             data=DatasetConfig(**cfg.data),
             model =  NetworkConfig(**cfg.model),
-            optim =OptimConfig(**cfg.optim),
             world=WorldConfig(**cfg.world),
             masking=MaskingConfig(**cfg.masking)
         )
