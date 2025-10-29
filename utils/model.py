@@ -91,7 +91,6 @@ class MaskedPredictor(torch.nn.Module):
             x: (B, N, C_out) Tensor of predicted tokens
             z: (B, L, D) Tensor of latent variables after processing
         '''
-        B = tokens.size(0)
         # input projection
         x = self.proj_in(tokens)
         # apply mask
@@ -99,7 +98,7 @@ class MaskedPredictor(torch.nn.Module):
         # add positional embeddings
         x = self.norm_in(x) + self.positions.weight
         # self-condition latents
-        z_init = self.latents.weight.expand(B, -1, -1)
+        z_init = self.latents.weight.expand(tokens.size(0), -1, -1)
         z = self.proj_latents(z_init, previous = latents)
         # shared noise projection
         if exists(noise):
@@ -109,4 +108,6 @@ class MaskedPredictor(torch.nn.Module):
             x, z = block(x, z, ctx = noise)
         # output projection
         x = self.proj_out(x)
+        # carry over unmasked tokens
+        x = torch.where(mask, x, tokens)
         return x, z
