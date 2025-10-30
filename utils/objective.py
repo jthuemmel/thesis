@@ -36,25 +36,25 @@ class AnyOrder_RIN(torch.nn.Module):
 
     # SCHEDULES
     @staticmethod
-    def cosine_schedule(t: torch.FloatTensor) -> torch.FloatTensor:
+    def cosine_schedule(t: torch.FloatTensor) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         rates = 1 - torch.cos(torch.pi * t / 2)
         weights = 0.5 * torch.pi * torch.sin(torch.pi * t / 2)
         return rates, weights
 
     @staticmethod
-    def linear_schedule(t: torch.FloatTensor) -> torch.FloatTensor:
+    def linear_schedule(t: torch.FloatTensor) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         rates = t
         weights = torch.ones_like(t)
         return rates, weights
     
     @staticmethod
-    def minmax_schedule(t: torch.FloatTensor, a: float = 0., b: float = 1.) -> torch.FloatTensor:
+    def minmax_schedule(t: torch.FloatTensor, a: float = 0., b: float = 1.) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         rates = a + (b - a) * t
         weights = torch.ones_like(t)
         return rates, weights
 
     # Forward
-    def sample_permutation(self, prior: str):
+    def sample_permutation(self, prior: str) -> torch.FloatTensor:
         if prior == 'dirichlet': # weight frames via dirichlet prior
             W = self.log_dirichlet((self.world.batch_size, self.world.token_sizes['t']), alpha=0.5)
             lhs = "b t"
@@ -69,7 +69,7 @@ class AnyOrder_RIN(torch.nn.Module):
         G = self.gumbel((self.world.batch_size, self.world.num_tokens))
         return G + W
     
-    def sample_timesteps(self, num_steps: int, schedule: str, stratify: bool = False):
+    def sample_timesteps(self, num_steps: int, schedule: str, stratify: bool = False) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         # sample uniform random timesteps for all steps and batch elements
         t = self.uniform((num_steps, self.world.batch_size, 1))
         # optionally, we can apply batch stratification here
@@ -86,7 +86,7 @@ class AnyOrder_RIN(torch.nn.Module):
             rs, ws = self.linear_schedule(t)
         return rs, ws
 
-    def sample_masks(self, num_steps: int, prior: str, schedule: str, stratify: bool = False):
+    def sample_masks(self, num_steps: int, prior: str, schedule: str, stratify: bool = False) -> tuple[torch.BoolTensor, torch.FloatTensor]:
         # determine permutation order
         prior = self.sample_permutation(prior = prior)
         # share prior across steps
@@ -98,29 +98,35 @@ class AnyOrder_RIN(torch.nn.Module):
         masks = self.binary_topk(prior, ks)
         return masks, weights
 
-    def sample_latent_noise(self): # sample standard normal noise for latents
-        return torch.randn((self.world.batch_size, self.world.num_tokens, self.model.dim_noise), device = self.device, generator = self.generator)
+    def sample_latent_noise(self, num_samples: int) -> torch.FloatTensor: # sample standard normal noise for latents
+        return torch.randn((num_samples, 1, self.model.dim_noise), device = self.device, generator = self.generator)
 
-    def forward(self, tokens, num_steps: int = 1, num_ensemble: int = 1, prior: str = 'dirichlet', schedule: str = 'cosine') -> torch.FloatTensor:
+    def forward(self, 
+                tokens: torch.FloatTensor, 
+                num_steps: int = 1, 
+                num_ensemble: int = 1, 
+                prior: str = 'dirichlet', 
+                schedule: str = 'cosine'
+                ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.FloatTensor]:
         # sample sequence of masks
         masks, weights = self.sample_masks(num_steps, prior = prior, schedule = schedule)
 
         # repeat for functional risk minimization
-        tokens = einops.repeat(tokens, "b n d -> (b e) n d", e = num_ensemble)
-        masks = einops.repeat(masks, 's b n -> s (b e) n d', e = num_ensemble, d = self.world.dim_tokens)
+        interface = einops.repeat(tokens, "b n d -> (b e) n d", e = num_ensemble)
+        masks = einops.repeat(masks, 's b n -> s (b e) n 1', e = num_ensemble)
     
         # iterate without gradient for self-conditioning
         latents = None
         with torch.no_grad():
             for s in range(num_steps - 1):
-                noise = self.sample_latent_noise()
-                tokens, latents = self.model(tokens = tokens, mask = masks[s], latents = latents, noise = noise)
+                noise = self.sample_latent_noise(interface.size(0))
+                interface, latents = self.model(tokens = interface, mask = masks[s], latents = latents, noise = noise)
                 
         # last step with gradient
-        noise = self.sample_latent_noise()
-        tokens, latents = self.model(tokens = tokens, mask = masks[-1], latents = latents, noise = noise)
+        noise = self.sample_latent_noise(interface.size(0))
+        interface, latents = self.model(tokens = interface, mask = masks[-1], latents = latents, noise = noise)
 
         # rearrange to ensemble form
-        tokens = einops.rearrange(tokens, "(b e) n d -> b n d e", e = num_ensemble)
-        masks = einops.rearrange(masks[-1], '(b e) n d -> b n d e', e = num_ensemble)
-        return tokens, masks, weights
+        tokens = einops.rearrange(interface, "(b e) n d -> b n d e", e = num_ensemble)
+        masks = einops.rearrange(masks, 's (b e) n 1 -> s b n 1 e', e = num_ensemble)
+        return tokens, masks[-1], weights[-1]

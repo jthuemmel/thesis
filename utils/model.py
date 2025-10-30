@@ -28,9 +28,9 @@ class MaskedPredictor(torch.nn.Module):
             )
         
         self.proj_out = EinMix(
-            pattern = f'b {world.flat_token_pattern} d -> {world.flatland_pattern} e',
-            weight_shape = f'v {world.patch_pattern} e d',
-            d = model.dim, e = world.num_tails, **world.patch_sizes, **world.token_sizes
+            pattern = f'b {world.flat_token_pattern} d -> {world.flatland_pattern}',
+            weight_shape = f'v {world.patch_pattern} d',
+            d = model.dim, **world.patch_sizes, **world.token_sizes
             )
         
         # Transformer
@@ -101,8 +101,7 @@ class MaskedPredictor(torch.nn.Module):
         z_init = self.latents.weight.expand(tokens.size(0), -1, -1)
         z = self.proj_latents(z_init, previous = latents)
         # shared noise projection
-        if exists(noise):
-            noise = noise + self.proj_noise(noise)
+        if exists(noise): noise = self.proj_noise(noise)
         # transformer
         for block in self.interface_network: 
             x, z = block(x, z, ctx = noise)

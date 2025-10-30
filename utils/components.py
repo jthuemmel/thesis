@@ -71,16 +71,11 @@ class Attention(torch.nn.Module):
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
-    @property
-    def backend(self):
-         return SDPBackend.FLASH_ATTENTION if torch.cuda.get_device_capability()[0] >= 8 else SDPBackend.EFFICIENT_ATTENTION
-
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
         B = q.size(0) #remember the original batch size
         q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
-        with sdpa_kernel(self.backend): 
-            attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = rearrange(attn, '(b g) h n d ->  b g n (h d)', b = B).squeeze(1) # if there was no leading dimension, we simply squeeze the empty dimension
         out = self.to_out(out)
         return out
@@ -94,7 +89,7 @@ class ConditionalLayerNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
         ctx = default(ctx, x.new_ones(1, 1, self.dim_ctx))
-        out = torch.einsum('bnd,dc->bnc', ctx, self.weight) + self.bias
+        out = torch.einsum('bnc,cd->bnd', ctx, self.weight) + self.bias
         scale, shift = out.chunk(2, dim=-1)
         x = (1. + scale) * normalize(x, dim=-1) + shift
         return x
