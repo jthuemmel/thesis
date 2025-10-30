@@ -113,20 +113,20 @@ class AnyOrder_RIN(torch.nn.Module):
 
         # repeat for functional risk minimization
         interface = einops.repeat(tokens, "b n d -> (b e) n d", e = num_ensemble)
-        masks = einops.repeat(masks, 's b n -> s (b e) n 1', e = num_ensemble)
+        ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = num_ensemble)
     
         # iterate without gradient for self-conditioning
         latents = None
         with torch.no_grad():
             for s in range(num_steps - 1):
                 noise = self.sample_latent_noise(interface.size(0))
-                interface, latents = self.model(tokens = interface, mask = masks[s], latents = latents, noise = noise)
+                interface, latents = self.model(tokens = interface, mask = ms[s], latents = latents, noise = noise)
                 
         # last step with gradient
         noise = self.sample_latent_noise(interface.size(0))
-        interface, latents = self.model(tokens = interface, mask = masks[-1], latents = latents, noise = noise)
+        interface, latents = self.model(tokens = interface, mask = ms[-1], latents = latents, noise = noise)
 
         # rearrange to ensemble form
         tokens = einops.rearrange(interface, "(b e) n d -> b n d e", e = num_ensemble)
-        masks = einops.rearrange(masks, 's (b e) n 1 -> s b n 1 e', e = num_ensemble)
+        
         return tokens, masks[-1], weights[-1]
