@@ -86,7 +86,7 @@ class AnyOrder_RIN(torch.nn.Module):
         t = t.sort(dim = 0).values
         return t
     
-    def sample_rates(self, t: torch.FloatTensor, schedule: str) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    def apply_schedule(self, t: torch.FloatTensor, schedule: str) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         # calculate rs and ws based on schedule
         if schedule == "cosine":
             rs, ws = self.cosine_schedule(t)
@@ -94,17 +94,18 @@ class AnyOrder_RIN(torch.nn.Module):
             rs, ws = self.minmax_schedule(t)
         else:
             rs, ws = self.linear_schedule(t)
-        return rs, ws
+        # convert rates to number of tokens to mask
+        ks = (rs * self.world.num_tokens).long()
+        return ks, ws
 
-    def sample_masks(self, S: int, prior: str, schedule: str, stratify: bool = False) -> tuple[torch.BoolTensor, torch.FloatTensor]:
+    def get_masks(self, S: int, prior: str, schedule: str, stratify: bool = False) -> tuple[torch.BoolTensor, torch.FloatTensor]:
         # determine permutation order
         ps = self.sample_prior(S = S, prior = prior)
         # sample random denoising timesteps
         ts = self.sample_timestep(S = S, stratify = stratify)
         # get masking rates and weights
-        rs, ws = self.sample_rates(ts, schedule = schedule)
-        # determine masks via gumbel-topk
-        ks = (rs * self.world.num_tokens).long()
+        ks, ws = self.apply_schedule(ts, schedule = schedule)
+        # determine masks via topk
         ms = self.binary_topk(ps, ks)
         return ms, ws
     
