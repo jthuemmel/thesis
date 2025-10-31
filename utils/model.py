@@ -107,4 +107,6 @@ class MaskedPredictor(torch.nn.Module):
             x, z = block(x, z, ctx = noise)
         # output projection
         x = self.proj_out(x)
+        # copy over unmasked tokens
+        x = torch.where(mask, x, tokens)
         return x, z

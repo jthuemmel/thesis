@@ -26,6 +26,9 @@ class AnyOrder_RIN(torch.nn.Module):
     def uniform(self, shape: tuple, eps: float = 0.) -> torch.FloatTensor:
         return torch.rand(shape, device=self.device, generator=self.generator) * (1 - 2 * eps) + eps
 
+    def normal(self, shape: tuple) -> torch.FloatTensor:
+        return torch.randn(shape, device = self.device, generator = self.generator)
+    
     # CATEGORICAL
     def binary_topk(self, weights: torch.FloatTensor, ks: torch.LongTensor) -> torch.BoolTensor:
         idx = weights.argsort(dim=-1, descending=True)
@@ -53,30 +56,37 @@ class AnyOrder_RIN(torch.nn.Module):
         weights = torch.ones_like(t)
         return rates, weights
 
-    # Forward
-    def sample_permutation(self, prior: str) -> torch.FloatTensor:
+    # MASKING
+    def sample_prior(self, S: int, prior: str) -> torch.FloatTensor:
+        B, N, T = self.world.batch_size, self.world.num_tokens, self.world.token_sizes['t']
         if prior == 'dirichlet': # weight frames via dirichlet prior
-            W = self.log_dirichlet((self.world.batch_size, self.world.token_sizes['t']), alpha=0.5)
+            log_prob = self.log_dirichlet((B, T), alpha=0.5)
             lhs = "b t"
         elif prior == 'prefix': # ensure initial tau frames are always masked last
-            W = torch.zeros((self.world.batch_size, self.world.token_sizes['t']), device=self.device)
-            W[:, :self.world.tau] = float('-inf')
+            log_prob = torch.zeros((B, T), device=self.device)
+            log_prob[:, :self.world.tau] = float('-inf')
             lhs = "b t"
         else: # uniform prior over all permutations
-            W = torch.zeros((self.world.batch_size, self.world.token_sizes['t']), device=self.device)
+            log_prob = torch.zeros((B, T), device=self.device)
             lhs = "b t"
-        W = einops.repeat(W, f'{lhs} -> b {self.world.flat_token_pattern}', **self.world.token_sizes, b = self.world.batch_size)
-        G = self.gumbel((self.world.batch_size, self.world.num_tokens))
-        return G + W
+        # expand to tokens and share across steps
+        log_prob = einops.repeat(log_prob, f'{lhs} -> s b {self.world.flat_token_pattern}', **self.world.token_sizes, b = B, s = S)
+        # add gumbel noise
+        g = self.gumbel((1, B, N)) + log_prob
+        return g
     
-    def sample_timesteps(self, num_steps: int, schedule: str, stratify: bool = False) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    def sample_timestep(self, S: int, stratify: bool = False) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        B = self.world.batch_size
         # sample uniform random timesteps for all steps and batch elements
-        t = self.uniform((num_steps, self.world.batch_size, 1))
+        t = self.uniform((S, B, 1))
         # optionally, we can apply batch stratification here
         if stratify:
-            t = (torch.linspace(0, 1, self.world.batch_size)[None, :, None] + t) % 1
+            t = (torch.linspace(0, 1, B)[None, :, None] + t) % 1
         # sort the sequence dimension s.t. earlier steps have higher masking rates
         t = t.sort(dim = 0).values
+        return t
+    
+    def sample_rates(self, t: torch.FloatTensor, schedule: str) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         # calculate rs and ws based on schedule
         if schedule == "cosine":
             rs, ws = self.cosine_schedule(t)
@@ -86,47 +96,34 @@ class AnyOrder_RIN(torch.nn.Module):
             rs, ws = self.linear_schedule(t)
         return rs, ws
 
-    def sample_masks(self, num_steps: int, prior: str, schedule: str, stratify: bool = False) -> tuple[torch.BoolTensor, torch.FloatTensor]:
+    def sample_masks(self, S: int, prior: str, schedule: str, stratify: bool = False) -> tuple[torch.BoolTensor, torch.FloatTensor]:
         # determine permutation order
-        prior = self.sample_permutation(prior = prior)
-        # share prior across steps
-        prior = einops.repeat(prior, 'b n -> s b n', s = num_steps)
-        # sample random masking rates
-        rates, weights = self.sample_timesteps(num_steps, schedule = schedule, stratify = stratify)
+        ps = self.sample_prior(S = S, prior = prior)
+        # sample random denoising timesteps
+        ts = self.sample_timestep(S = S, stratify = stratify)
+        # get masking rates and weights
+        rs, ws = self.sample_rates(ts, schedule = schedule)
         # determine masks via gumbel-topk
-        ks = (rates * self.world.num_tokens).long()
-        masks = self.binary_topk(prior, ks)
-        return masks, weights
-
-    def sample_latent_noise(self, num_samples: int) -> torch.FloatTensor: # sample standard normal noise for latents
-        return torch.randn((num_samples, 1, self.model.dim_noise), device = self.device, generator = self.generator)
-
-    def forward(self, 
-                tokens: torch.FloatTensor, 
-                num_steps: int = 1, 
-                num_ensemble: int = 1, 
-                prior: str = 'dirichlet', 
-                schedule: str = 'cosine'
-                ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.FloatTensor]:
-        # sample sequence of masks
-        masks, weights = self.sample_masks(num_steps, prior = prior, schedule = schedule)
-
-        # repeat for functional risk minimization
-        interface = einops.repeat(tokens, "b n d -> (b e) n d", e = num_ensemble)
-        ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = num_ensemble)
+        ks = (rs * self.world.num_tokens).long()
+        ms = self.binary_topk(ps, ks)
+        return ms, ws
     
+    # FORWARD
+    def forward(self, tokens: torch.FloatTensor, masks: torch.BoolTensor, S: int, E: int) -> torch.FloatTensor:
+        # parallelise ensemble processing
+        fs = self.normal(shape = (S, self.world.batch_size * E, 1, self.model.dim_noise)) # s (b e) 1 d
+        xs = einops.repeat(tokens, "b n c -> (b e) n c", e = E)
+        ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = E)
+
         # iterate without gradient for self-conditioning
-        latents = None
+        zs = None
         with torch.no_grad():
-            for s in range(num_steps - 1):
-                noise = self.sample_latent_noise(interface.size(0))
-                interface, latents = self.model(tokens = interface, mask = ms[s], latents = latents, noise = noise)
+            for s in range(S - 1):
+                xs, zs = self.model(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
                 
         # last step with gradient
-        noise = self.sample_latent_noise(interface.size(0))
-        interface, latents = self.model(tokens = interface, mask = ms[-1], latents = latents, noise = noise)
+        xs, zs = self.model(tokens = xs, mask = ms[-1], latents = zs, noise = fs[-1])
 
         # rearrange to ensemble form
-        tokens = einops.rearrange(interface, "(b e) n d -> b n d e", e = num_ensemble)
-        
-        return tokens, masks[-1], weights[-1]
+        xs = einops.rearrange(xs, "(b e) n c -> b n c e", e = E)
+        return xs
