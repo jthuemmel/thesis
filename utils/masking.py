@@ -1,158 +1,97 @@
 import torch
 import einops
 
-class Masking:
-    def __init__(self, masking_cfg, world_cfg, optim_cfg, device, generator=None):
-        self.masking = masking_cfg
-        self.world = world_cfg
-        self.optim_cfg = optim_cfg
-        self.device = device
-        self.generator = generator
+class MaskingStrategy(torch.nn.Module):
+    def __init__(self, world, schedule: str):
+        super().__init__()
+        self.world = world
+        self.schedule = getattr(self, f"{schedule}_schedule", default = self.linear_schedule)
 
-    def get_timestep(self, timestep: str):
-        if timestep == "uniform":
-            t = self.single_timestep()
-            lhs = 'b 1'
-        elif timestep == "framewise":
-            t = self.framewise_timestep()
-            lhs = 'b t'
-        elif timestep == 'history':
-            t = self.history_timestep()
-            lhs = 't'
-        else:
-            raise ValueError(f"Unknown timestep: {timestep}")
-        return einops.repeat(t, f"{lhs} -> {self.world.flat_mask_pattern}", **self.world.token_sizes,b=self.optim_cfg.batch_size,)
-
-    def get_schedule(self, t, schedule: str):
-        if schedule == "cosine":
-            rate = self.cosine_schedule(t)
-            weight = self.cosine_weight(t, self.masking.eps)
-        elif schedule == "arcsine":
-            rate = self.arcsine_schedule(t)
-            weight = self.arcsine_weight(t, self.masking.eps)
-        elif schedule == "uniform":
-            rate = (self.masking.rate_max - self.masking.rate_min) * t + self.masking.rate_min
-            weight = torch.ones_like(rate)
-        else:
-            raise ValueError(f"Unknown schedule: {schedule}")
-        return rate, weight
+    def sample_prior(self, S: int, B: int, device: torch.device, **kwargs) -> torch.FloatTensor:
+        raise NotImplementedError
     
-    def get_mask(self, rate, mask: str):
-        if mask == "bernoulli":
-            visible = torch.bernoulli(rate, generator=self.generator).bool()
-        elif mask == "topk":
-            G = self.gumbel_noise((self.optim_cfg.batch_size, self.world.num_tokens))
-            ks = self.k_from_rates(rate)
-            if self.masking.alphas:
-                G = G + self.dirichlet_joint()
-            visible = self.binary_topk(G, ks=ks)
-        else:
-            raise ValueError(f"Unknown mask: {mask}")
-        return visible
+    def sample_timesteps(self, S: int, B: int, device: torch.device, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        raise NotImplementedError
+    
+    def sample_masks(self, prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        raise NotImplementedError
 
-    def __call__(self,
-                timestep: str = "uniform", 
-                schedule: str = "cosine", 
-                mask: str = "bernoulli"
-                ):
-        
-        # pick timestep Float: (B, N, 1)
-        t = self.get_timestep(timestep) 
+    def forward(self, S: int, B: int, device: torch.device, rng: torch.Generator = None, **kwargs) -> tuple[torch.BoolTensor, torch.FloatTensor]:
+        prior = self.sample_prior(S, B, device, rng = rng, **kwargs)
+        rates, weights = self.sample_timesteps(S, B, device, rng = rng, **kwargs)
+        masks = self.sample_masks(prior, rates, **kwargs)
+        return masks, weights
 
-        # pick schedule (elementwise) Float: (B, N, 1)
-        rate, weight = self.get_schedule(t, schedule)
-
-        # pick mask generator Boolean: (B, N, 1)
-        visible = self.get_mask(rate, mask)
-
-        return visible, weight
-
+    # SELECT
+    @staticmethod
+    def binary_topk(prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        ks = (prior.size(-1) * rates).long()
+        idx = prior.argsort(dim=-1, descending=True)
+        rank = torch.arange(prior.size(-1), device=prior.device).expand_as(prior)
+        mask = torch.zeros_like(prior, dtype=torch.bool, device=prior.device)
+        mask.scatter_(dim = -1, index = idx, src= ks > rank) # True for top-k False otherwise
+        return mask
+    
     # SAMPLING
-    def uniform(self, shape: tuple):
-        return torch.rand(shape, device=self.device, generator=self.generator)
-
-    def gumbel_noise(self, shape: tuple):
-        return -torch.log(-torch.log(self.uniform(shape)))
-
-    # DIRICHLET
-    def dirichlet_joint(self):
-        D = einops.reduce(
-            [self.dirichlet_marginal(ax).log() for ax in self.masking.alphas.keys()],
-            "factors ... -> ...",
-            "sum",
-        )
-        return D
+    @staticmethod
+    def log_dirichlet(shape: tuple, alpha: float, device: torch.device,  eps: float = 1e-7, rng: torch.Generator = None, **kwargs) -> torch.FloatTensor:
+        return torch.log(torch._sample_dirichlet(torch.full(shape, alpha, device=device), generator=rng) + eps)
     
-    def dirichlet_marginal(self, ax: str):
-        concentration = torch.full(
-            (self.optim_cfg.batch_size, self.world.token_sizes[ax]),
-            self.masking.alphas[ax],
-            device=self.device,
-        )
-        probs = torch._sample_dirichlet(concentration, generator=self.generator)
-        return einops.repeat(
-            probs,
-            f"b {ax} -> b {self.world.flat_token_pattern}",
-            **self.world.token_sizes,
-            b=self.optim_cfg.batch_size,
-        )
-
-    # TIMESTEPS
-    def framewise_timestep(self):
-        T = self.world.token_sizes["t"]
-        B = self.optim_cfg.batch_size
-        if self.masking.stratification:
-            t = self.uniform((1, T))
-            t = (t + torch.linspace(0, 1, B, device=t.device).view(-1, 1)) % 1
-        else:
-            t = self.uniform((B, T))
-        f = self.masking.tail_frac
-        t = torch.where(t > f, (t - f) / (1 - f), torch.zeros_like(t))
-        return t
-
-    def single_timestep(self):
-        B = self.optim_cfg.batch_size
-        if self.masking.stratification:
-            t = self.uniform((1,))
-            t = (t + torch.linspace(0, 1, B, device=t.device).view(-1, 1)) % 1
-        else:
-            t = self.uniform((B, 1))
-        return t
+    @staticmethod
+    def gumbel(shape: tuple, device: torch.device, eps: float = 1e-7, rng: torch.Generator = None, **kwargs) -> torch.FloatTensor:
+        return -torch.log(-torch.log(torch.rand(shape, device=device, generator=rng) + eps) + eps)
     
-    def history_timestep(self):
-        t = torch.zeros((self.world.token_sizes["t"],), device=self.device)
-        t[: self.world.tau] = 1.0
-        return t
-    
-    # TOPK 
-    def k_from_rates(self, rates):
-        return (self.world.num_tokens * rates).long()
-
-    def binary_topk(self, weights, ks):
-        index = weights.argsort(dim=-1, descending=True)
-        pos = torch.arange(weights.size(-1), device=weights.device)
-        index = einops.rearrange(index, "b n -> b n 1")
-        pos = einops.rearrange(pos, "n -> 1 n 1")
-        binary = torch.zeros_like(index, dtype=torch.bool, device=self.device).scatter(1, index, ks > pos)
-        return binary
-
     # SCHEDULES
     @staticmethod
-    def arcsine_schedule(t: torch.Tensor):
-        return 0.5 - 0.5 * torch.cos(torch.pi * t)
+    def cosine_schedule(t: torch.FloatTensor, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        rates = 1 - torch.cos(torch.pi * t / 2)
+        weights = 0.5 * torch.pi * torch.sin(torch.pi * t / 2)
+        return rates, weights
 
     @staticmethod
-    def arcsine_weight(t: torch.Tensor, eps: float = 1e-3):
-        t_adj = t * (1 - 2*eps) + eps  # maps t ∈ [0,1] → [eps, 1-eps]
-        return 0.5 * torch.pi * torch.sin(torch.pi * t_adj)
+    def linear_schedule(t: torch.FloatTensor, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        return t, torch.ones_like(t)
+    
+class DirichletMasking(MaskingStrategy):
+    def __init__(self, world, alpha: float = 1.0, schedule: str = "cosine"):
+        super().__init__(world, schedule = schedule)
+        self.alpha = alpha
 
-    @staticmethod
-    def cosine_schedule(t: torch.Tensor):
-        return 1 - torch.cos(torch.pi * t / 2)
+    def sample_prior(self, S: int, B: int, device: torch.device, rng: torch.Generator = None, **kwargs) -> torch.FloatTensor:
+        N, T = self.world.num_tokens, self.world.token_sizes["t"]
+        log_dirichlet = self.log_dirichlet((S, B, T), self.alpha, device, generator=rng)
+        gumbel_noise = self.gumbel((S, B, N), device, generator=rng)
+        prior = einops.repeat(log_dirichlet, f"s b t -> s b {self.world.flat_token_pattern}", n=N) + gumbel_noise
+        return prior
 
-    @staticmethod
-    def cosine_weight(t: torch.Tensor, eps: float = 1e-3):
-        t_adj = t * (1 - 2*eps) + eps  # maps t ∈ [0,1] → [eps, 1-eps]
-        return 0.5 * torch.pi * torch.sin(torch.pi * t_adj / 2)
+    def sample_timesteps(self, S: int, B: int, device: torch.device, rng: torch.Generator = None, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        t = torch.rand((S, B, 1), device=device, generator=rng)
+        t = t.sort(dim=0).values  # sort timesteps for progressive masking
+        rates, weights = self.schedule(t)
+        return rates, weights
+    
+    def sample_masks(self, prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        return self.binary_topk(prior, rates)
+    
 
+class ForecastMasking(MaskingStrategy):
+    def __init__(self, world, schedule: str = "linear"):
+        super().__init__(world, schedule = schedule)
+        self.tau = self.world.tau
 
+    def sample_prior(self, S: int, B: int, device: torch.device, **kwargs) -> torch.FloatTensor:
+        prior = torch.arange(self.world.num_tokens, device=device).float()
+        prior = einops.repeat(prior, "n -> s b n", s=S, b=B)
+        return prior
+
+    def sample_timesteps(self, S: int, B: int, device: torch.device, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        T = self.world.token_sizes["t"]
+        start = (self.tau / T).float()
+        t = torch.linspace(start, 1.0, steps=S, device=device)
+        t = einops.repeat(t, "s -> s b ()", b=B)
+        rates, weights = self.schedule(t) 
+        return rates, weights
+    
+    def sample_masks(self, prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        return self.binary_topk(prior, rates)
+    
