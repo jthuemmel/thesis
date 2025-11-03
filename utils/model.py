@@ -1,4 +1,5 @@
 import torch
+import einops
 from utils.components import *
 from einops.layers.torch import EinMix
 
@@ -75,22 +76,12 @@ class MaskedPredictor(torch.nn.Module):
             if m.weight is not None:
                 torch.nn.init.zeros_(m.weight)
 
-    def forward(self, 
+    def step(self, 
              tokens: torch.FloatTensor, 
              mask: torch.BoolTensor, 
              latents: torch.FloatTensor = None,
              noise: torch.FloatTensor = None
              ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        '''
-        Args:
-            tokens: (B, N, C_in) Tensor of input tokens
-            mask: (B, N, 1) BoolTensor indicating masked tokens
-            latents: (B, L, D) Tensor of latent variables (optional)
-            noise: (B, 1, C_noise) Tensor of noise conditioning (optional)
-        Returns:
-            x: (B, N, C_out) Tensor of predicted tokens
-            z: (B, L, D) Tensor of latent variables after processing
-        '''
         # input projection
         x = self.proj_in(tokens)
         # apply mask
@@ -110,3 +101,39 @@ class MaskedPredictor(torch.nn.Module):
         # copy over unmasked tokens
         x = torch.where(mask, x, tokens)
         return x, z
+    
+    def forward(self, 
+                tokens: torch.FloatTensor, 
+                masks: torch.BoolTensor, 
+                E: int, 
+                generator: torch.Generator = None
+                ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        '''
+        Args:
+            tokens: (B, N, C_in) Tensor of input tokens
+            masks: (S, B, N) BoolTensor of masks for S steps
+            E: Number of ensemble members
+            generator: torch.Generator for random number generation
+        Returns:
+            x: (B, N, C_out, E) Tensor of predicted tokens
+            z: (B, L, D, E) Tensor of latent variables after processing
+        '''
+        # parallelise ensemble processing
+        S, B, N, device = masks.shape, masks.device
+        fs = torch.randn((S, B * E, 1, self.dim_noise), device = device, generator = generator)
+        xs = einops.repeat(tokens, "b n c -> (b e) n c", e = E, b = B, n = N)
+        ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = E, b = B, n = N)
+
+        # iterate without gradient for self-conditioning
+        zs = None
+        with torch.no_grad():
+            for s in range(S - 1):
+                xs, zs = self.step(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
+                
+        # last step with gradient
+        xs, zs = self.step(tokens = xs, mask = ms[-1], latents = zs, noise = fs[-1])
+
+        # rearrange to ensemble form
+        xs = einops.rearrange(xs, "(b e) n c -> b n c e", e = E, b = B, n = N)
+        zs = einops.rearrange(zs, "(b e) l d -> b l d e", e = E, b = B)
+        return xs, zs
