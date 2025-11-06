@@ -106,21 +106,21 @@ class MaskedPredictor(torch.nn.Module):
                 tokens: torch.FloatTensor, 
                 masks: torch.BoolTensor, 
                 E: int, 
-                generator: torch.Generator = None
+                rng: torch.Generator = None
                 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         '''
         Args:
             tokens: (B, N, C_in) Tensor of input tokens
             masks: (S, B, N) BoolTensor of masks for S steps
             E: Number of ensemble members
-            generator: torch.Generator for random number generation
+            rng: torch.Generator for random number generation
         Returns:
             x: (B, N, C_out, E) Tensor of predicted tokens
             z: (B, L, D, E) Tensor of latent variables after processing
         '''
         # parallelise ensemble processing
-        S, B, N, device = masks.shape, masks.device
-        fs = torch.randn((S, B * E, 1, self.dim_noise), device = device, generator = generator)
+        S, B, N = masks.size()
+        fs = torch.randn((S, B * E, 1, self.dim_noise), device = tokens.device, generator = rng)
         xs = einops.repeat(tokens, "b n c -> (b e) n c", e = E, b = B, n = N)
         ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = E, b = B, n = N)
 
