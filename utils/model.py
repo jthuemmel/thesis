@@ -126,9 +126,10 @@ class MaskedPredictor(torch.nn.Module):
 
         # iterate without gradient for self-conditioning
         zs = None
-        with torch.no_grad():
-            for s in range(S - 1):
-                xs, zs = self.step(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
+        for s in range(S - 1):
+            xs, zs = self.step(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
+            xs = xs.detach()
+            zs = zs.detach()
                 
         # last step with gradient
         xs, zs = self.step(tokens = xs, mask = ms[-1], latents = zs, noise = fs[-1])
