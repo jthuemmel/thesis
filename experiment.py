@@ -15,7 +15,7 @@ import utils.config as cfg
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
 from utils.model import MaskedPredictor
-from utils.masking import Masking
+from utils.masking import *
 from utils.loss_fn import *
 
 ### HELPER FUNCTIONS
@@ -48,12 +48,12 @@ class Experiment(DistributedTrainer):
         return self._cfg.world
     
     @property
-    def masking_cfg(self):
-        return self._cfg.masking       
+    def objective_cfg(self):
+        return self._cfg.objective       
 
     @property
     def use_fair_crps(self):
-        return self.world.num_ens > 1 
+        return self.objective_cfg.train_ens > 1 
     
     # DATA
     def lens_data(self):
@@ -130,7 +130,7 @@ class Experiment(DistributedTrainer):
     
     def create_optimizer(self, named_params):
         if self.cfg.use_zero:
-            return ZeroRedundancyOptimizer(
+            optimizer = ZeroRedundancyOptimizer(
                 [{'params': p} for n, p in named_params],
                 torch.optim.AdamW,
                 lr=self.cfg.lr,
@@ -138,42 +138,54 @@ class Experiment(DistributedTrainer):
                 betas=(self.cfg.beta1, self.cfg.beta2)
             )
         else:
-            return torch.optim.AdamW(
+            optimizer = torch.optim.AdamW(
                 named_params,
                 lr=self.cfg.lr,
                 weight_decay=self.cfg.weight_decay,
                 betas=(self.cfg.beta1, self.cfg.beta2),
             )
+        return optimizer
 
     def create_scheduler(self, optimizer):
-        if self.cfg.scheduler_step == 'batch':
-            return torch.optim.lr_scheduler.OneCycleLR(
-                optimizer = optimizer,
-                max_lr = self.cfg.lr,
-                total_steps = self.cfg.total_steps,
-                pct_start = self.cfg.warmup_steps / self.cfg.total_steps,
-                cycle_momentum = False,
-                div_factor = self.cfg.div_factor,
-                final_div_factor = self.cfg.final_div_factor,
-            )
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=self.cfg.epochs,
-                eta_min=self.cfg.eta_min,
-                last_epoch=-1,
-            )
-    
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor = self.cfg.div_factor,
+            total_iters = self.cfg.warmup_steps
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.cfg.total_steps - self.cfg.warmup_steps,
+            eta_min=self.cfg.eta_min
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[self.cfg.warmup_steps]
+        )
+        return scheduler
+
     def create_model(self):
-        model = MaskedPredictor(
-            self.model_cfg, self.world, 
-            generator= self.generator
+        self.frcst_masking = ForecastMasking(
+            world = self.world, 
+            tau = self.objective_cfg.tau,
+            schedule=self.objective_cfg.frcst_schedule,
+            noise_scale= self.objective_cfg.frcst_noise_scale
             )
+        self.dirichlet_masking = DirichletMasking(
+            world = self.world, 
+            schedule= self.objective_cfg.train_schedule,
+            alpha= self.objective_cfg.alpha, 
+            stratify= self.objective_cfg.stratify,
+            progressive= self.objective_cfg.progressive
+            )
+
+        model = MaskedPredictor(self.model_cfg, self.world)
         return model
     
     # LOSS
     def create_loss(self):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-            w_spectral = self.world.spectral_loss_weight
+            w_spectral = self.cfg.spectral_loss_weight
             if w_spectral > 0:
                 spectral_loss = self.spectral_crps(ens, obs, mask, mask_weight)
                 node_loss = self.node_crps(ens, obs, mask, mask_weight)
@@ -219,7 +231,7 @@ class Experiment(DistributedTrainer):
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
-        score = f_kernel_crps(o_fft, e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2)) #[B, V, T]
+        score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2)) #[B, V, T]
         correction = w_v * w_m / (1.0 - m.clamp(max = 1 / self.world.num_elements))
         return (score * correction).mean()
 
@@ -228,22 +240,13 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-
-        visible, _ = self.mask_generator(
-            timestep= 'history',
-            schedule= 'uniform',
-            mask= 'bernoulli',
-        )
-
-        E = self.world.num_ens
-        if E > 1:
-            tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
-            vis = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
-            prediction = model(tokens, vis)
-            prediction = einops.rearrange(prediction, '(b e) ... k -> b ... (e k)', e = E)
-        else:
-            prediction = model(tokens, visible)
-
+        # values from config
+        S = self.objective_cfg.frcst_steps
+        E = self.objective_cfg.frcst_ens
+        # forward mask sampler and model
+        masks, _ = self.frcst_masking(S, device = self.device, rng = self.generator)
+        prediction, _ = model(tokens, masks, E = E, rng = self.generator)
+        # expand lsm to ensemble and select sea values (lsm = 1) or set to 0 (lsm = 0) for land
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
 
@@ -251,28 +254,28 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
+        
+        # sample self-conditioning steps during training
+        S = 1 if torch.rand((1,)).item() > self.objective_cfg.conditioning_rate else 2
+        E = self.objective_cfg.train_ens
 
-        visible, weight = self.mask_generator(
-            timestep= self.masking_cfg.timestep,
-            schedule= self.masking_cfg.schedule,
-            mask= self.masking_cfg.mask,
-        )
-
-        E = self.world.num_ens
-        if E > 1:
-            tokens = einops.repeat(tokens, 'b ... -> (b e) ...', e = E)
-            vis = einops.repeat(visible, 'b ... -> (b e) ...', e = E)
-            prediction = model(tokens, vis)
-            prediction = einops.rearrange(prediction, '(b e) ... k -> b ... (e k)', e = E)
-        else:
-            prediction = model(tokens, visible)
-
+        # sample mask (and weight) sequence of length S (shape: S, B, N)
+        mask_sequence, weight_sequence = self.dirichlet_masking(S, device = self.device, rng = self.generator)
+        
+        # forward model (returns ensemble prediction for the final mask: B, N, C, E)
+        prediction, _ = model(tokens = tokens, masks = mask_sequence, E = E, rng = self.generator)
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
-        vis, weight = self.mask_to_field(visible), self.mask_to_field(weight)
+        
+        # select only the last mask (and weight) and project to field shape
+        mask, weight = self.mask_to_field(mask_sequence[-1]), self.mask_to_field(weight_sequence[-1])
 
-        mask = torch.logical_and(self.land_sea_mask, ~vis)
-        loss = self.loss_fn(prediction, batch, mask, weight)
+        #loss and metrics are only calculated for masked (i.e. predicted) tokens in the sea
+        mask = torch.logical_and(mask, self.land_sea_mask)
 
+        # calculate weighted loss
+        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
+
+        # calculate additional metrics
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
@@ -291,7 +294,7 @@ class Experiment(DistributedTrainer):
     
     def mask_to_field(self, mask):
         return einops.repeat(mask,
-                             f"{self.world.flat_mask_pattern} -> {self.world.field_pattern}",
+                             f"b {self.world.flat_token_pattern} -> {self.world.field_pattern}",
                                 **self.world.token_sizes, **self.world.patch_sizes)
 
     # EVAL
