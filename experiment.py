@@ -323,7 +323,7 @@ class Experiment(DistributedTrainer):
         meta_data = self.val_dataset.dataset
         time, lat, lon = meta_data.time, meta_data.lat, meta_data.lon
         ens = np.arange(pred.shape[-1])
-        tau = self.world.tau
+        tau = self.objective_cfg.tau
         T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
         lag = np.arange(1, 1 + ((T - tau) * tt))
         history = tau * tt
