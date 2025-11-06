@@ -112,7 +112,7 @@ class ForecastMasking(MaskingStrategy):
 
     def sample_timesteps(self, S: int,device: torch.device, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         t = torch.linspace(0, 1.0, steps=S, device=device)
-        t = einops.repeat(t, "s -> s b n", b=self.world.batch_size, n = self.world.num_tokens)
+        t = einops.repeat(t, "s -> s b f", b=self.world.batch_size, f = self.frcst_length)
         rates, weights = self.schedule(t)
         return rates, weights
 
