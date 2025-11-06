@@ -103,35 +103,36 @@ class DatasetConfig:
     max_dirs: int = 100
 
 @dataclass
-class MaskingConfig:
-    alphas: dict = field(default_factory=dict) # ax: alpha_per_ax
-    stratification: bool = True
-    tail_frac: float = 0.0
-    rate_min: float = 0.0
-    rate_max: float = 1.0
-    timestep: str = "framewise" # uniform | framewise | history
-    schedule: str = "cosine" # arcsine | cosine | uniform (with bounds)
-    mask: str = "bernoulli" # bernoulli | topk
+class ObjectiveConfig:
+    tau: int = 2
+    alpha: float = 0.5
+    conditioning_rate: float = 0.75
+    stratify: bool = True
+    progressive: bool = True
     eps: float = 1e-3
+    train_ens: int = 4
+    train_schedule: str = 'cosine'
+    frcst_noise_scale: float = 1e-4
+    frcst_steps: int = 6
+    frcst_ens: int = 8
+    frcst_schedule: str = 'linear'
 
 @dataclass
 class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
     batch_size: int
-    tau: int
-    num_tails: Optional[int] = 0
-    num_ens: Optional[int] = 0
-    spectral_loss_weight: float = 0.0
 
     # derived fields
     field_layout: tuple = field(init=False)
     patch_layout: tuple = field(init=False)
     token_sizes: dict = field(init=False)
     token_shape: tuple = field(init=False)
+    
     num_tokens: int = field(init=False)
     num_elements: int = field(init=False)
     dim_tokens: int = field(init=False)
+
     field_pattern: str = field(init=False)
     token_pattern: str = field(init=False)
     patch_pattern: str = field(init=False)
@@ -161,7 +162,6 @@ class WorldConfig:
         self.flat_token_pattern = f"({self.token_pattern})"
         self.flat_patch_pattern = f"({self.patch_pattern})"
         self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"
-        self.flat_mask_pattern = f'b {self.flat_token_pattern} ()'
 
 @dataclass
 class TrainerConfig:
@@ -179,22 +179,28 @@ class TrainerConfig:
 
     # Optimization
     epochs: int = 1
+
+    use_zero: bool = False
     lr: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.99
-    total_steps: Optional[int] = 100000
-    warmup_steps: Optional[int] = 1000
-    weight_decay: Optional[float] = 0.01
-    div_factor: Optional[float] = 25
-    final_div_factor: Optional[float] = 1e4
-    eta_min: Optional[float] = 1e-5
-    mixed_precision: bool = True
+
+    total_steps: int = 100000
+    warmup_steps: int = 1000
+    weight_decay: float = 0.01
+
+    div_factor: float = 1e-5
+    eta_min: float = 1e-5
+    scheduler_step: str = "batch"
+    
     use_ema: bool = False
     ema_decay: float = 0.9999
-    use_zero: bool = False
+    
+    spectral_loss_weight: float = 0.
+    mixed_precision: bool = True
     clip_gradients: bool = True
     clip_value: float = 1.
-    scheduler_step: str = "epoch"
+    
     num_workers: int = 4
 
     # Paths
@@ -211,7 +217,7 @@ class MTMConfig:
     data: DatasetConfig
     model: NetworkConfig
     world: WorldConfig
-    masking: MaskingConfig
+    objective: ObjectiveConfig
 
     @classmethod
     def from_omegaconf(cls, cfg: dict | OmegaConf):
@@ -226,5 +232,5 @@ class MTMConfig:
             data=DatasetConfig(**cfg.data),
             model =  NetworkConfig(**cfg.model),
             world=WorldConfig(**cfg.world),
-            masking=MaskingConfig(**cfg.masking)
+            objective=ObjectiveConfig(**cfg.objective)
         )
