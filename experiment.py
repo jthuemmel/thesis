@@ -256,8 +256,9 @@ class Experiment(DistributedTrainer):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample self-conditioning steps during training
-        S = 1 if torch.rand((1,)).item() > self.objective_cfg.conditioning_rate else 2
-        E = self.objective_cfg.train_ens
+        single_step = torch.rand((1,)).item() > self.objective_cfg.conditioning_rate
+        S = 1 if self.mode == 'train' and single_step else 2
+        E = self.objective_cfg.train_ens if self.mode == 'train' else self.objective_cfg.frcst_ens
 
         # sample mask (and weight) sequence of length S (shape: S, B, N)
         mask_sequence, weight_sequence = self.dirichlet_masking(S, device = self.device, rng = self.generator)
