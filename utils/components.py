@@ -2,7 +2,7 @@ import torch
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from torch.nn.functional import scaled_dot_product_attention, silu, normalize
+from torch.nn.functional import scaled_dot_product_attention, silu, normalize, linear
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -83,14 +83,14 @@ class Attention(torch.nn.Module):
 class ConditionalLayerNorm(torch.nn.Module):
     def __init__(self, dim: int, dim_ctx: int = 1):
         super().__init__()
-        self.dim_ctx = dim_ctx
-        self.weight = torch.nn.Parameter(torch.zeros(dim_ctx, dim * 2))
+        self.weight = torch.nn.Parameter(torch.zeros(dim * 2, dim_ctx)) if dim_ctx > 1 else None
         self.bias = torch.nn.Parameter(torch.zeros(dim * 2))
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        ctx = default(ctx, x.new_ones(1, 1, self.dim_ctx))
-        out = torch.einsum('bnc,cd->bnd', ctx, self.weight) + self.bias
-        scale, shift = out.chunk(2, dim=-1)
+        if exists(ctx):
+            scale, shift = linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
+        else:
+            scale, shift = self.bias.chunk(2, dim = -1)
         x = (1. + scale) * normalize(x, dim=-1) + shift
         return x
 
