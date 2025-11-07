@@ -254,7 +254,10 @@ class Experiment(DistributedTrainer):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample self-conditioning steps during training
-        single_step = torch.rand((1,)).item() > self.objective_cfg.conditioning_rate
+        # Linear curriculum: 0 at epoch 0–25, ramps to 0.75 by epoch 100
+        progress = max(0.0, min(1.0, (self.current_epoch - 25) / (100 - 25)))
+        single_step = torch.rand((1,)).item() > 0.75 * progress
+
         S = 1 if self.mode == 'train' and single_step else 2
         E = self.objective_cfg.train_ens if self.mode == 'train' else self.objective_cfg.frcst_ens
 
