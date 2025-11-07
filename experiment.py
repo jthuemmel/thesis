@@ -4,6 +4,7 @@ import argparse
 import math
 import einops
 
+import matplotlib.pyplot as plt
 import xarray as xr
 import numpy as np
 
@@ -149,7 +150,7 @@ class Experiment(DistributedTrainer):
     def create_scheduler(self, optimizer):
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            start_factor = self.cfg.div_factor,
+            start_factor = 1 / self.cfg.div_factor,
             total_iters = self.cfg.warmup_steps
         )
         cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -187,11 +188,11 @@ class Experiment(DistributedTrainer):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
             w_spectral = self.cfg.spectral_loss_weight
             if w_spectral > 0:
-                spectral_loss = self.spectral_crps(ens, obs, mask, mask_weight)
-                node_loss = self.node_crps(ens, obs, mask, mask_weight)
+                spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
+                node_loss = self.node_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
                 loss = w_spectral * spectral_loss + node_loss  
             else:
-                loss = self.node_crps(ens, obs, mask, mask_weight)
+                loss = self.node_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
             return loss 
         return loss_fn
 
@@ -221,7 +222,7 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
     
     def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-        score = f_kernel_crps(obs, ens, fair = self.use_fair_crps)
+        score = f_kernel_crps(observation=obs, ensemble=ens, fair = self.use_fair_crps)
         score = score * self.per_variable_weights
         loss = (score * mask_weight)[mask].mean()
         return loss
@@ -240,13 +241,10 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        # values from config
         S = self.objective_cfg.frcst_steps
         E = self.objective_cfg.frcst_ens
-        # forward mask sampler and model
         masks, _ = self.frcst_masking(S, device = self.device, rng = self.generator)
         prediction, _ = model(tokens, masks, E = E, rng = self.generator)
-        # expand lsm to ensemble and select sea values (lsm = 1) or set to 0 (lsm = 0) for land
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
 
@@ -265,6 +263,8 @@ class Experiment(DistributedTrainer):
         
         # forward model (returns ensemble prediction for the final mask: B, N, C, E)
         prediction, _ = model(tokens = tokens, masks = mask_sequence, E = E, rng = self.generator)
+        
+        # set all land pixels to 0 manually
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         
         # select only the last mask (and weight) and project to field shape
@@ -318,6 +318,11 @@ class Experiment(DistributedTrainer):
         ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
         self.get_nino_metrics(ds)
         self.get_field_metrics(ds)
+
+        if self.is_root:
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 0, ens = 0).plot()
+            plt.savefig(self.model_dir / "test_sample.png")
+            plt.close()
 
     def get_xarray_dataset(self, batch_idx, pred, obs):
         #meta data
