@@ -20,7 +20,7 @@ class MaskedPredictor(torch.nn.Module):
         self.proj_latents = SelfConditioning(dim=model.dim)
         
         # Per-variable I/O projections
-        self.norm_in = ConditionalLayerNorm(model.dim)
+        self.norm_in = torch.nn.LayerNorm(model.dim)
         self.proj_in = EinMix(
             pattern = f'{world.flatland_pattern} -> b {world.flat_token_pattern} d',
             weight_shape = f'v {world.patch_pattern} d', 
@@ -74,7 +74,7 @@ class MaskedPredictor(torch.nn.Module):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
             if m.weight is not None:
-                torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
+                torch.nn.init.trunc_normal_(m.weight, std = 1e-8)
 
     def step(self, 
              tokens: torch.FloatTensor, 
