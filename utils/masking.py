@@ -27,10 +27,10 @@ class MaskingStrategy(torch.nn.Module):
     @staticmethod
     def binary_topk(prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
         ks = (prior.size(-1) * rates).long()
-        idx = prior.argsort(dim=-1, descending=True)
+        idx = prior.argsort(dim=-1, descending=False)
         rank = torch.arange(prior.size(-1), device=prior.device).expand_as(prior)
         mask = torch.zeros_like(prior, dtype=torch.bool, device=prior.device)
-        mask.scatter_(dim = -1, index = idx, src= ks > rank) # True for top-k False otherwise
+        mask.scatter_(dim = -1, index = idx, src= ks < rank) # True for top-k False otherwise
         return mask
     
     # SAMPLING
@@ -69,16 +69,19 @@ class DirichletMasking(MaskingStrategy):
         prior = log_dirichlet + gumbel_noise
         return prior
 
-    def sample_timesteps(self, S: int, device: torch.device, rng: torch.Generator = None, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    def sample_timesteps(self, S: int, device: torch.device, rng: torch.Generator = None, eps: float = 1e-2, **kwargs
+                         ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         B, N = self.world.batch_size, self.world.num_tokens
-        t = torch.rand((S, B, 1), device=device, generator=rng)
-        if self.stratify: # add batch-level stratification for low-discrepancy sampling
+        t = torch.rand((S, B, 1), device=device, generator=rng).expand(-1, -1, N)
+        # add batch-level stratification for low-discrepancy sampling
+        if self.stratify: 
             bs = torch.linspace(0, 1, B, device = device).view(-1, 1)
             t = (t + bs) % 1
-        if self.progressive: # sort timesteps for progressive masking
-            t = t.sort(dim=0).values  
-        rates, weights = self.schedule(t)
-        rates, weights = rates.expand(-1, -1, N), weights.expand(-1, -1, N)
+        # sort timesteps for progressive masking
+        if self.progressive: 
+            t = t.sort(dim=0, descending = True).values  
+        t_adj = t * (1 - 2*eps) + eps  # maps t ∈ [0,1] → [eps, 1-eps]
+        rates, weights = self.schedule(t_adj)
         return rates, weights
     
     def sample_masks(self, prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
@@ -101,7 +104,7 @@ class ForecastMasking(MaskingStrategy):
     def sample_prior(self, S: int,device: torch.device, rng: torch.Generator = None, **kwargs) -> torch.FloatTensor:
         # base frame order repeated per token
         B = self.world.batch_size
-        frames = torch.arange(self.frcst_frames, device=device).float()
+        frames = torch.arange(self.frcst_frames, 0, -1, device=device).float()
         frames = einops.repeat(frames, 'f -> s b (f n)', s=S, b=B, n=self.tokens_per_frame)
 
         if self.noise_scale > 0.0:

@@ -74,7 +74,7 @@ class MaskedPredictor(torch.nn.Module):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
             if m.weight is not None:
-                torch.nn.init.zeros_(m.weight)
+                torch.nn.init.trunc_normal_(m.weight, std = get_weight_std(m.weight))
 
     def step(self, 
              tokens: torch.FloatTensor, 
@@ -92,14 +92,14 @@ class MaskedPredictor(torch.nn.Module):
         z_init = self.latents.weight.expand(tokens.size(0), -1, -1)
         z = self.proj_latents(z_init, previous = latents)
         # shared noise projection
-        if exists(noise): noise = self.proj_noise(noise)
+        if exists(noise): noise = noise + self.proj_noise(noise)
         # transformer
         for block in self.interface_network: 
             x, z = block(x, z, ctx = noise)
         # output projection
         x = self.proj_out(x)
         # copy over unmasked tokens
-        x = torch.where(mask, x, tokens)
+        x = torch.where(mask, x, tokens) 
         return x, z
     
     def forward(self, 
@@ -118,11 +118,11 @@ class MaskedPredictor(torch.nn.Module):
             x: (B, N, C_out, E) Tensor of predicted tokens
             z: (B, L, D, E) Tensor of latent variables after processing
         '''
-        # parallelise ensemble processing
         S, B, N = masks.size()
+        # parallelise ensemble processing
         fs = torch.randn((S, B * E, 1, self.dim_noise), device = tokens.device, generator = rng)
         xs = einops.repeat(tokens, "b n c -> (b e) n c", e = E, b = B, n = N)
-        ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = E, b = B, n = N)
+        ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = E, b = B, n = N, s = S)
 
         # iterate without gradient for self-conditioning
         zs = None
@@ -133,7 +133,7 @@ class MaskedPredictor(torch.nn.Module):
                 
         # last step with gradient
         xs, zs = self.step(tokens = xs, mask = ms[-1], latents = zs, noise = fs[-1])
-
+        
         # rearrange to ensemble form
         xs = einops.rearrange(xs, "(b e) n c -> b n c e", e = E, b = B, n = N)
         zs = einops.rearrange(zs, "(b e) l d -> b l d e", e = E, b = B)

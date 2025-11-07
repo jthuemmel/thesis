@@ -15,9 +15,9 @@ class Metric:
         if value.dim() == 0:
             return value
         elif self.reduction == dist.ReduceOp.AVG:
-            return value.mean(dim=dim)
+            return value.nanmean(dim=dim)
         elif self.reduction == dist.ReduceOp.SUM:
-            return value.sum(dim=dim)
+            return value.nansum(dim=dim)
         elif self.reduction == dist.ReduceOp.MIN:
             return value.min(dim=dim)[0]
         elif self.reduction == dist.ReduceOp.MAX:
