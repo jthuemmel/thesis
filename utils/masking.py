@@ -26,11 +26,11 @@ class MaskingStrategy(torch.nn.Module):
     # SELECT
     @staticmethod
     def binary_topk(prior: torch.FloatTensor, rates: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
-        ks = (prior.size(-1) * rates).long()
-        idx = prior.argsort(dim=-1, descending=False)
+        ks = (prior.size(-1) * rates).long() # rate -> 1 == #masked -> N
+        idx = prior.argsort(dim=-1, descending=False) # prior -> -inf = high likelihood of masking
         rank = torch.arange(prior.size(-1), device=prior.device).expand_as(prior)
         mask = torch.zeros_like(prior, dtype=torch.bool, device=prior.device)
-        mask.scatter_(dim = -1, index = idx, src= ks < rank) # True for top-k False otherwise
+        mask.scatter_(dim = -1, index = idx, src= ks > rank) # True for top-k False otherwise
         return mask
     
     # SAMPLING
@@ -45,8 +45,9 @@ class MaskingStrategy(torch.nn.Module):
     # SCHEDULES
     @staticmethod
     def cosine_schedule(t: torch.FloatTensor, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        rates = 1 - torch.cos(torch.pi * t / 2)
-        weights = 0.5 * torch.pi * torch.sin(torch.pi * t / 2)
+        # t -> 1 = high rate, t -> 0 = low rate
+        rates = torch.cos(torch.pi * (1 - t) / 2)
+        weights = torch.sin(torch.pi * (1 - t) / 2) * torch.pi / 2
         return rates, weights
 
     @staticmethod
@@ -63,11 +64,11 @@ class DirichletMasking(MaskingStrategy):
 
     def sample_prior(self, S: int, device: torch.device, rng: torch.Generator = None, **kwargs) -> torch.FloatTensor:
         B, N, T = self.world.batch_size, self.world.num_tokens, self.world.token_sizes["t"]
-        log_dirichlet = self.log_dirichlet((S, B, T), self.alpha, device, generator=rng)
-        gumbel_noise = self.gumbel((S, B, N), device, generator=rng)
-        log_dirichlet = einops.repeat(log_dirichlet, f"s b t -> s b {self.world.flat_token_pattern}", **self.world.token_sizes)
+        log_dirichlet = self.log_dirichlet((1, B, T), self.alpha, device, generator=rng)
+        gumbel_noise = self.gumbel((1, B, N), device, generator=rng)
+        log_dirichlet = einops.repeat(log_dirichlet, f"1 b t -> 1 b {self.world.flat_token_pattern}", **self.world.token_sizes)
         prior = log_dirichlet + gumbel_noise
-        return prior
+        return prior.expand(S, -1, -1)
 
     def sample_timesteps(self, S: int, device: torch.device, rng: torch.Generator = None, eps: float = 1e-2, **kwargs
                          ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
@@ -75,7 +76,7 @@ class DirichletMasking(MaskingStrategy):
         t = torch.rand((S, B, 1), device=device, generator=rng).expand(-1, -1, N)
         # add batch-level stratification for low-discrepancy sampling
         if self.stratify: 
-            bs = torch.linspace(0, 1, B, device = device).view(-1, 1)
+            bs = torch.linspace(0, 1, B, device = device).view(1, -1, 1)
             t = (t + bs) % 1
         # sort timesteps for progressive masking
         if self.progressive: 
@@ -114,7 +115,7 @@ class ForecastMasking(MaskingStrategy):
         return frames
 
     def sample_timesteps(self, S: int,device: torch.device, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        t = torch.linspace(0, 1.0, steps=S, device=device)
+        t = torch.linspace(1.0, 1 / S, steps=S, device=device)
         t = einops.repeat(t, "s -> s b f", b=self.world.batch_size, f = self.frcst_length)
         rates, weights = self.schedule(t)
         return rates, weights
