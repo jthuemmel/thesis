@@ -73,8 +73,8 @@ class MaskedPredictor(torch.nn.Module):
         if isinstance(m, ConditionalLayerNorm):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
-            if m.weight is not None:
-                torch.nn.init.trunc_normal_(m.weight, std = 1e-8)
+            if m.weight is not None: # CLN weight close to 0
+                torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
 
     def step(self, 
              tokens: torch.FloatTensor, 
@@ -92,7 +92,8 @@ class MaskedPredictor(torch.nn.Module):
         z_init = self.latents.weight.expand(tokens.size(0), -1, -1)
         z = self.proj_latents(z_init, previous = latents)
         # shared noise projection
-        if exists(noise): noise = noise + self.proj_noise(noise)
+        if exists(noise): 
+            noise = noise + self.proj_noise(noise)
         # transformer
         for block in self.interface_network: 
             x, z = block(x, z, ctx = noise)
@@ -119,6 +120,7 @@ class MaskedPredictor(torch.nn.Module):
             z: (B, L, D, E) Tensor of latent variables after processing
         '''
         S, B, N = masks.size()
+        
         # parallelise ensemble processing
         fs = torch.randn((S, B * E, 1, self.dim_noise), device = tokens.device, generator = rng)
         xs = einops.repeat(tokens, "b n c -> (b e) n c", e = E, b = B, n = N)
