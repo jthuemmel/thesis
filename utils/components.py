@@ -2,7 +2,7 @@ import torch
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from torch.nn.functional import scaled_dot_product_attention, silu, layer_norm, linear
+from torch.nn.functional import scaled_dot_product_attention, silu, linear
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -83,6 +83,7 @@ class Attention(torch.nn.Module):
 class ConditionalLayerNorm(torch.nn.Module):
     def __init__(self, dim: int, dim_ctx: int = None):
         super().__init__()
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
         self.weight = torch.nn.Parameter(torch.zeros(dim * 2, dim_ctx)) if exists(dim_ctx) else None
         self.bias = torch.nn.Parameter(torch.zeros(dim * 2))
 
@@ -91,20 +92,19 @@ class ConditionalLayerNorm(torch.nn.Module):
             scale, shift = linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
         else:
             scale, shift = self.bias.chunk(2, dim = -1)
-        x_norm = layer_norm(x, normalized_shape = x.size(-1))
-        x = (1. + scale) * x_norm + shift
+        x = (1. + scale) * self.norm(x) + shift
         return x
 
 class SelfConditioning(torch.nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.ffn = GatedFFN(dim)
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
         self.scale = torch.nn.Parameter(torch.zeros(dim))
 
     def forward(self, initial: torch.FloatTensor, previous: torch.FloatTensor = None):
         previous = default(previous, torch.zeros_like(initial))
-        x_norm = layer_norm(previous + self.ffn(previous), normalized_shape = previous.size(-1))
-        x = self.scale * x_norm + initial
+        x = self.scale * self.norm(previous + self.ffn(previous)) + initial
         return x
 
 class TransformerBlock(torch.nn.Module):
