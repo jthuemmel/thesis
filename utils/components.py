@@ -2,7 +2,7 @@ import torch
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from torch.nn.functional import scaled_dot_product_attention, silu, normalize, linear
+from torch.nn.functional import scaled_dot_product_attention, silu, layer_norm, linear
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -81,17 +81,18 @@ class Attention(torch.nn.Module):
         return out
 
 class ConditionalLayerNorm(torch.nn.Module):
-    def __init__(self, dim: int, dim_ctx: int = 1):
+    def __init__(self, dim: int, dim_ctx: int = None):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(dim * 2, dim_ctx)) if dim_ctx > 1 else None
+        self.weight = torch.nn.Parameter(torch.zeros(dim * 2, dim_ctx)) if exists(dim_ctx) else None
         self.bias = torch.nn.Parameter(torch.zeros(dim * 2))
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if exists(ctx):
+        if exists(ctx) and exists(self.weight):
             scale, shift = linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
         else:
             scale, shift = self.bias.chunk(2, dim = -1)
-        x = (1. + scale) * normalize(x, dim=-1) + shift
+        x_norm = layer_norm(x, normalized_shape = x.size(-1))
+        x = (1. + scale) * x_norm + shift
         return x
 
 class SelfConditioning(torch.nn.Module):
@@ -102,7 +103,9 @@ class SelfConditioning(torch.nn.Module):
 
     def forward(self, initial: torch.FloatTensor, previous: torch.FloatTensor = None):
         previous = default(previous, torch.zeros_like(initial))
-        return initial + self.scale * normalize(previous + self.ffn(previous), dim = -1)
+        x_norm = layer_norm(previous + self.ffn(previous), normalized_shape = previous.size(-1))
+        x = self.scale * x_norm + initial
+        return x
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
