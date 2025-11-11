@@ -269,7 +269,7 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        E, S = 4, 1 if self.step_counter < self.objective_cfg.single_steps else 4, 2
+        E, S = (4, 1) if self.step_counter < self.objective_cfg.single_steps else (4, 2)
         masks, _ = self.frcst_masking(S, device = self.device, rng = self.generator)
         prediction, _ = model(tokens, masks, E = E, rng = self.generator)
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
