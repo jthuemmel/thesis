@@ -119,7 +119,7 @@ class Experiment(DistributedTrainer):
     
     # SETUP
     def setup_misc(self):
-        pass
+        self.step_counter = 0
         
     def create_job_name(self):
         if exists(self.cfg.job_name):
@@ -153,15 +153,20 @@ class Experiment(DistributedTrainer):
             start_factor = 1 / self.cfg.div_factor,
             total_iters = self.cfg.warmup_steps
         )
+        constant_scheduler = torch.optim.lr_scheduler.ConstantLR(
+            optimizer,
+            factor = 1.,
+            total_iters = self.cfg.constant_steps
+        )
         cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.cfg.total_steps - self.cfg.warmup_steps,
+            T_max=self.cfg.total_steps - self.cfg.warmup_steps - self.cfg.constant_steps,
             eta_min=self.cfg.eta_min
         )
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[self.cfg.warmup_steps]
+            schedulers=[warmup_scheduler, constant_scheduler, cosine_scheduler],
+            milestones=[self.cfg.warmup_steps, self.cfg.constant_steps]
         )
         return scheduler
 
@@ -236,7 +241,8 @@ class Experiment(DistributedTrainer):
         correction = w_v * w_m / (1.0 - m.clamp(max = 1 / self.world.num_elements))
         return (score * correction).mean()
 
-    #FORWARD       
+    #FORWARD
+          
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
@@ -254,11 +260,8 @@ class Experiment(DistributedTrainer):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample self-conditioning steps during training
-        # Linear curriculum: 0 at epoch 0–25, ramps to 0.75 by epoch 100
-        progress = max(0.0, min(1.0, (self.current_epoch - 25) / (100 - 25)))
-        single_step = torch.rand((1,)).item() > 0.75 * progress
-
-        S = 1 if self.mode == 'train' and single_step else 2
+        cr = self.objective_cfg.conditioning_rate if self.step_counter > 3e4 else 0
+        S = 1 if torch.rand((1,)).item() > cr else 2
         E = self.objective_cfg.train_ens if self.mode == 'train' else self.objective_cfg.frcst_ens
 
         # sample mask (and weight) sequence of length S (shape: S, B, N)
@@ -283,6 +286,8 @@ class Experiment(DistributedTrainer):
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
+        # update step counter
+        self.step_counter = self.step_counter + 1
         return loss
     
     # Tokenizers
