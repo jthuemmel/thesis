@@ -54,6 +54,10 @@ class MaskingStrategy(torch.nn.Module):
     def linear_schedule(t: torch.FloatTensor, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         return t, torch.ones_like(t)
     
+    @staticmethod
+    def minmax_schedule(t: torch.FloatTensor, a: float = 0.5, b: float = 0.99, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        return (b - a) * t + a, torch.ones_like(t)
+    
 # FRAME-WISE DIRICHLET PRIOR    
 class DirichletMasking(MaskingStrategy):
     def __init__(self, world, alpha: float = 1.0, schedule: str = "cosine", stratify: bool = True, progressive: bool = True):

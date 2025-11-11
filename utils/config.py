@@ -88,6 +88,7 @@ class NetworkConfig:
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
     use_checkpoint: Optional[bool] = True
+    architecture: Optional[str] = None
 
 @dataclass
 class DatasetConfig:
@@ -186,6 +187,7 @@ class TrainerConfig:
     beta2: float = 0.99
 
     total_steps: int = 100000
+    constant_steps: int = 0
     warmup_steps: int = 1000
     weight_decay: float = 0.01
 
