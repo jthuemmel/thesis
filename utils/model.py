@@ -38,7 +38,7 @@ class MaskedPredictor(torch.nn.Module):
             )
         
         # Transformer
-        self.transformer = TRANSFORMERS[getattr(model, 'architecture', 'perceiver')](model, world)
+        self.transformer = TRANSFORMERS[getattr(model, 'backbone', 'perceiver')](model, world)
         
         # Weight initialization
         self.apply(self.base_init)
