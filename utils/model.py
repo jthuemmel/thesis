@@ -1,7 +1,10 @@
 import torch
 import einops
 from utils.components import *
+from utils.backbones import *
 from einops.layers.torch import EinMix
+
+TRANSFORMERS = {'perceiver': Perceiver, 'interface': InterfaceNetwork, 'vit': ViT, 'flamingo': Flamingo}
 
 class MaskedPredictor(torch.nn.Module):
     '''Masked Predictor based on Recurrent Interface Networks (RINs)'''
@@ -35,14 +38,7 @@ class MaskedPredictor(torch.nn.Module):
             )
         
         # Transformer
-        self.interface_network = torch.nn.ModuleList([
-            InterfaceBlock(model.dim, 
-                           dim_heads=model.dim_heads, 
-                           num_blocks= model.num_compute_blocks, 
-                           dim_ctx = model.dim_noise,
-                           use_checkpoint=model.use_checkpoint)
-            for _ in range(model.num_layers)
-            ])
+        self.transformer = TRANSFORMERS[getattr(model, 'architecture', 'perceiver')](model, world)
         
         # Weight initialization
         self.apply(self.base_init)
@@ -93,10 +89,9 @@ class MaskedPredictor(torch.nn.Module):
         z = self.proj_latents(z_init, previous = latents)
         # shared noise projection
         if exists(noise): 
-            noise = noise + self.proj_noise(noise)
+            noise = self.proj_noise(noise)
         # transformer
-        for block in self.interface_network: 
-            x, z = block(x, z, ctx = noise)
+        x, z = self.transformer(x = x, z = z, ctx = noise)
         # output projection
         x = self.proj_out(x)
         # copy over unmasked tokens
@@ -126,15 +121,10 @@ class MaskedPredictor(torch.nn.Module):
         xs = einops.repeat(tokens, "b n c -> (b e) n c", e = E, b = B, n = N)
         ms = einops.repeat(masks, 's b n -> s (b e) n 1', e = E, b = B, n = N, s = S)
 
-        # iterate without gradient for self-conditioning
+        # iterate
         zs = None
-        for s in range(S - 1):
+        for s in range(S):
             xs, zs = self.step(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
-            xs = xs.detach()
-            zs = zs.detach()
-                
-        # last step with gradient
-        xs, zs = self.step(tokens = xs, mask = ms[-1], latents = zs, noise = fs[-1])
         
         # rearrange to ensemble form
         xs = einops.rearrange(xs, "(b e) n c -> b n c e", e = E, b = B, n = N)
