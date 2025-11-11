@@ -88,7 +88,7 @@ class NetworkConfig:
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
     use_checkpoint: Optional[bool] = True
-    architecture: Optional[str] = None
+    backbone: Optional[str] = None
 
 @dataclass
 class DatasetConfig:
@@ -108,6 +108,7 @@ class ObjectiveConfig:
     tau: int = 2
     alpha: float = 0.5
     conditioning_rate: float = 0.75
+    single_steps: int = 10000
     stratify: bool = True
     progressive: bool = True
     eps: float = 1e-3
@@ -185,14 +186,9 @@ class TrainerConfig:
     lr: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.99
-
-    total_steps: int = 100000
-    constant_steps: int = 0
-    warmup_steps: int = 1000
     weight_decay: float = 0.01
 
-    div_factor: float = 1e-5
-    eta_min: float = 1e-5
+    schedulers: Optional[list] = None
     scheduler_step: str = "batch"
     
     use_ema: bool = False
