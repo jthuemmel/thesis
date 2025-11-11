@@ -148,27 +148,49 @@ class Experiment(DistributedTrainer):
         return optimizer
 
     def create_scheduler(self, optimizer):
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor = 1 / self.cfg.div_factor,
-            total_iters = self.cfg.warmup_steps
-        )
-        constant_scheduler = torch.optim.lr_scheduler.ConstantLR(
-            optimizer,
-            factor = 1.,
-            total_iters = self.cfg.constant_steps
-        )
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.cfg.total_steps - self.cfg.warmup_steps - self.cfg.constant_steps,
-            eta_min=self.cfg.eta_min
-        )
+        schedulers = []
+        milestones = []
+        total = 0
+
+        for sch_cfg in self.cfg.schedulers:  # list of dicts
+            typ = sch_cfg["type"].lower()
+            steps = sch_cfg["steps"]
+            total += steps
+            milestones.append(total)
+
+            if typ == "linear":
+                sched = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=sch_cfg.get("start_factor", 1.0),
+                    end_factor=sch_cfg.get("end_factor", 1.0),
+                    total_iters=steps
+                )
+            elif typ == "constant":
+                sched = torch.optim.lr_scheduler.ConstantLR(
+                    optimizer,
+                    factor=sch_cfg.get("factor", 1.0),
+                    total_iters=steps
+                )
+            elif typ == "cosine":
+                sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=steps,
+                    eta_min=sch_cfg.get("eta_min", 0.0)
+                )
+            else:
+                raise ValueError(f"Unknown scheduler type: {typ}")
+
+            schedulers.append(sched)
+
+        # milestones exclude final stage
+        milestones = milestones[:-1]
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
-            schedulers=[warmup_scheduler, constant_scheduler, cosine_scheduler],
-            milestones=[self.cfg.warmup_steps, self.cfg.constant_steps]
+            schedulers=schedulers,
+            milestones=milestones
         )
         return scheduler
+
 
     def create_model(self):
         self.frcst_masking = ForecastMasking(
@@ -247,8 +269,7 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        S = self.objective_cfg.frcst_steps
-        E = self.objective_cfg.frcst_ens
+        E, S = 4, 1 if self.step_counter < self.objective_cfg.single_steps else 4, 2
         masks, _ = self.frcst_masking(S, device = self.device, rng = self.generator)
         prediction, _ = model(tokens, masks, E = E, rng = self.generator)
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
@@ -259,10 +280,8 @@ class Experiment(DistributedTrainer):
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
-        # sample self-conditioning steps during training
-        cr = self.objective_cfg.conditioning_rate if self.step_counter > 3e4 else 0
-        S = 1 if torch.rand((1,)).item() > cr else 2
-        E = self.objective_cfg.train_ens if self.mode == 'train' else self.objective_cfg.frcst_ens
+        # steps and ens
+        E, S = (4, 1) if self.step_counter < self.objective_cfg.single_steps else (2, 2)
 
         # sample mask (and weight) sequence of length S (shape: S, B, N)
         mask_sequence, weight_sequence = self.dirichlet_masking(S, device = self.device, rng = self.generator)
@@ -273,8 +292,8 @@ class Experiment(DistributedTrainer):
         # set all land pixels to 0 manually
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         
-        # select only the last mask (and weight) and project to field shape
-        mask, weight = self.mask_to_field(mask_sequence[-1]), self.mask_to_field(weight_sequence[-1])
+        # select only the first mask (and weight) and project to field shape
+        mask, weight = self.mask_to_field(mask_sequence[0]), self.mask_to_field(weight_sequence[0])
 
         #loss and metrics are only calculated for masked (i.e. predicted) tokens in the sea
         mask = torch.logical_and(mask, self.land_sea_mask)
