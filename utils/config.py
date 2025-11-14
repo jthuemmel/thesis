@@ -111,7 +111,8 @@ class ObjectiveConfig:
     single_steps: int = 10000
     stratify: bool = True
     progressive: bool = True
-    eps: float = 1e-3
+    tmin:float=0.0
+    tmax:float=1.0
     train_ens: int = 4
     train_schedule: str = 'cosine'
     frcst_noise_scale: float = 1e-4

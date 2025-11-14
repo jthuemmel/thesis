@@ -54,15 +54,22 @@ class MaskingStrategy(torch.nn.Module):
     def linear_schedule(t: torch.FloatTensor, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         return t, torch.ones_like(t)
     
-    @staticmethod
-    def minmax_schedule(t: torch.FloatTensor, a: float = 0.5, b: float = 0.99, **kwargs) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        return (b - a) * t + a, torch.ones_like(t)
-    
 # FRAME-WISE DIRICHLET PRIOR    
 class DirichletMasking(MaskingStrategy):
-    def __init__(self, world, alpha: float = 1.0, schedule: str = "cosine", stratify: bool = True, progressive: bool = True):
+    def __init__(
+            self,
+            world, 
+            alpha: float = 1.0, 
+            schedule: str = "cosine", 
+            stratify: bool = True, 
+            progressive: bool = True, 
+            tmin: float = 0.01, 
+            tmax: float = 0.99
+            ):
         super().__init__(world, schedule = schedule)
         self.alpha = alpha
+        self.tmin = tmin
+        self.tmax = tmax
         self.stratify = stratify
         self.progressive = progressive
 
@@ -74,18 +81,17 @@ class DirichletMasking(MaskingStrategy):
         prior = log_dirichlet + gumbel_noise
         return prior.expand(S, -1, -1)
 
-    def sample_timesteps(self, S: int, device: torch.device, rng: torch.Generator = None, eps: float = 1e-2, **kwargs
+    def sample_timesteps(self, S: int, device: torch.device, rng: torch.Generator = None, **kwargs
                          ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         B, N = self.world.batch_size, self.world.num_tokens
         t = torch.rand((S, B, 1), device=device, generator=rng).expand(-1, -1, N)
         # add batch-level stratification for low-discrepancy sampling
         if self.stratify: 
-            bs = torch.linspace(0, 1, B, device = device).view(1, -1, 1)
-            t = (t + bs) % 1
+            t = (t + torch.linspace(0, 1, B, device = device).view(1, -1, 1)) % 1
         # sort timesteps for progressive masking
         if self.progressive: 
             t = t.sort(dim=0, descending = True).values  
-        t_adj = t * (1 - 2*eps) + eps  # maps t ∈ [0,1] → [eps, 1-eps]
+        t_adj = (self.tmax - self.tmin) * t + self.tmin  # maps t ∈ [0,1] → [a, b]
         rates, weights = self.schedule(t_adj)
         return rates, weights
     

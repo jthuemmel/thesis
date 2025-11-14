@@ -204,7 +204,9 @@ class Experiment(DistributedTrainer):
             schedule= self.objective_cfg.train_schedule,
             alpha= self.objective_cfg.alpha, 
             stratify= self.objective_cfg.stratify,
-            progressive= self.objective_cfg.progressive
+            progressive= self.objective_cfg.progressive,
+            tmin = self.objective_cfg.tmin,
+            tmax=self.objective_cfg.tmax
             )
 
         model = MaskedPredictor(self.model_cfg, self.world)
@@ -269,9 +271,9 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        E, S = (4, 1) if self.step_counter < self.objective_cfg.single_steps else (4, 2)
-        masks, _ = self.frcst_masking(S, device = self.device, rng = self.generator)
-        prediction, _ = model(tokens, masks, E = E, rng = self.generator)
+        masks, _ = self.frcst_masking(S = 1, device = self.device, rng = self.generator)
+        masks = masks.expand(2, -1, -1)
+        prediction, _ = model(tokens, masks, E = 4, rng = self.generator)
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
 
@@ -280,23 +282,26 @@ class Experiment(DistributedTrainer):
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
-        # steps and ens
-        E, S = (4, 1) if self.step_counter < self.objective_cfg.single_steps else (2, 2)
+        # sample mask (and weight) sequence of length S (shape: 1, B, N)
+        mask_sequence, weight_sequence = self.dirichlet_masking(S = 1, device = self.device, rng = self.generator)
+        
+        # self-conditioning via repeated masks:
+        if torch.rand((1,)).item() > self.objective_cfg.conditioning_rate:
+            mask_sequence = mask_sequence.expand(2, -1, -1)
 
-        # sample mask (and weight) sequence of length S (shape: S, B, N)
-        mask_sequence, weight_sequence = self.dirichlet_masking(S, device = self.device, rng = self.generator)
-        
         # forward model (returns ensemble prediction for the final mask: B, N, C, E)
-        prediction, _ = model(tokens = tokens, masks = mask_sequence, E = E, rng = self.generator)
+        prediction, _ = model(tokens = tokens, masks = mask_sequence, E = 4, rng = self.generator)
         
-        # set all land pixels to 0 manually
-        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
-        
-        # select only the first mask (and weight) and project to field shape
-        mask, weight = self.mask_to_field(mask_sequence[0]), self.mask_to_field(weight_sequence[0])
+        # reshape to field format
+        prediction = self.tokens_to_field(prediction) 
+        mask = self.mask_to_field(mask_sequence[-1])
+        weight = self.mask_to_field(weight_sequence[-1])
 
         #loss and metrics are only calculated for masked (i.e. predicted) tokens in the sea
         mask = torch.logical_and(mask, self.land_sea_mask)
+        
+        # set all land pixels to 0 manually
+        prediction = prediction * self.land_sea_mask[..., None]
 
         # calculate weighted loss
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
