@@ -89,7 +89,7 @@ class MaskedPredictor(torch.nn.Module):
         z = self.proj_latents(z_init, previous = latents)
         # shared noise projection
         if exists(noise): 
-            noise = self.proj_noise(noise)
+            noise = noise + self.proj_noise(noise)
         # transformer
         x, z = self.transformer(x = x, z = z, ctx = noise)
         # output projection
@@ -125,6 +125,9 @@ class MaskedPredictor(torch.nn.Module):
         zs = None
         for s in range(S):
             xs, zs = self.step(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
+            # detach gradients unless it is the last step
+            if s < S - 1: 
+                xs, zs = (xs.detach(), zs.detach())
         
         # rearrange to ensemble form
         xs = einops.rearrange(xs, "(b e) n c -> b n c e", e = E, b = B, n = N)
