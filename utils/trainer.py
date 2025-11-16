@@ -338,7 +338,7 @@ class DistributedTrainer(TrainerInterface):
     def post_epoch(self):
         #time tracking
         self.epoch_end = datetime.now(UTC)
-        n_remaining = self.cfg.epochs - self.current_epoch
+        n_remaining = self.total_epochs - self.current_epoch
         per_epoch = (self.epoch_end - self.epoch_start).total_seconds()
         eta = (n_remaining * per_epoch) / 60
         #calculate time per batch
@@ -527,6 +527,6 @@ class DistributedTrainer(TrainerInterface):
     @root_only
     def print_progress(self):
         stats = self.misc_metrics.last
-        print(f"Epoch {self.current_epoch}/{self.cfg.epochs} | Time per epoch [min]: {stats['time_per_epoch[s]'] / 60} ETA [min]: {stats['eta[min]']:.2f}", flush=True)
+        print(f"Epoch {self.current_epoch}/{self.total_epochs} | Time per epoch [min]: {stats['time_per_epoch[s]'] / 60} ETA [min]: {stats['eta[min]']:.2f}", flush=True)
         print(f"Train Loss: {self.train_metrics.last['loss']:.2e} | Val Loss: {self.val_metrics.last['loss']:.2e}", flush=True)
         print(f"Peak VRAM: {stats['peak_vram[gb]']}GB | ms per batch: {stats['time_per_batch[ms]']}", flush = True)
