@@ -116,6 +116,10 @@ class DistributedTrainer(TrainerInterface):
     def cfg(self):
         """Interface to the config object."""
         return self._cfg
+    
+    @property
+    def total_epochs(self):
+        return self.cfg.epochs
 
     def __init__(self, config):
         self._cfg = config if is_dataclass(config) else OmegaConf.structured(config)
@@ -403,7 +407,7 @@ class DistributedTrainer(TrainerInterface):
         if not self.initialized:
             self.setup_training()
         self.pre_training() 
-        while self.current_epoch <= self.cfg.epochs:
+        while self.current_epoch <= self.total_epochs:
             self.pre_epoch()
             self.train_epoch() 
             self.evaluate_epoch()

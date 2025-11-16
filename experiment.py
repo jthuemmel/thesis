@@ -60,7 +60,7 @@ class Experiment(DistributedTrainer):
     def lens_data(self):
         if not hasattr(self, "_lens_data"):
             lens_config = self.data_cfg
-            lens_config = replace(lens_config, stats = default(self.data_cfg.stats, cfg.LENS_STATS))
+            #lens_config = replace(lens_config, stats = default(self.data_cfg.stats, cfg.LENS_STATS))
             lens_config = replace(lens_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
             self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
         return self._lens_data       
@@ -68,7 +68,7 @@ class Experiment(DistributedTrainer):
     def godas_data(self):
         if not hasattr(self, "_godas_data"):
             godas_config = self.data_cfg
-            godas_config = replace(godas_config, stats = default(self.data_cfg.stats, cfg.GODAS_STATS))
+            #godas_config = replace(godas_config, stats = default(self.data_cfg.stats, cfg.GODAS_STATS))
             godas_config = replace(godas_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
             self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
@@ -76,7 +76,7 @@ class Experiment(DistributedTrainer):
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
             picontrol_config = self.data_cfg
-            picontrol_config = replace(picontrol_config, stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
+            #picontrol_config = replace(picontrol_config, stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
             picontrol_config = replace(picontrol_config, time_slice = {"start": "1900", "stop": "2000", "step": None})
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
@@ -181,7 +181,8 @@ class Experiment(DistributedTrainer):
                 raise ValueError(f"Unknown scheduler type: {typ}")
 
             schedulers.append(sched)
-
+        # remember total of scheduled steps
+        self.total_steps = total
         # milestones exclude final stage
         milestones = milestones[:-1]
         scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -190,7 +191,6 @@ class Experiment(DistributedTrainer):
             milestones=milestones
         )
         return scheduler
-
 
     def create_model(self):
         self.frcst_masking = ForecastMasking(
@@ -252,8 +252,7 @@ class Experiment(DistributedTrainer):
     
     def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
         score = f_kernel_crps(observation=obs, ensemble=ens, fair = self.use_fair_crps)
-        score = score * self.per_variable_weights
-        loss = (score * mask_weight)[mask].mean()
+        loss = (score * mask_weight * self.per_variable_weights)[mask].mean()
         return loss
 
     def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
@@ -266,13 +265,16 @@ class Experiment(DistributedTrainer):
         return (score * correction).mean()
 
     #FORWARD
-          
+    @property
+    def total_epochs(self):
+        return self.total_steps // len(self.train_dl)
+    
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         masks, _ = self.frcst_masking(S = 1, device = self.device, rng = self.generator)
-        masks = masks.expand(2, -1, -1)
+        #masks = masks.expand(2, -1, -1)
         prediction, _ = model(tokens, masks, E = 4, rng = self.generator)
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
@@ -286,16 +288,16 @@ class Experiment(DistributedTrainer):
         mask_sequence, weight_sequence = self.dirichlet_masking(S = 1, device = self.device, rng = self.generator)
         
         # self-conditioning via repeated masks:
-        if torch.rand((1,)).item() > self.objective_cfg.conditioning_rate:
-            mask_sequence = mask_sequence.expand(2, -1, -1)
+        #if torch.rand((1,)).item() > self.objective_cfg.conditioning_rate:
+        #    mask_sequence = mask_sequence.expand(2, -1, -1)
 
         # forward model (returns ensemble prediction for the final mask: B, N, C, E)
         prediction, _ = model(tokens = tokens, masks = mask_sequence, E = 4, rng = self.generator)
         
         # reshape to field format
         prediction = self.tokens_to_field(prediction) 
-        mask = self.mask_to_field(mask_sequence[-1])
-        weight = self.mask_to_field(weight_sequence[-1])
+        mask = self.mask_to_field(mask_sequence[-1, :, :])
+        weight = self.mask_to_field(weight_sequence[-1, :, :])
 
         #loss and metrics are only calculated for masked (i.e. predicted) tokens in the sea
         mask = torch.logical_and(mask, self.land_sea_mask)
@@ -352,7 +354,7 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 0, ens = 0).plot()
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 21, ens = 0).plot()
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 
@@ -373,9 +375,8 @@ class Experiment(DistributedTrainer):
                 continue
             
             std = self.val_dataset._stds.sel(variable = var).values
-            mean = self.val_dataset._means.sel(variable = var).values
-            p = pred[:, v, history:].float().detach().cpu().numpy() * std + mean
-            o = obs[:, v, history:].float().detach().cpu().numpy() * std + mean
+            p = pred[:, v, history:].float().detach().cpu().numpy() * std
+            o = obs[:, v, history:].float().detach().cpu().numpy() * std
 
             #create xarray
             data_array = xr.Dataset(
