@@ -93,12 +93,12 @@ class NetworkConfig:
 @dataclass
 class DatasetConfig:
     sequence_length: int = 1
-    variables: List[str] = field(default_factory=lambda: VARS)
-    eval_variables: List[str] = field(default_factory=lambda: VARS)
+    variables: List[str] = field(default_factory=lambda:VARS)
+    eval_variables: List[str] = field(default_factory=lambda:VARS)
     time_slice: Optional[dict] = None
     lat_slice: Optional[dict] = None
     lon_slice: Optional[dict] = None
-    stats: Optional[dict] = None
+    stats: Optional[dict] = field(default_factory=lambda:LENS_STATS)
     return_type: str = "tensor"
     eval_data: str = "picontrol"
     max_dirs: int = 100
@@ -107,8 +107,8 @@ class DatasetConfig:
 class ObjectiveConfig:
     tau: int = 2
     alpha: float = 0.5
-    conditioning_rate: float = 0.75
-    single_steps: int = 10000
+    conditioning_rate: float = 0.0
+    single_steps: int = 0
     stratify: bool = True
     progressive: bool = True
     tmin:float=0.0
