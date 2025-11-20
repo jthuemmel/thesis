@@ -144,6 +144,7 @@ class Experiment(DistributedTrainer):
                 lr=self.cfg.lr,
                 weight_decay=self.cfg.weight_decay,
                 betas=(self.cfg.beta1, self.cfg.beta2),
+                fused=True
             )
         return optimizer
 
@@ -197,7 +198,6 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             tau = self.objective_cfg.tau,
             schedule=self.objective_cfg.frcst_schedule,
-            noise_scale= self.objective_cfg.frcst_noise_scale
             )
         self.dirichlet_masking = DirichletMasking(
             world = self.world, 
@@ -288,8 +288,8 @@ class Experiment(DistributedTrainer):
         mask_sequence, weight_sequence = self.dirichlet_masking(S = 1, device = self.device, rng = self.generator)
         
         # self-conditioning via repeated masks:
-        #if torch.rand((1,)).item() > self.objective_cfg.conditioning_rate:
-        #    mask_sequence = mask_sequence.expand(2, -1, -1)
+        #if torch.rand((1,)).item() < self.objective_cfg.conditioning_rate:
+        #   mask_sequence = mask_sequence.expand(2, -1, -1)
 
         # forward model (returns ensemble prediction for the final mask: B, N, C, E)
         prediction, _ = model(tokens = tokens, masks = mask_sequence, E = 4, rng = self.generator)

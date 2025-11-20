@@ -19,7 +19,9 @@ class MaskedPredictor(torch.nn.Module):
         self.masks = torch.nn.Embedding(1, model.dim)
         
         # Projections for latents and noise
-        self.proj_noise = GatedFFN(dim=model.dim_noise) if exists(model.dim_noise) else torch.nn.Identity()
+        self.proj_noise = torch.nn.Sequential(
+            GatedFFN(model.dim_noise), torch.nn.LayerNorm(model.dim_noise)
+        ) if exists(model.dim_noise) else torch.nn.Identity()
         self.proj_latents = SelfConditioning(dim=model.dim)
         
         # Per-variable I/O projections
@@ -71,6 +73,9 @@ class MaskedPredictor(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
             if m.weight is not None: # CLN weight close to 0
                 torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
+        # self conditioning
+        if isinstance(m, SelfConditioning):
+            torch.nn.init.trunc_normal_(m.scale, std = 1e-7)
 
     def step(self, 
              tokens: torch.FloatTensor, 
@@ -85,11 +90,11 @@ class MaskedPredictor(torch.nn.Module):
         # add positional embeddings
         x = self.norm_in(x) + self.positions.weight
         # self-condition latents
-        z_init = self.latents.weight.expand(tokens.size(0), -1, -1)
-        z = self.proj_latents(z_init, previous = latents)
+        z = self.proj_latents(initial = self.latents.weight.expand(tokens.size(0), -1, -1), 
+                              previous = latents)
         # shared noise projection
         if exists(noise): 
-            noise = noise + self.proj_noise(noise)
+            noise = self.proj_noise(noise)
         # transformer
         x, z = self.transformer(x = x, z = z, ctx = noise)
         # output projection
@@ -126,7 +131,7 @@ class MaskedPredictor(torch.nn.Module):
         for s in range(S):
             xs, zs = self.step(tokens = xs, mask = ms[s], latents = zs, noise = fs[s])
             # detach gradients unless it is the last step
-            if s < S - 1: 
+            if s < S - 1:
                 xs, zs = (xs.detach(), zs.detach())
         
         # rearrange to ensemble form

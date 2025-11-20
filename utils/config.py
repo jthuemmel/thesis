@@ -111,12 +111,12 @@ class ObjectiveConfig:
     single_steps: int = 0
     stratify: bool = True
     progressive: bool = True
+    event_dims: tuple = ('t',)
     tmin:float=0.0
     tmax:float=1.0
     train_ens: int = 4
-    train_schedule: str = 'cosine'
-    frcst_noise_scale: float = 1e-4
-    frcst_steps: int = 6
+    train_schedule: str = 'sine'
+    frcst_steps: int = 1
     frcst_ens: int = 8
     frcst_schedule: str = 'linear'
 
