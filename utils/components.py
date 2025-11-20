@@ -17,8 +17,8 @@ def default(val, d):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def get_weight_std(weight: torch.Tensor):
-    return 1 / weight.size(-1)**0.5
+def get_weight_std(weight: torch.Tensor, dim: int = -1):
+    return 1 / weight.size(dim)**0.5
 
 class ContinuousPositionalEmbedding(torch.nn.Module):
     def __init__(self, dim_per_coord: int, wavelengths: List[Tuple[int, int]] = [(1., 256)], model_dim: Optional[int] = None):
