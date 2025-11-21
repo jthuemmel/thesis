@@ -106,19 +106,12 @@ class DatasetConfig:
 @dataclass
 class ObjectiveConfig:
     tau: int = 2
-    alpha: float = 0.5
-    conditioning_rate: float = 0.0
-    single_steps: int = 0
     stratify: bool = True
-    progressive: bool = True
+    progressive: bool = False
     event_dims: tuple = ('t',)
-    tmin:float=0.0
-    tmax:float=1.0
-    train_ens: int = 4
-    train_schedule: str = 'sine'
-    frcst_steps: int = 1
-    frcst_ens: int = 8
-    frcst_schedule: str = 'linear'
+    c1: float = 1.
+    c0: float = 1.
+    epsilon: float = 0.05
 
 @dataclass
 class WorldConfig:

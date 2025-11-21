@@ -196,18 +196,12 @@ class Experiment(DistributedTrainer):
     def create_model(self):
         self.frcst_masking = ForecastMasking(
             world = self.world, 
-            tau = self.objective_cfg.tau,
-            schedule=self.objective_cfg.frcst_schedule,
+            objective=self.objective_cfg
             )
-        self.dirichlet_masking = DirichletMasking(
+        self.masking = KumaraswamyMasking(
             world = self.world, 
-            schedule= self.objective_cfg.train_schedule,
-            alpha= self.objective_cfg.alpha, 
-            stratify= self.objective_cfg.stratify,
-            progressive= self.objective_cfg.progressive,
-            tmin = self.objective_cfg.tmin,
-            tmax=self.objective_cfg.tmax
-            )
+            objective=self.objective_cfg
+        )
 
         model = MaskedPredictor(self.model_cfg, self.world)
         return model
@@ -273,8 +267,7 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        masks, _ = self.frcst_masking(S = 1, device = self.device, rng = self.generator)
-        #masks = masks.expand(2, -1, -1)
+        masks = self.frcst_masking(shape=(1, batch.size(0)))
         prediction, _ = model(tokens, masks, E = 4, rng = self.generator)
         prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
         return prediction
@@ -285,7 +278,7 @@ class Experiment(DistributedTrainer):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample mask (and weight) sequence of length S (shape: 1, B, N)
-        mask_sequence, weight_sequence = self.dirichlet_masking(S = 1, device = self.device, rng = self.generator)
+        mask_sequence, weight_sequence = self.masking(shape=(1, batch.size(0)), rng = self.generator)
         
         # self-conditioning via repeated masks:
         #if torch.rand((1,)).item() < self.objective_cfg.conditioning_rate:
