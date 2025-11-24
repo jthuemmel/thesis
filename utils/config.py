@@ -108,6 +108,7 @@ class ObjectiveConfig:
     tau: int = 2
     stratify: bool = True
     progressive: bool = False
+    discretise: bool = False
     event_dims: tuple = ('t',)
     c1: float = 1.
     c0: float = 1.
@@ -182,7 +183,7 @@ class TrainerConfig:
     beta2: float = 0.99
     weight_decay: float = 0.01
 
-    schedulers: Optional[list] = None
+    schedulers: Optional[list ] = None
     scheduler_step: str = "batch"
     
     use_ema: bool = False
