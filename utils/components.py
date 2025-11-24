@@ -63,20 +63,26 @@ class GatedFFN(torch.nn.Module):
         return x
     
 class Attention(torch.nn.Module):
-    def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False):
+    def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False, qk_norm: bool = True):
         super().__init__()
         self.split_heads = Rearrange('... n (h d) -> (...) h n d', d = dim_heads)
+        self.merge_heads = Rearrange('... h n d -> ... n (h d)')
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
         self.to_k = torch.nn.Linear(dim, dim, bias = bias)
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
+        self.norm_q = torch.nn.LayerNorm(dim_heads, bias = bias) if qk_norm else torch.nn.Identity()
+        self.norm_k = torch.nn.LayerNorm(dim_heads, bias = bias) if qk_norm else torch.nn.Identity()
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
-        B = q.size(0) #remember the original batch size
+        B, groups = q.size(0), q.ndim == 4 #remember the original batch size and whether there was a leading dimension
         q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
+        q = self.norm_q(q)
+        k = self.norm_k(k)
         attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
-        out = rearrange(attn, '(b g) h n d ->  b g n (h d)', b = B).squeeze(1) # if there was no leading dimension, we simply squeeze the empty dimension
+        out = self.merge_heads(attn)
+        if groups: out = rearrange(out, '(b g) ... -> b g ...', b = B)
         out = self.to_out(out)
         return out
 
