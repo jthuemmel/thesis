@@ -8,21 +8,15 @@ class ForecastMasking(torch.nn.Module):
         super().__init__()
         self.world = world
         self.objective = objective
-
-        self.register_buffer("tau", torch.tensor(objective.tau))
-        T = self.world.token_sizes["t"]
-        N = self.world.num_tokens
-
-        self.prefix_frames = self.tau
-        self.frcst_frames = T - self.tau
-        self.tokens_per_frame = N // T
-        self.prefix_length = self.tau * self.tokens_per_frame
-        self.frcst_length = N - self.prefix_length
+        self.register_buffer("prefix_frames", torch.tensor(objective.tau, dtype = torch.long))
+        self.register_buffer("frcst_frames", torch.tensor(world.token_sizes["t"] - objective.tau, dtype = torch.long))
+        
 
     def forward(self, shape: tuple):
-        frcst_mask = torch.ones(shape + (self.frcst_length,), device = self.tau.device)
-        prefix_mask = frcst_mask.new_zeros(shape + (self.prefix_length,))
-        return torch.cat([prefix_mask, frcst_mask], dim=-1)
+        frcst_mask = torch.ones(shape + (self.frcst_frames,), device = self.tau.device, dtype = torch.bool)
+        prefix_mask = frcst_mask.new_zeros(shape + (self.prefix_frames,))
+        combined = torch.cat([prefix_mask, frcst_mask], dim = -1)
+        return einops.repeat(combined, f'... t -> ... {self.world.flat_token_pattern}', **self.world.token_sizes)
 
 # FRAME-WISE BERNOULLI PRIOR
 class KumaraswamyMasking(torch.nn.Module):
@@ -76,7 +70,7 @@ class KumaraswamyMasking(torch.nn.Module):
     def sample_prior(self, shape: tuple, rng: torch.Generator = None):
         if self.objective.stratify:
             t = torch.rand(shape[:-1] + (1,) + (self.num_events,), device=self.c1.device, generator=rng)
-            t = (t + torch.linspace(0, 1, shape[-1]).view(-1, 1)) % 1
+            t = (t + torch.linspace(0, 1, shape[-1], device=self.c1.device).view(-1, 1)) % 1
         else:
             t = torch.rand(shape + (self.num_events,), device=self.c1.device, generator=rng)
         t = t * (1.0 - 2.0 * self.epsilon) + self.epsilon
@@ -109,6 +103,7 @@ class KumaraswamyMasking(torch.nn.Module):
     def forward(self, shape: tuple, rng: torch.Generator = None) -> tuple[torch.BoolTensor, torch.FloatTensor]:
         t = self.sample_prior(shape, rng=rng)
         if self.objective.progressive: t = t.sort(0, descending = True).values
+        if self.objective.discretise: t = t.round(decimals=2)
         rates, weights = self.schedule(t)
         rates, weights = self.expand_events(rates, weights)
         masks = self.sample_masks(rates, rng=rng)

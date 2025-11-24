@@ -54,7 +54,7 @@ class Experiment(DistributedTrainer):
 
     @property
     def use_fair_crps(self):
-        return self.objective_cfg.train_ens > 1 
+        return True
     
     # DATA
     def lens_data(self):
@@ -197,11 +197,11 @@ class Experiment(DistributedTrainer):
         self.frcst_masking = ForecastMasking(
             world = self.world, 
             objective=self.objective_cfg
-            )
+            ).to(self.device)
         self.masking = KumaraswamyMasking(
             world = self.world, 
             objective=self.objective_cfg
-        )
+        ).to(self.device)
 
         model = MaskedPredictor(self.model_cfg, self.world)
         return model
