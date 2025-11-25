@@ -235,7 +235,7 @@ class JaggedPredictor(torch.nn.Module):
             noise = self.proj_noise(noise)
 
         # mask into jagged tensor
-        x = torch.nested.as_nested_tensor([x[i, m] for i, m in enumerate(mask)], layout=torch.jagged)
+        x = torch.nested.as_nested_tensor([x[i, m] for i, m in enumerate(mask.logical_not())], layout=torch.jagged)
         z = torch.nested.as_nested_tensor(z, layout=torch.jagged)
         q = torch.nested.as_nested_tensor(self.queries.weight.expand(tokens.size(0), -1, -1), layout=torch.jagged)
         
