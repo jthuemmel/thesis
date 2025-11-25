@@ -241,6 +241,7 @@ class DistributedTrainer(TrainerInterface):
         self.model = DistributedDataParallel(model, 
                                              device_ids=[self.local_rank], 
                                              output_device=self.local_rank, 
+                                             find_unused_parameters=False
                                              )
         if self.cfg.use_ema:
             self.ema_model = AveragedModel(self.model.module, multi_avg_fn=get_ema_multi_avg_fn(self.cfg.ema_decay))

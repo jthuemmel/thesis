@@ -70,8 +70,8 @@ class Attention(torch.nn.Module):
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
         self.to_k = torch.nn.Linear(dim, dim, bias = bias)
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
-        self.norm_q = torch.nn.LayerNorm(dim_heads, bias = bias) if qk_norm else torch.nn.Identity()
-        self.norm_k = torch.nn.LayerNorm(dim_heads, bias = bias) if qk_norm else torch.nn.Identity()
+        self.norm_q = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
+        self.norm_k = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:

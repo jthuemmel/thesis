@@ -15,7 +15,7 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 import utils.config as cfg
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
-from utils.model import MaskedPredictor
+from utils.model import MaskedPredictor, JaggedPredictor
 from utils.masking import *
 from utils.loss_fn import *
 
@@ -203,6 +203,7 @@ class Experiment(DistributedTrainer):
             objective=self.objective_cfg
         ).to(self.device)
 
+        #model = JaggedPredictor(self.model_cfg, self.world)
         model = MaskedPredictor(self.model_cfg, self.world)
         return model
     

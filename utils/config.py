@@ -109,7 +109,7 @@ class ObjectiveConfig:
     stratify: bool = True
     progressive: bool = False
     discretise: bool = False
-    event_dims: tuple = ('t',)
+    event_dims: List[str] = field(default_factory=lambda: ['t'])
     c1: float = 1.
     c0: float = 1.
     epsilon: float = 0.05

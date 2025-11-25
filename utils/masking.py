@@ -13,7 +13,7 @@ class ForecastMasking(torch.nn.Module):
         
 
     def forward(self, shape: tuple):
-        frcst_mask = torch.ones(shape + (self.frcst_frames,), device = self.tau.device, dtype = torch.bool)
+        frcst_mask = torch.ones(shape + (self.frcst_frames,), device = self.frcst_frames.device, dtype = torch.bool)
         prefix_mask = frcst_mask.new_zeros(shape + (self.prefix_frames,))
         combined = torch.cat([prefix_mask, frcst_mask], dim = -1)
         return einops.repeat(combined, f'... t -> ... {self.world.flat_token_pattern}', **self.world.token_sizes)
