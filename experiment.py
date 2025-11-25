@@ -203,8 +203,10 @@ class Experiment(DistributedTrainer):
             objective=self.objective_cfg
         ).to(self.device)
 
-        #model = JaggedPredictor(self.model_cfg, self.world)
-        model = MaskedPredictor(self.model_cfg, self.world)
+        if self.model_cfg.backbone == 'jagged':
+            model = JaggedPredictor(self.model_cfg, self.world)
+        else:
+            model = MaskedPredictor(self.model_cfg, self.world)
         return model
     
     # LOSS
