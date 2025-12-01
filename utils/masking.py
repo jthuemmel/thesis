@@ -12,18 +12,15 @@ class ForecastMasking(torch.nn.Module):
         self.register_buffer("prefix_frames", torch.tensor(objective.tau, dtype = torch.long))
         self.register_buffer("frcst_frames", torch.tensor(world.token_sizes["t"] - objective.tau, dtype = torch.long))
     
-    def expand_events(self, *args):
-        return einops.repeat(
-            [*args],
-            f'args ... {self.event_pattern} -> args ... {self.world.flat_token_pattern}', 
-            **self.world.token_sizes
-            )
-
     def forward(self, shape: tuple):
         frcst_mask = torch.ones(shape + (self.frcst_frames,), device = self.frcst_frames.device, dtype = torch.bool)
         prefix_mask = frcst_mask.new_zeros(shape + (self.prefix_frames,))
         combined = torch.cat([prefix_mask, frcst_mask], dim = -1)
-        return self.expand_events(combined)
+        return einops.repeat(
+            combined,
+            f'... {self.event_pattern} -> ... {self.world.flat_token_pattern}', 
+            **self.world.token_sizes
+            )
 
 # FRAME-WISE BERNOULLI PRIOR
 class KumaraswamyMasking(torch.nn.Module):
