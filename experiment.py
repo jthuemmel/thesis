@@ -60,24 +60,29 @@ class Experiment(DistributedTrainer):
     def lens_data(self):
         if not hasattr(self, "_lens_data"):
             lens_config = self.data_cfg
-            #lens_config = replace(lens_config, stats = default(self.data_cfg.stats, cfg.LENS_STATS))
-            lens_config = replace(lens_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
+            lens_config = replace(lens_config, 
+                                  time_slice = {"start": "1850", "stop": "2000", "step": None},
+                                  stats = default(self.data_cfg.stats, cfg.LENS_STATS)
+                                  )
             self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
         return self._lens_data       
 
     def godas_data(self):
         if not hasattr(self, "_godas_data"):
             godas_config = self.data_cfg
-            #godas_config = replace(godas_config, stats = default(self.data_cfg.stats, cfg.GODAS_STATS))
-            godas_config = replace(godas_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
+            godas_config = replace(godas_config, 
+                                   time_slice = {"start": "1980", "stop": "2020", "step": None},
+                                   stats = default(self.data_cfg.stats, cfg.GODAS_STATS)
+                                   )
             self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
 
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
             picontrol_config = self.data_cfg
-            #picontrol_config = replace(picontrol_config, stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
-            picontrol_config = replace(picontrol_config, time_slice = {"start": "1900", "stop": "2000", "step": None})
+            picontrol_config = replace(picontrol_config, 
+                                       time_slice = {"start": "1900", "stop": "2000", "step": None},
+                                       stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
