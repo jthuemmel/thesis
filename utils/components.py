@@ -65,7 +65,7 @@ class GatedFFN(torch.nn.Module):
 class Attention(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False, qk_norm: bool = True):
         super().__init__()
-        self.split_heads = Rearrange('... n (h d) -> (...) h n d', d = dim_heads)
+        self.split_heads = Rearrange('... n (h d) -> ... h n d', d = dim_heads)
         self.merge_heads = Rearrange('... h n d -> ... n (h d)')
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
         self.to_k = torch.nn.Linear(dim, dim, bias = bias)
@@ -75,15 +75,12 @@ class Attention(torch.nn.Module):
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
-        B, groups = q.size(0), q.ndim == 4 #remember the original batch size and whether there was a leading dimension
         q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
         q = self.norm_q(q)
         k = self.norm_k(k)
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = self.merge_heads(attn)
-        if groups: out = rearrange(out, '(b g) ... -> b g ...', b = B)
         out = self.to_out(out)
         return out
 
