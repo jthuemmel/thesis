@@ -70,8 +70,8 @@ class Attention(torch.nn.Module):
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
         self.to_k = torch.nn.Linear(dim, dim, bias = bias)
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
-        self.norm_q = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
-        self.norm_k = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
+        self.norm_q = torch.nn.LayerNorm(dim_heads, bias=False) if qk_norm else torch.nn.Identity()
+        self.norm_k = torch.nn.LayerNorm(dim_heads, bias=False) if qk_norm else torch.nn.Identity()
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
@@ -79,7 +79,8 @@ class Attention(torch.nn.Module):
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
         q = self.norm_q(q)
         k = self.norm_k(k)
-        attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = self.merge_heads(attn)
         out = self.to_out(out)
         return out
@@ -112,11 +113,11 @@ class SelfConditioning(torch.nn.Module):
         return x
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
+    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, qk_norm: bool = True, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
-        self.att = Attention(dim, dim_heads)
+        self.att = Attention(dim, dim_heads, qk_norm = qk_norm)
         self.ffn = GatedFFN(dim)
         self.has_skip = has_skip
 
