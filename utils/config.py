@@ -80,6 +80,7 @@ class NetworkConfig:
     num_latents: Optional[int] = None
     num_compute_blocks: Optional[int] = None
     num_cls: Optional[int] = None
+    num_tails: Optional[int] = None
     dim_in: Optional[int] = None
     dim_out: Optional[int] = None
     dim_noise: Optional[int] = None
@@ -105,13 +106,23 @@ class DatasetConfig:
 
 @dataclass
 class ObjectiveConfig:
+    # frcst context
     tau: int = 2
+    # args for masked diffusion sampling
     stratify: bool = True
     progressive: bool = False
     discretise: bool = False
+    # event dims for prior
     event_dims: List[str] = field(default_factory=lambda: ['t'])
+    # kumaraswamy concentrations
     c1: float = 1.
     c0: float = 1.
+    # dirichlet concentration
+    alpha: float = 0.5
+    # multinomial bounds
+    k_min: int = 0
+    k_max: int = 2880
+    # schedule bounded [eps, 1-eps]
     epsilon: float = 0.05
 
 @dataclass
