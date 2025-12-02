@@ -20,8 +20,8 @@ class EinMask(torch.nn.Module):
         self.to_fields = EinMix(
             pattern=f"b {world.flat_token_pattern} d -> {world.field_pattern} e", 
             weight_shape=f'e v {world.patch_pattern} d', 
-            bias_shape=f'e v {world.patch_pattern}',
-            d = network.dim, e = network.num_tails, **world.patch_sizes, **world.token_sizes 
+            d = network.dim, e = network.num_tails, 
+            **world.patch_sizes, **world.token_sizes 
             )
         
         # embeddings
@@ -61,7 +61,7 @@ class EinMask(torch.nn.Module):
         if isinstance(m, EinMix):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
             if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
+                torch.nn.init.trunc_normal_(m.bias, std = 0.02)
         # conditional layer norm
         if isinstance(m, ConditionalLayerNorm):
             if m.bias is not None:
@@ -81,7 +81,7 @@ class EinMask(torch.nn.Module):
         # apply flamingo-style transformer
         for block in self.transformer:
             kv = torch.cat([tokens, latents], dim = 1)
-            latents = block(q = latents, kv = kv, is_causal = True)
+            latents = block(q = latents, kv = kv)
         queries = self.write(q = queries, kv = latents)
         # linear tail prediction
         fields = self.to_fields(queries)
