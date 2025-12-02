@@ -15,7 +15,7 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 import utils.config as cfg
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
-from utils.model import MaskedPredictor, JaggedPredictor
+from utils.einmask import EinMask
 from utils.masking import *
 from utils.loss_fn import *
 
@@ -54,7 +54,7 @@ class Experiment(DistributedTrainer):
 
     @property
     def use_fair_crps(self):
-        return True
+        return False
     
     # DATA
     def lens_data(self):
@@ -203,15 +203,12 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             objective=self.objective_cfg
             ).to(self.device)
-        self.masking = KumaraswamyMasking(
+        self.masking = DirichletMasking(
             world = self.world, 
             objective=self.objective_cfg
         ).to(self.device)
 
-        if self.model_cfg.backbone == 'jagged':
-            model = JaggedPredictor(self.model_cfg, self.world)
-        else:
-            model = MaskedPredictor(self.model_cfg, self.world)
+        model = EinMask(network=self.model_cfg, world=self.world)
         return model
     
     # LOSS
@@ -273,47 +270,29 @@ class Experiment(DistributedTrainer):
     
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
-        tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        masks = self.frcst_masking(shape=(1, batch.size(0)))
-        prediction, _ = model(tokens, masks, E = 4, rng = self.generator)
-        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
+
+        src = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
+
+        prediction = model(batch, src)
+        prediction = prediction * self.land_sea_mask[..., None]
+        prediction = prediction.sort(dim=-1).values
         return prediction
 
     def forward_step(self, batch_idx, batch):
         batch = batch.to(self.device)
-        tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        
-        # sample mask (and weight) sequence of length S (shape: 1, B, N)
-        mask_sequence, weight_sequence = self.masking(shape=(1, batch.size(0)), rng = self.generator)
-        
-        # self-conditioning via repeated masks:
-        #if torch.rand((1,)).item() < self.objective_cfg.conditioning_rate:
-        #   mask_sequence = mask_sequence.expand(2, -1, -1)
 
-        # forward model (returns ensemble prediction for the final mask: B, N, C, E)
-        prediction, _ = model(tokens = tokens, masks = mask_sequence, E = 4, rng = self.generator)
-        
-        # reshape to field format
-        prediction = self.tokens_to_field(prediction) 
-        mask = self.mask_to_field(mask_sequence[-1, :, :])
-        weight = self.mask_to_field(weight_sequence[-1, :, :])
+        src, tgt, weight = self.masking((batch.size(0),), rng = self.generator)
 
-        #loss and metrics are only calculated for masked (i.e. predicted) tokens in the sea
-        mask = torch.logical_and(mask, self.land_sea_mask)
-        
-        # set all land pixels to 0 manually
-        prediction = prediction * self.land_sea_mask[..., None]
+        prediction = model(batch, src)
 
-        # calculate weighted loss
+        mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
 
-        # calculate additional metrics
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
-        # update step counter
         self.step_counter = self.step_counter + 1
         return loss
     
@@ -355,7 +334,7 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 21, ens = 0).plot()
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 21).mean('ens').plot()
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 
