@@ -10,10 +10,10 @@ class ForecastMasking(torch.nn.Module):
         self.objective = objective
         self.event_pattern = 't'
         self.register_buffer("prefix_frames", torch.tensor(objective.tau, dtype = torch.long))
-        self.register_buffer("frcst_frames", torch.tensor(world.token_sizes["t"] - objective.tau, dtype = torch.long))
+        self.register_buffer("total_frames", torch.tensor(world.token_sizes["t"], dtype = torch.long))
     
     def forward(self, shape: tuple, return_indices: bool = True):
-        mask = torch.zeros((self.frcst_frames,), device = self.frcst_frames.device)
+        mask = torch.zeros((self.total_frames,), device = self.total_frames.device)
         mask[:self.prefix_frames] = 1
         mask = einops.repeat(mask, f'{self.event_pattern} -> {self.world.flat_token_pattern}', **self.world.token_sizes)
         if return_indices:
@@ -159,6 +159,6 @@ class DirichletMasking(torch.nn.Module):
     def forward(self, shape: tuple, rng: torch.Generator = None):
         prior = self.sample_dirichlet(shape, rng)
         k, w = self.sample_rate(rng)
-        src = torch.multinomial(prior, k, generator=rng)
+        src = torch.multinomial(prior, int(k), generator=rng)
         mask = torch.ones_like(prior, dtype= torch.bool).scatter_(1, src, False)
         return src, mask, w
