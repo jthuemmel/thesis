@@ -334,7 +334,7 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 21).mean('ens').plot()
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot()
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 
@@ -424,11 +424,11 @@ class Experiment(DistributedTrainer):
 
     @staticmethod
     def get_nino4(da: xr.DataArray):
-        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
     
     @staticmethod
     def get_nino34(da: xr.DataArray):
-        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
 
     @staticmethod
     def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
