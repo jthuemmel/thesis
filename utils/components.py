@@ -34,7 +34,7 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
         # register buffer and optional projection
         self.register_buffer("freqs", freqs)  # shape (n_coords, dim_per_coord // 2)
         self.embedding_dim = len(wavelengths) * (d_half * 2) #make sure the embedding dim is correct even if d_half rounds
-        self.proj = torch.nn.Identity() if exists(model_dim) else torch.nn.Linear(self.embedding_dim, model_dim)
+        self.proj = torch.nn.Linear(self.embedding_dim, model_dim) if exists(model_dim) else torch.nn.Identity()
 
     def forward(self, coordinates: torch.Tensor):
         with torch.amp.autocast(enabled = False, device_type = coordinates.device.type): # overflows fp16 if not careful
