@@ -186,7 +186,7 @@ class TrainerConfig:
     wb_tags: Optional[List[str]] = None
 
     # Optimization
-    epochs: int = 1
+    epochs: Optional[int] = 1
 
     use_zero: bool = False
     lr: float = 1e-4
