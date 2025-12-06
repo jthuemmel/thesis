@@ -106,6 +106,8 @@ class DatasetConfig:
 
 @dataclass
 class ObjectiveConfig:
+    # prior
+    prior: str = 'dirichlet'
     # frcst context
     tau: int = 2
     # args for masked diffusion sampling

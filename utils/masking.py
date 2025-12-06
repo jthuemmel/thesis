@@ -121,7 +121,7 @@ class BernoulliMasking(torch.nn.Module):
         masks = self.sample_masks(rates, rng=rng)
         return masks, weights
     
-class DirichletMasking(torch.nn.Module):
+class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
         super().__init__()
         # configs
@@ -145,10 +145,11 @@ class DirichletMasking(torch.nn.Module):
     
 
     def sample_dirichlet(self, shape: tuple, rng: torch.Generator = None):
-        dirichlet = torch._sample_dirichlet(self.alpha.expand(*shape, -1), generator=rng)
-        return einops.repeat(dirichlet, 
-                             f'... {self.event_pattern} -> ... {self.world.flat_token_pattern}', 
-                             **self.world.token_sizes)
+        return torch._sample_dirichlet(self.alpha.expand(*shape, -1), generator=rng)
+    
+    def sample_binomial(self, shape: tuple, rng: torch.Generator = None):
+        u = torch.rand((2, *shape, self.num_events), generator=rng, device = self.alpha.device)
+        return torch.where(u[0] > self.alpha, u[1], 1e-7)
     
     def sample_rate(self, rng: torch.Generator = None):
         t = torch.rand((1,), device= self.alpha.device, generator=rng)
@@ -157,8 +158,12 @@ class DirichletMasking(torch.nn.Module):
         return k, w
     
     def forward(self, shape: tuple, rng: torch.Generator = None):
-        prior = self.sample_dirichlet(shape, rng)
+        prior_fn = getattr(self, f"sample_{self.objective.prior}")
+        prior = einops.repeat(prior_fn(shape, rng), 
+                             f'... {self.event_pattern} -> ... {self.world.flat_token_pattern}', 
+                             **self.world.token_sizes)
         k, w = self.sample_rate(rng)
         src = torch.multinomial(prior, int(k), generator=rng)
         mask = torch.ones_like(prior, dtype= torch.bool).scatter_(1, src, False)
         return src, mask, w
+    
