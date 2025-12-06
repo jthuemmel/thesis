@@ -11,10 +11,10 @@ class EinMask(torch.nn.Module):
         super().__init__()
         # I/O
         self.to_tokens = EinMix(
-            pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} d", 
-            weight_shape=f'v d {world.patch_pattern}', 
-            bias_shape=f'{world.flat_token_pattern} d', # token-wise bias
-            d = network.dim, **world.patch_sizes, **world.token_sizes
+            pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} di", 
+            weight_shape=f'v di {world.patch_pattern}', 
+            #bias_shape=f'{world.flat_token_pattern} di', # token-wise bias
+            di = network.dim_in, **world.patch_sizes, **world.token_sizes
             )
         
         self.to_fields = EinMix(
@@ -23,12 +23,21 @@ class EinMask(torch.nn.Module):
             d = network.dim, e = network.num_tails, 
             **world.patch_sizes, **world.token_sizes 
             )
-        
-        # embeddings
-        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
-        self.queries = torch.nn.Embedding(world.num_tokens, network.dim)
 
-        # flamingo
+        # position embedding
+        self.positions = ContinuousPositionalEmbedding(network.dim_coords, network.wavelengths, network.dim - network.dim_in)
+        self.register_buffer(
+            "coordinates",
+            torch.stack(
+                torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape),
+                dim = -1)
+        )
+
+        # learnable embeddings
+        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
+        self.queries = torch.nn.Embedding(world.num_tokens, network.dim_in)
+
+        # flamingo transformer
         self.transformer = torch.nn.ModuleList([
             TransformerBlock(
                 dim =network.dim, 
@@ -72,10 +81,16 @@ class EinMask(torch.nn.Module):
     def forward(self, fields, context):
         # linear embedding + token-wise bias
         tokens = self.to_tokens(fields)
-        # expand shapes
+        # positional codes
+        positions = self.positions(self.coordinates)
+        # expand shapes (d = dc + di)
         latents = einops.repeat(self.latents.weight, 'm d -> b m d', b = tokens.size(0))
-        queries = einops.repeat(self.queries.weight, 'n d -> b n d', b = tokens.size(0))
-        context = einops.repeat(context, 'b n -> b n d', d = tokens.size(-1))
+        queries = einops.repeat(self.queries.weight, 'n di -> b n di', b = tokens.size(0))
+        positions = einops.repeat(positions, "n dc -> b n dc", b = tokens.size(0))
+        context = einops.repeat(context, 'b n -> b n d', d = latents.size(-1))
+        # concatenate position codes
+        tokens = torch.cat([tokens, positions], dim = -1)
+        queries = torch.cat([queries, positions], dim = -1)
         # encode only context tokens
         tokens = tokens.gather(1, context)
         # apply flamingo-style transformer
