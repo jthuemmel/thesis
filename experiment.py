@@ -203,7 +203,7 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             objective=self.objective_cfg
             ).to(self.device)
-        self.masking = DirichletMasking(
+        self.masking = MultinomialMasking(
             world = self.world, 
             objective=self.objective_cfg
         ).to(self.device)
@@ -400,7 +400,7 @@ class Experiment(DistributedTrainer):
         nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
         nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
         nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
-        for lag in [3, 9, 15, 21]:
+        for lag in [3, 9, 15, 18, 21]:
             self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).item())
             self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).item())
         
