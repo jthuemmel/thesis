@@ -13,7 +13,6 @@ class EinMask(torch.nn.Module):
         self.to_tokens = EinMix(
             pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} di", 
             weight_shape=f'v di {world.patch_pattern}', 
-            #bias_shape=f'{world.flat_token_pattern} di', # token-wise bias
             di = network.dim_in, **world.patch_sizes, **world.token_sizes
             )
         
@@ -40,16 +39,18 @@ class EinMask(torch.nn.Module):
         # flamingo transformer
         self.transformer = torch.nn.ModuleList([
             TransformerBlock(
-                dim =network.dim, 
-                dim_heads=network.dim_heads, 
-                dim_ctx = network.dim_noise
+                dim = network.dim, 
+                dim_heads = network.dim_heads, 
+                dim_ctx = network.dim_noise,
+                drop_path = network.drop_path,
                 ) 
                 for _ in range(network.num_layers)
             ])
         self.write = TransformerBlock(
-                dim =network.dim, 
-                dim_heads=network.dim_heads, 
+                dim = network.dim, 
+                dim_heads = network.dim_heads, 
                 dim_ctx = network.dim_noise,
+                has_skip = False
                 )
 
         # Weight initialization
@@ -70,7 +71,7 @@ class EinMask(torch.nn.Module):
         if isinstance(m, EinMix):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
             if m.bias is not None:
-                torch.nn.init.trunc_normal_(m.bias, std = 0.02)
+                torch.nn.init.zeros_(m.bias)
         # conditional layer norm
         if isinstance(m, ConditionalLayerNorm):
             if m.bias is not None:
