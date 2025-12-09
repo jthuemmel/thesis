@@ -255,7 +255,9 @@ class Experiment(DistributedTrainer):
         return loss
 
     def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-        m, w_m, w_v = map(lambda x: x.float().mean(dim = (-1, -2)), (mask, mask_weight, self.per_variable_weights))
+        m = mask.float().mean(dim = (-1, -2))
+        w_v = self.per_variable_weights.mean(dim = (-1, -2))
+        w_m = mask_weight if mask_weight.numel() == 1 else mask_weight.mean(dim = (-1, -2))
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
@@ -338,6 +340,13 @@ class Experiment(DistributedTrainer):
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 
+        if self.is_root and self.current_epoch == self.total_epochs:
+            self.write_to_disk(ds)
+
+    def write_to_disk(self, data: xr.Dataset):
+        path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
+        data.to_zarr(path, mode = "w")
+
     def get_xarray_dataset(self, batch_idx, pred, obs):
         #meta data
         meta_data = self.val_dataset.dataset
@@ -392,14 +401,27 @@ class Experiment(DistributedTrainer):
             pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            
             self.current_metrics.log_metric(f"{var}_pcc", pcc.item())
             self.current_metrics.log_metric(f"{var}_ssr", ssr.item())
             self.current_metrics.log_metric(f"{var}_rmse", rmse.item())
 
     def get_nino_metrics(self, eval_data: xr.Dataset):
         nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        nino4_tgt, nino4_pred = self.get_nino4(eval_data["temp_ocn_0a_tgt"]), self.get_nino4(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        
         nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
-        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
+        nino4_pcc = self.xr_pcc(nino4_pred, nino4_tgt, ("time",))
+
+        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))
+        nino4_rmse = self.xr_rmse(nino4_pred, nino4_tgt, ("time",))
+
+        nino4_thresh_month =  np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
+        nino34_thresh_month = np.argwhere(nino34_pcc.values > 0.5).max(initial=0)
+
+        self.current_metrics.log_metric('nino4_pcc_month', float(nino4_thresh_month))
+        self.current_metrics.log_metric('nino34_pcc_month', float(nino34_thresh_month))
+
         for lag in [3, 9, 15, 18, 21]:
             self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).item())
             self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).item())
@@ -424,11 +446,11 @@ class Experiment(DistributedTrainer):
 
     @staticmethod
     def get_nino4(da: xr.DataArray):
-        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
     
     @staticmethod
     def get_nino34(da: xr.DataArray):
-        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
 
     @staticmethod
     def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
