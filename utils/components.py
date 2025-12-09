@@ -42,6 +42,20 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
             emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
         emb = rearrange(emb, "... n d two -> ... (n d two)")
         return self.proj(emb)
+    
+class DropPath(torch.nn.Module):
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor):
+        if not self.training or self.drop_prob == 0.:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x * random_tensor.div(keep_prob)
+
 
 class SwiGLU(torch.nn.Module):
     def forward(self, x: torch.Tensor):
@@ -113,10 +127,17 @@ class SelfConditioning(torch.nn.Module):
         return x
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, qk_norm: bool = True, **kwargs):
+    def __init__(self, 
+                 dim: int, 
+                 dim_heads: int = 64, 
+                 dim_ctx: Optional[int] = None, 
+                 drop_path: float = 0.,
+                 has_skip: bool = True, 
+                 qk_norm: bool = True, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
+        self.drop_path = DropPath(drop_path)
         self.att = Attention(dim, dim_heads, qk_norm = qk_norm)
         self.ffn = GatedFFN(dim)
         self.has_skip = has_skip
@@ -125,8 +146,8 @@ class TransformerBlock(torch.nn.Module):
         skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
         kv = kv if kv is not None else q
-        q = skip + self.att(q, kv, kv, **attn_kwargs)
-        q = q + self.ffn(self.ffn_norm(q, ctx))
+        q = skip + self.drop_path(self.att(q, kv, kv, **attn_kwargs))
+        q = q + self.drop_path(self.ffn(self.ffn_norm(q, ctx)))
         return q
 
 class InterfaceBlock(torch.nn.Module):
