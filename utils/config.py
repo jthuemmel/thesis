@@ -86,6 +86,7 @@ class NetworkConfig:
     dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
+    drop_path: Optional[float] = 0.0
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
     use_checkpoint: Optional[bool] = True
