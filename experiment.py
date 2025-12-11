@@ -416,8 +416,8 @@ class Experiment(DistributedTrainer):
         nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))
         nino4_rmse = self.xr_rmse(nino4_pred, nino4_tgt, ("time",))
 
-        nino4_thresh_month =  np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
-        nino34_thresh_month = np.argwhere(nino34_pcc.values > 0.5).max(initial=0)
+        nino4_thresh_month =  1 + np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
+        nino34_thresh_month = 1 + np.argwhere(nino34_pcc.values > 0.5).max(initial=0)
 
         self.current_metrics.log_metric('nino4_pcc_month', float(nino4_thresh_month))
         self.current_metrics.log_metric('nino34_pcc_month', float(nino34_thresh_month))
