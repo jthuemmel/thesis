@@ -8,9 +8,9 @@ class SphericalDiffusionNoise(torch.nn.Module):
     def __init__(
             self,
             num_channels: int,
-            nsteps: int = 36,
-            nlat: int = 180,
-            nlon: int = 360,
+            num_steps: int = 36,
+            num_lat: int = 180,
+            num_lon: int = 360,
             sigma: float | list = 1.0,
             horizontal_length: float | list = 500., # correlation length w.r.t the earth radius
             temporal_length: float = 1.0, # correlation length w.r.t dt = 1
@@ -19,29 +19,23 @@ class SphericalDiffusionNoise(torch.nn.Module):
             lon_slice: slice=slice(90, 330, 2),
         ):
         """
-        A Random Field derived from a gaussian Diffusion Process on the sphere:
-
+        A Random Field derived from a gaussian Diffusion Process on the sphere.
         For details see https://www.ecmwf.int/sites/default/files/elibrary/2009/11577-stochastic-parametrization-and-model-uncertainty.pdf,
         appendix 8.1.
         """
         super().__init__()
         #regional slices
-        self.lat_slice = default(lat_slice, slice(0, nlat, 1))
+        self.lat_slice = default(lat_slice, slice(0, num_lat, 1))
         self.lon_slice = default(lon_slice, slice(0, lon_slice, 1))
 
         # Number of latitudinal modes.
-        self.nlat = nlat
-        self.nlon = nlon
-        self.nsteps = nsteps
+        self.nlat = num_lat
+        self.nlon = num_lon
+        self.nsteps = num_steps
         self.num_channels = num_channels
 
         # Inverse SHT
         self.isht = torch_harmonics.InverseRealSHT(self.nlat, self.nlon, grid=grid_type)
-        self.lmax_local = self.isht.lmax
-        self.mmax_local = self.isht.mmax
-        self.nlat_local = self.nlat
-        self.nlon_local = self.nlon
-
         self.lmax = self.isht.lmax
         self.mmax = self.isht.mmax      
 
@@ -97,7 +91,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 # sample white noise
                 eta_l = torch.empty(
-                    (*shape, self.num_channels, self.nsteps, self.lmax_local, self.mmax_local, 2), 
+                    (*shape, self.num_channels, self.nsteps, self.lmax, self.mmax, 2), 
                     dtype=torch.float32, device=self.phi.device
                     )
                 # scale according to sigma
