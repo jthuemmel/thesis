@@ -12,8 +12,8 @@ class SphericalDiffusionNoise(torch.nn.Module):
             nlat: int = 180,
             nlon: int = 360,
             sigma: float | list = 1.0,
-            kT: float | list = 0.5 * (500.0 / 6370.0) ** 2,
-            lambd: float = 1.0,
+            spatial_length: float | list = 500., # correlation length w.r.t the earth radius
+            temporal_length: float = 1.0, # correlation length w.r.t dt = 1
             grid_type: str="equiangular",
             lat_slice: slice=slice(58, 122, 1),
             lon_slice: slice=slice(90, 330, 2),
@@ -46,21 +46,23 @@ class SphericalDiffusionNoise(torch.nn.Module):
         self.mmax = self.isht.mmax      
 
         # make sure kT is a torch.Tensor
-        if isinstance(kT, list):
-            kT = torch.as_tensor(kT)
-            assert len(kT.shape) == 1
-            assert kT.shape[0] == num_channels
+
+        if isinstance(spatial_length, list):
+            spatial_length = torch.as_tensor(spatial_length)
+            assert len(spatial_length.shape) == 1
+            assert spatial_length.shape[0] == num_channels
         else:
-            kT = torch.as_tensor([kT]).repeat(num_channels)
-        kT = kT.reshape(self.num_channels, 1)
-        # same for lambd
-        if isinstance(lambd, list):
-            lambd = torch.as_tensor(lambd)
-            assert len(lambd.shape) == 1
-            assert lambd.shape[0] == num_channels
+            spatial_length = torch.as_tensor([spatial_length]).repeat(num_channels)
+        spatial_length = spatial_length.reshape(self.num_channels, 1)
+        kT = 0.5 * (spatial_length / 6370.0) ** 2
+        # same for temporal_length
+        if isinstance(temporal_length, list):
+            temporal_length = torch.as_tensor(temporal_length)
+            assert len(temporal_length.shape) == 1
+            assert temporal_length.shape[0] == num_channels
         else:
-            lambd = torch.as_tensor([lambd]).repeat(num_channels)
-        lambd = lambd.reshape(self.num_channels, 1)
+            temporal_length = torch.as_tensor([temporal_length]).repeat(num_channels)
+        lambd = 1 / temporal_length.reshape(self.num_channels, 1)
 
         ls = torch.arange(self.lmax)
         ektllp1 = torch.exp(-kT * ls * (ls + 1))
