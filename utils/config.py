@@ -187,6 +187,7 @@ class TrainerConfig:
     use_wandb: bool = True
     wb_project: Optional[str] = None
     wb_tags: Optional[List[str]] = None
+    save_eval: bool = False
 
     # Optimization
     epochs: Optional[int] = 1

@@ -340,7 +340,7 @@ class Experiment(DistributedTrainer):
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 
-        if self.is_root and self.current_epoch == self.total_epochs:
+        if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
             self.write_to_disk(ds)
 
     def write_to_disk(self, data: xr.Dataset):
