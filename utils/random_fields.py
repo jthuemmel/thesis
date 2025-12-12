@@ -11,12 +11,12 @@ class SphericalDiffusionNoise(torch.nn.Module):
             nsteps: int = 36,
             nlat: int = 180,
             nlon: int = 360,
-            sigma=1.0,
-            kT=0.5 * (500.0 / 6370.0) ** 2,
-            lambd=1.0,
-            grid_type="equiangular",
-            lat_slice=slice(58, 122, 1),
-            lon_slice=slice(90,330,2),
+            sigma: float | list = 1.0,
+            kT: float | list = 0.5 * (500.0 / 6370.0) ** 2,
+            lambd: float = 1.0,
+            grid_type: str="equiangular",
+            lat_slice: slice=slice(58, 122, 1),
+            lon_slice: slice=slice(90, 330, 2),
         ):
         """
         A Random Field derived from a gaussian Diffusion Process on the sphere:
