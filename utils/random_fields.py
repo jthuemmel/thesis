@@ -12,7 +12,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
             nlat: int = 180,
             nlon: int = 360,
             sigma: float | list = 1.0,
-            spatial_length: float | list = 500., # correlation length w.r.t the earth radius
+            horizontal_length: float | list = 500., # correlation length w.r.t the earth radius
             temporal_length: float = 1.0, # correlation length w.r.t dt = 1
             grid_type: str="equiangular",
             lat_slice: slice=slice(58, 122, 1),
@@ -47,14 +47,14 @@ class SphericalDiffusionNoise(torch.nn.Module):
 
         # make sure kT is a torch.Tensor
 
-        if isinstance(spatial_length, list):
-            spatial_length = torch.as_tensor(spatial_length)
-            assert len(spatial_length.shape) == 1
-            assert spatial_length.shape[0] == num_channels
+        if isinstance(horizontal_length, list):
+            horizontal_length = torch.as_tensor(horizontal_length)
+            assert len(horizontal_length.shape) == 1
+            assert horizontal_length.shape[0] == num_channels
         else:
-            spatial_length = torch.as_tensor([spatial_length]).repeat(num_channels)
-        spatial_length = spatial_length.reshape(self.num_channels, 1)
-        kT = 0.5 * (spatial_length / 6370.0) ** 2
+            horizontal_length = torch.as_tensor([horizontal_length]).repeat(num_channels)
+        horizontal_length = horizontal_length.reshape(self.num_channels, 1)
+        kT = 0.5 * (horizontal_length / 6378.0) ** 2 # scale = radius * sqrt(2 * kT)
         # same for temporal_length
         if isinstance(temporal_length, list):
             temporal_length = torch.as_tensor(temporal_length)
@@ -62,7 +62,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
             assert temporal_length.shape[0] == num_channels
         else:
             temporal_length = torch.as_tensor([temporal_length]).repeat(num_channels)
-        lambd = 1 / temporal_length.reshape(self.num_channels, 1)
+        lambd = 1 / temporal_length.reshape(self.num_channels, 1) # lambda = dt / scale
 
         ls = torch.arange(self.lmax)
         ektllp1 = torch.exp(-kT * ls * (ls + 1))
@@ -86,8 +86,8 @@ class SphericalDiffusionNoise(torch.nn.Module):
         discount = toeplitz.flip(dims = (1,)) # reversed strides
 
         # expand and register
-        phi = einops.repeat(phi, 'c 1 -> c t l m u', t = self.nsteps, l = self.lmax_local, m = self.mmax_local, u = 2)
-        sigma_l = einops.repeat(sigma_l, 'c l -> c t l m u', t = self.nsteps, l = self.lmax_local, m = self.mmax_local, u = 2)
+        phi = einops.rearrange(phi, 'c 1 -> c 1 1 1 1')
+        sigma_l = einops.rearrange(sigma_l, 'c l -> c 1 l 1 1')
         self.register_buffer("phi", phi, persistent=False)
         self.register_buffer("sigma_l", sigma_l, persistent=False)
         self.register_buffer("discount", discount, persistent=False)
@@ -95,10 +95,12 @@ class SphericalDiffusionNoise(torch.nn.Module):
     def forward(self, shape, rng = None):
         with torch.no_grad():
             with torch.amp.autocast(device_type="cuda", enabled=False):
+                # sample white noise
                 eta_l = torch.empty(
                     (*shape, self.num_channels, self.nsteps, self.lmax_local, self.mmax_local, 2), 
                     dtype=torch.float32, device=self.phi.device
                     )
+                # scale according to sigma
                 state = self.sigma_l * eta_l.normal_(generator = rng)
                 # the very first element in the time history requires a different weighting to sample the stationary distribution
                 state[..., 0, :, :, :] = state[..., 0, :, :, :] / torch.sqrt(1.0 - self.phi[..., 0, :, :, :]**2)
