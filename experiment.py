@@ -278,7 +278,7 @@ class Experiment(DistributedTrainer):
 
         prediction = model(batch, src)
         prediction = prediction * self.land_sea_mask[..., None]
-        prediction = prediction.sort(dim=-1).values
+        #prediction = prediction.sort(dim=-1).values
         return prediction
 
     def forward_step(self, batch_idx, batch):

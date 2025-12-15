@@ -11,9 +11,9 @@ class SphericalDiffusionNoise(torch.nn.Module):
             num_steps: int = 36,
             num_lat: int = 180,
             num_lon: int = 360,
-            sigma: float | list = 1.0,
+            sigma: float = 1.0,
             horizontal_length: float | list = 500., # correlation length w.r.t the earth radius
-            temporal_length: float = 1.0, # correlation length w.r.t dt = 1
+            temporal_length: float | list  = 1.0, # correlation length w.r.t dt = 1
             grid_type: str="equiangular",
             lat_slice: slice=slice(58, 122, 1),
             lon_slice: slice=slice(90, 330, 2),
