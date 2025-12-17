@@ -123,8 +123,8 @@ class ObjectiveConfig:
     # dirichlet concentration
     alpha: float = 0.5
     # multinomial bounds
-    k_min: int = 0
-    k_max: int = 2880
+    k_min: Optional[int] = None
+    k_max: Optional[int] = None
     # schedule bounded [eps, 1-eps]
     epsilon: float = 0.05
 

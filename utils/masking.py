@@ -1,7 +1,7 @@
 import torch
 import einops
 from math import prod
-from utils.config import WorldConfig, ObjectiveConfig
+from utils.config import WorldConfig, ObjectiveConfig, default
     
 class ForecastMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
@@ -132,8 +132,8 @@ class MultinomialMasking(torch.nn.Module):
         self.schedule = KumaraswamySchedule(objective=objective)
 
         # attributes
-        self.k_min = objective.k_min
-        self.k_max = objective.k_max
+        self.k_min = default(objective.k_min, 1)
+        self.k_max = default(objective.k_max, world.num_tokens)
 
         # Events
         assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
