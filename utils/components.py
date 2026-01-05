@@ -34,7 +34,7 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
         # register buffer and optional projection
         self.register_buffer("freqs", freqs)  # shape (n_coords, dim_per_coord // 2)
         self.embedding_dim = len(wavelengths) * (d_half * 2) #make sure the embedding dim is correct even if d_half rounds
-        self.proj = torch.nn.Identity() if exists(model_dim) else torch.nn.Linear(self.embedding_dim, model_dim)
+        self.proj = torch.nn.Linear(self.embedding_dim, model_dim) if exists(model_dim) else torch.nn.Identity()
 
     def forward(self, coordinates: torch.Tensor):
         with torch.amp.autocast(enabled = False, device_type = coordinates.device.type): # overflows fp16 if not careful
@@ -42,6 +42,20 @@ class ContinuousPositionalEmbedding(torch.nn.Module):
             emb = torch.stack((angles.sin(), angles.cos()), dim=-1)
         emb = rearrange(emb, "... n d two -> ... (n d two)")
         return self.proj(emb)
+    
+class DropPath(torch.nn.Module):
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor):
+        if not self.training or self.drop_prob == 0.:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x * random_tensor.div(keep_prob)
+
 
 class SwiGLU(torch.nn.Module):
     def forward(self, x: torch.Tensor):
@@ -65,17 +79,16 @@ class GatedFFN(torch.nn.Module):
 class Attention(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False, qk_norm: bool = True):
         super().__init__()
-        self.split_heads = Rearrange('... n (h d) -> (...) h n d', d = dim_heads)
+        self.split_heads = Rearrange('... n (h d) -> ... h n d', d = dim_heads)
         self.merge_heads = Rearrange('... h n d -> ... n (h d)')
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
         self.to_k = torch.nn.Linear(dim, dim, bias = bias)
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
-        self.norm_q = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
-        self.norm_k = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
+        self.norm_q = torch.nn.LayerNorm(dim_heads, bias=False) if qk_norm else torch.nn.Identity()
+        self.norm_k = torch.nn.LayerNorm(dim_heads, bias=False) if qk_norm else torch.nn.Identity()
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
-        B, groups = q.size(0), q.ndim == 4 #remember the original batch size and whether there was a leading dimension
         q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
         q = self.norm_q(q)
@@ -83,7 +96,6 @@ class Attention(torch.nn.Module):
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = self.merge_heads(attn)
-        if groups: out = rearrange(out, '(b g) ... -> b g ...', b = B)
         out = self.to_out(out)
         return out
 
@@ -115,11 +127,18 @@ class SelfConditioning(torch.nn.Module):
         return x
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_heads: int = 64, dim_ctx: Optional[int] = None, has_skip: bool = True, **kwargs):
+    def __init__(self, 
+                 dim: int, 
+                 dim_heads: int = 64, 
+                 dim_ctx: Optional[int] = None, 
+                 drop_path: float = 0.,
+                 has_skip: bool = True, 
+                 qk_norm: bool = True, **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
-        self.att = Attention(dim, dim_heads)
+        self.drop_path = DropPath(drop_path)
+        self.att = Attention(dim, dim_heads, qk_norm = qk_norm)
         self.ffn = GatedFFN(dim)
         self.has_skip = has_skip
 
@@ -127,8 +146,8 @@ class TransformerBlock(torch.nn.Module):
         skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
         kv = kv if kv is not None else q
-        q = skip + self.att(q, kv, kv, **attn_kwargs)
-        q = q + self.ffn(self.ffn_norm(q, ctx))
+        q = skip + self.drop_path(self.att(q, kv, kv, **attn_kwargs))
+        q = q + self.drop_path(self.ffn(self.ffn_norm(q, ctx)))
         return q
 
 class InterfaceBlock(torch.nn.Module):

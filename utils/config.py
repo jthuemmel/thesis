@@ -80,11 +80,13 @@ class NetworkConfig:
     num_latents: Optional[int] = None
     num_compute_blocks: Optional[int] = None
     num_cls: Optional[int] = None
+    num_tails: Optional[int] = None
     dim_in: Optional[int] = None
     dim_out: Optional[int] = None
     dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
+    drop_path: Optional[float] = 0.0
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
     use_checkpoint: Optional[bool] = True
@@ -105,13 +107,25 @@ class DatasetConfig:
 
 @dataclass
 class ObjectiveConfig:
+    # prior
+    prior: str = 'dirichlet'
+    # frcst context
     tau: int = 2
+    # args for masked diffusion sampling
     stratify: bool = True
     progressive: bool = False
     discretise: bool = False
+    # event dims for prior
     event_dims: List[str] = field(default_factory=lambda: ['t'])
+    # kumaraswamy concentrations
     c1: float = 1.
     c0: float = 1.
+    # dirichlet concentration
+    alpha: float = 0.5
+    # multinomial bounds
+    k_min: Optional[int] = None
+    k_max: Optional[int] = None
+    # schedule bounded [eps, 1-eps]
     epsilon: float = 0.05
 
 @dataclass
@@ -173,9 +187,10 @@ class TrainerConfig:
     use_wandb: bool = True
     wb_project: Optional[str] = None
     wb_tags: Optional[List[str]] = None
+    save_eval: bool = False
 
     # Optimization
-    epochs: int = 1
+    epochs: Optional[int] = 1
 
     use_zero: bool = False
     lr: float = 1e-4

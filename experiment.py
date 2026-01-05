@@ -15,7 +15,7 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 import utils.config as cfg
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
-from utils.model import MaskedPredictor, JaggedPredictor
+from utils.einmask import EinMask
 from utils.masking import *
 from utils.loss_fn import *
 
@@ -54,30 +54,35 @@ class Experiment(DistributedTrainer):
 
     @property
     def use_fair_crps(self):
-        return True
+        return False
     
     # DATA
     def lens_data(self):
         if not hasattr(self, "_lens_data"):
             lens_config = self.data_cfg
-            #lens_config = replace(lens_config, stats = default(self.data_cfg.stats, cfg.LENS_STATS))
-            lens_config = replace(lens_config, time_slice = {"start": "1850", "stop": "2000", "step": None})
+            lens_config = replace(lens_config, 
+                                  time_slice = {"start": "1850", "stop": "2000", "step": None},
+                                  stats = default(self.data_cfg.stats, cfg.LENS_STATS)
+                                  )
             self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
         return self._lens_data       
 
     def godas_data(self):
         if not hasattr(self, "_godas_data"):
             godas_config = self.data_cfg
-            #godas_config = replace(godas_config, stats = default(self.data_cfg.stats, cfg.GODAS_STATS))
-            godas_config = replace(godas_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
+            godas_config = replace(godas_config, 
+                                   time_slice = {"start": "1980", "stop": "2020", "step": None},
+                                   stats = default(self.data_cfg.stats, cfg.GODAS_STATS)
+                                   )
             self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
 
     def picontrol_data(self):
         if not hasattr(self, "_picontrol_data"):
             picontrol_config = self.data_cfg
-            #picontrol_config = replace(picontrol_config, stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
-            picontrol_config = replace(picontrol_config, time_slice = {"start": "1900", "stop": "2000", "step": None})
+            picontrol_config = replace(picontrol_config, 
+                                       time_slice = {"start": "1900", "stop": "2000", "step": None},
+                                       stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
@@ -198,15 +203,12 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             objective=self.objective_cfg
             ).to(self.device)
-        self.masking = KumaraswamyMasking(
+        self.masking = MultinomialMasking(
             world = self.world, 
             objective=self.objective_cfg
         ).to(self.device)
 
-        if self.model_cfg.backbone == 'jagged':
-            model = JaggedPredictor(self.model_cfg, self.world)
-        else:
-            model = MaskedPredictor(self.model_cfg, self.world)
+        model = EinMask(network=self.model_cfg, world=self.world)
         return model
     
     # LOSS
@@ -253,7 +255,9 @@ class Experiment(DistributedTrainer):
         return loss
 
     def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-        m, w_m, w_v = map(lambda x: x.float().mean(dim = (-1, -2)), (mask, mask_weight, self.per_variable_weights))
+        m = mask.float().mean(dim = (-1, -2))
+        w_v = self.per_variable_weights.mean(dim = (-1, -2))
+        w_m = mask_weight if mask_weight.numel() == 1 else mask_weight.mean(dim = (-1, -2))
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
@@ -268,47 +272,29 @@ class Experiment(DistributedTrainer):
     
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
-        tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        masks = self.frcst_masking(shape=(1, batch.size(0)))
-        prediction, _ = model(tokens, masks, E = 4, rng = self.generator)
-        prediction = self.tokens_to_field(prediction) * self.land_sea_mask[..., None]
+
+        src = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
+
+        prediction = model(batch, src)
+        prediction = prediction * self.land_sea_mask[..., None]
+        #prediction = prediction.sort(dim=-1).values
         return prediction
 
     def forward_step(self, batch_idx, batch):
         batch = batch.to(self.device)
-        tokens = self.field_to_tokens(batch)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        
-        # sample mask (and weight) sequence of length S (shape: 1, B, N)
-        mask_sequence, weight_sequence = self.masking(shape=(1, batch.size(0)), rng = self.generator)
-        
-        # self-conditioning via repeated masks:
-        #if torch.rand((1,)).item() < self.objective_cfg.conditioning_rate:
-        #   mask_sequence = mask_sequence.expand(2, -1, -1)
 
-        # forward model (returns ensemble prediction for the final mask: B, N, C, E)
-        prediction, _ = model(tokens = tokens, masks = mask_sequence, E = 4, rng = self.generator)
-        
-        # reshape to field format
-        prediction = self.tokens_to_field(prediction) 
-        mask = self.mask_to_field(mask_sequence[-1, :, :])
-        weight = self.mask_to_field(weight_sequence[-1, :, :])
+        src, tgt, weight = self.masking((batch.size(0),), rng = self.generator)
 
-        #loss and metrics are only calculated for masked (i.e. predicted) tokens in the sea
-        mask = torch.logical_and(mask, self.land_sea_mask)
-        
-        # set all land pixels to 0 manually
-        prediction = prediction * self.land_sea_mask[..., None]
+        prediction = model(batch, src)
 
-        # calculate weighted loss
+        mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
 
-        # calculate additional metrics
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
-        # update step counter
         self.step_counter = self.step_counter + 1
         return loss
     
@@ -350,9 +336,16 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 21, ens = 0).plot()
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot()
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
+
+        if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
+            self.write_to_disk(ds)
+
+    def write_to_disk(self, data: xr.Dataset):
+        path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
+        data.to_zarr(path, mode = "w")
 
     def get_xarray_dataset(self, batch_idx, pred, obs):
         #meta data
@@ -408,15 +401,28 @@ class Experiment(DistributedTrainer):
             pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            
             self.current_metrics.log_metric(f"{var}_pcc", pcc.item())
             self.current_metrics.log_metric(f"{var}_ssr", ssr.item())
             self.current_metrics.log_metric(f"{var}_rmse", rmse.item())
 
     def get_nino_metrics(self, eval_data: xr.Dataset):
         nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        nino4_tgt, nino4_pred = self.get_nino4(eval_data["temp_ocn_0a_tgt"]), self.get_nino4(eval_data["temp_ocn_0a_pred"]).mean("ens")
+        
         nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
-        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))        
-        for lag in [3, 9, 15, 21]:
+        nino4_pcc = self.xr_pcc(nino4_pred, nino4_tgt, ("time",))
+
+        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))
+        nino4_rmse = self.xr_rmse(nino4_pred, nino4_tgt, ("time",))
+
+        nino4_thresh_month =  1 + np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
+        nino34_thresh_month = 1 + np.argwhere(nino34_pcc.values > 0.5).max(initial=0)
+
+        self.current_metrics.log_metric('nino4_pcc_month', float(nino4_thresh_month))
+        self.current_metrics.log_metric('nino34_pcc_month', float(nino34_thresh_month))
+
+        for lag in [3, 9, 15, 18, 21]:
             self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).item())
             self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).item())
         
