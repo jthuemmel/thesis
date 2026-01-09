@@ -112,6 +112,18 @@ class ConditionalLayerNorm(torch.nn.Module):
             scale, shift = self.bias.chunk(2, dim = -1)
         x = (1. + scale) * self.norm(x) + shift
         return x
+    
+class SelfConditioning(torch.nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.ffn = GatedFFN(dim)
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
+        self.scale = torch.nn.Parameter(torch.zeros(dim))
+
+    def forward(self, initial: torch.FloatTensor, previous: torch.FloatTensor = None):
+        previous = default(previous, torch.zeros_like(initial))
+        x = self.scale * self.norm(previous + self.ffn(previous)) + initial
+        return x
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, 
