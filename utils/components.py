@@ -56,7 +56,6 @@ class DropPath(torch.nn.Module):
         random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
         return x * random_tensor.div(keep_prob)
 
-
 class SwiGLU(torch.nn.Module):
     def forward(self, x: torch.Tensor):
         x1, x2 = x.chunk(2, dim=-1) 
@@ -114,18 +113,6 @@ class ConditionalLayerNorm(torch.nn.Module):
         x = (1. + scale) * self.norm(x) + shift
         return x
 
-class SelfConditioning(torch.nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.ffn = GatedFFN(dim)
-        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
-        self.scale = torch.nn.Parameter(torch.zeros(dim))
-
-    def forward(self, initial: torch.FloatTensor, previous: torch.FloatTensor = None):
-        previous = default(previous, torch.zeros_like(initial))
-        x = self.scale * self.norm(previous + self.ffn(previous)) + initial
-        return x
-
 class TransformerBlock(torch.nn.Module):
     def __init__(self, 
                  dim: int, 
@@ -145,7 +132,7 @@ class TransformerBlock(torch.nn.Module):
     def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
         skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
-        kv = kv if kv is not None else q
+        kv = self.att_norm(kv, ctx) if kv is not None else q
         q = skip + self.drop_path(self.att(q, kv, kv, **attn_kwargs))
         q = q + self.drop_path(self.ffn(self.ffn_norm(q, ctx)))
         return q
