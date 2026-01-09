@@ -32,7 +32,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
         self.nlat = num_lat
         self.nlon = num_lon
         self.nsteps = num_steps
-        self.num_channels = num_channels
+        self.nchannels = num_channels
 
         # Inverse SHT
         self.isht = torch_harmonics.InverseRealSHT(self.nlat, self.nlon, grid=grid_type)
@@ -47,7 +47,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
             assert horizontal_length.shape[0] == num_channels
         else:
             horizontal_length = torch.as_tensor([horizontal_length]).repeat(num_channels)
-        horizontal_length = horizontal_length.reshape(self.num_channels, 1)
+        horizontal_length = horizontal_length.reshape(self.nchannels, 1)
         kT = 0.5 * (horizontal_length / 6378.0) ** 2 # scale = radius * sqrt(2 * kT)
         # same for temporal_length
         if isinstance(temporal_length, list):
@@ -56,7 +56,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
             assert temporal_length.shape[0] == num_channels
         else:
             temporal_length = torch.as_tensor([temporal_length]).repeat(num_channels)
-        lambd = 1 / temporal_length.reshape(self.num_channels, 1) # lambda = dt / scale
+        lambd = 1 / temporal_length.reshape(self.nchannels, 1) # lambda = dt / scale
 
         ls = torch.arange(self.lmax)
         ektllp1 = torch.exp(-kT * ls * (ls + 1))
@@ -91,7 +91,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 # sample white noise
                 eta_l = torch.empty(
-                    (*shape, self.num_channels, self.nsteps, self.lmax, self.mmax, 2), 
+                    (*shape, self.nchannels, self.nsteps, self.lmax, self.mmax, 2), 
                     dtype=torch.float32, device=self.phi.device
                     )
                 # scale according to sigma
