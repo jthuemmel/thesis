@@ -24,8 +24,8 @@ class EinMask(torch.nn.Module):
             num_lon = 90,
             horizontal_length = einops.repeat(s, 's -> (s t)', t = len(t)),
             temporal_length = einops.repeat(t, 't -> (s t)', s = len(s)),
-            lat_slice=slice(14, -15, 1), # 16 latitudes ~ -32 to 32
-            lon_slice=slice(0, 60, 2) # 30 longitudes ~ 90 to 330
+            lat_slice=slice(14, -15, 1), # 16 latitudes ~ -32 to 32 with 4 deg res
+            lon_slice=slice(0, 60, 2) # 30 longitudes ~ 90 to 330 with 4 deg res and 2 step
         )
 
         # pre-compute positional embedding
@@ -102,11 +102,8 @@ class EinMask(torch.nn.Module):
 
     def forward(self, fields: torch.FloatTensor, visible: torch.LongTensor, E: int = 1, rng: torch.Generator = None) -> torch.FloatTensor:
         # visible: (S, B, v) or (B, v)
-        if visible.ndim == 2:
-            S, B = (1, visible.size(0))
-            visible = visible.unsqueeze(0)
-        else:
-            S, B = (visible.size(0), visible.size(1))
+        if visible.ndim == 2: visible = visible.unsqueeze(0)
+        S, B = (visible.size(0), visible.size(1))
 
         # expand to ensemble form
         xs = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
