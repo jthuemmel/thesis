@@ -12,11 +12,11 @@ class SphericalDiffusionNoise(torch.nn.Module):
             num_lat: int = 180,
             num_lon: int = 360,
             sigma: float = 1.0,
-            horizontal_length: float | list = 500., # correlation length w.r.t the earth radius
-            temporal_length: float | list  = 1.0, # correlation length w.r.t dt = 1
+            horizontal_length: float | list | torch.Tensor = 500., # correlation length w.r.t the earth radius
+            temporal_length: float | list| torch.Tensor  = 1.0, # correlation length w.r.t dt = 1
             grid_type: str="equiangular",
-            lat_slice: slice=slice(58, 122, 1),
-            lon_slice: slice=slice(90, 330, 2),
+            lat_slice: slice=None,
+            lon_slice: slice=None,
         ):
         """
         A Random Field derived from a gaussian Diffusion Process on the sphere.
@@ -39,23 +39,24 @@ class SphericalDiffusionNoise(torch.nn.Module):
         self.lmax = self.isht.lmax
         self.mmax = self.isht.mmax      
 
-        # make sure kT is a torch.Tensor
-
-        if isinstance(horizontal_length, list):
-            horizontal_length = torch.as_tensor(horizontal_length)
-            assert len(horizontal_length.shape) == 1
-            assert horizontal_length.shape[0] == num_channels
+        # make sure kT is a torch.Tensor of shape (nchannels, 1)
+        horizontal_length = torch.as_tensor(horizontal_length)
+        if horizontal_length.numel() == self.nchannels:
+            horizontal_length = horizontal_length.reshape(self.nchannels, 1)
+        elif horizontal_length.numel() == 1:
+            horizontal_length = horizontal_length.expand(self.nchannels, 1)
         else:
-            horizontal_length = torch.as_tensor([horizontal_length]).repeat(num_channels)
-        horizontal_length = horizontal_length.reshape(self.nchannels, 1)
+            raise ValueError("horizontal_length must be a scalar or have length equal to nchannels")
         kT = 0.5 * (horizontal_length / 6378.0) ** 2 # scale = radius * sqrt(2 * kT)
-        # same for temporal_length
-        if isinstance(temporal_length, list):
-            temporal_length = torch.as_tensor(temporal_length)
-            assert len(temporal_length.shape) == 1
-            assert temporal_length.shape[0] == num_channels
+
+        # same for lambd
+        temporal_length = torch.as_tensor(temporal_length)
+        if temporal_length.numel() == self.nchannels:
+            temporal_length = temporal_length.reshape(self.nchannels, 1)
+        elif temporal_length.numel() == 1:
+            temporal_length = temporal_length.expand(self.nchannels, 1)
         else:
-            temporal_length = torch.as_tensor([temporal_length]).repeat(num_channels)
+            raise ValueError("temporal_length must be a scalar or have length equal to nchannels")
         lambd = 1 / temporal_length.reshape(self.nchannels, 1) # lambda = dt / scale
 
         ls = torch.arange(self.lmax)

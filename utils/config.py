@@ -115,6 +115,8 @@ class ObjectiveConfig:
     stratify: bool = True
     progressive: bool = False
     discretise: bool = False
+    # ens size
+    ens_size: int = 1
     # event dims for prior
     event_dims: List[str] = field(default_factory=lambda: ['t'])
     # kumaraswamy concentrations

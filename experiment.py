@@ -54,7 +54,7 @@ class Experiment(DistributedTrainer):
 
     @property
     def use_fair_crps(self):
-        return False
+        return self.objective_cfg.ens_size > 1
     
     # DATA
     def lens_data(self):
@@ -268,7 +268,7 @@ class Experiment(DistributedTrainer):
     #FORWARD
     @property
     def total_epochs(self):
-        return self.total_steps // len(self.train_dl)
+        return max(1, self.total_steps // len(self.train_dl))
     
     def frcst_step(self, batch_idx, batch):
         batch = batch.to(self.device)
@@ -276,9 +276,8 @@ class Experiment(DistributedTrainer):
 
         src = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
 
-        prediction = model(batch, src)
+        prediction = model(batch, src, E = self.objective_cfg.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
-        #prediction = prediction.sort(dim=-1).values
         return prediction
 
     def forward_step(self, batch_idx, batch):
@@ -287,7 +286,7 @@ class Experiment(DistributedTrainer):
 
         src, tgt, weight = self.masking((batch.size(0),), rng = self.generator)
 
-        prediction = model(batch, src)
+        prediction = model(batch, src, E = self.objective_cfg.ens_size, rng = self.generator)
 
         mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
