@@ -15,8 +15,8 @@ class EinMask(torch.nn.Module):
         self.world = world
 
         # noise generator
-        s = torch.tensor([500, 1000, 2000])
-        t = torch.tensor([1, 2, 4])
+        s = torch.tensor([500, 1000, 2000, 4000])
+        t = torch.tensor([1, 2, 4, 6])
         self.noise_generator = SphericalDiffusionNoise(
             num_channels = len(s) * len(t),
             num_steps = 6,
@@ -29,10 +29,11 @@ class EinMask(torch.nn.Module):
         )
 
         # pre-compute positional embedding
+        self.positions = ContinuousPositionalEmbedding(network.dim_coords, network.wavelengths, model_dim= None)
         idcs = torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape)
         idcs = torch.stack(idcs, dim = -1)
-        pos = ContinuousPositionalEmbedding(network.dim_coords, network.wavelengths, model_dim= None)
-        self.register_buffer('coordinates', pos(idcs))
+        pos = self.positions(idcs)
+        self.register_buffer('coordinates', pos)
 
         # I/O
         self.token_embedding = EinMix(
@@ -49,8 +50,8 @@ class EinMask(torch.nn.Module):
             )
         
         self.context_embedding = torch.nn.Linear(
-            in_features = pos.embedding_dim + self.noise_generator.nchannels,
-            out_features = network.dim - network.dim_in,
+                in_features = self.positions.embedding_dim + self.noise_generator.nchannels,
+                out_features = network.dim - network.dim_in,
             )
 
         # learnable parameters (Embedding for convenient initialization)
