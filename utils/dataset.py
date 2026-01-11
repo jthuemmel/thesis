@@ -170,6 +170,8 @@ class MultifileNinoDataset(ConcatDataset):
         assert rank is not None and world_size is not None, 'Rank and world size must be provided'
         assert rank < world_size, 'Rank must be less than world size'
         assert len(directories) >= world_size, 'Number of directories must be greater than or equal to world size'
+        if len(directories) % world_size != 0:
+            print('Warning: Number of directories is not divisible by world size. Some processes may have more directories than others.')
         return [directories[i] for i in range(rank, len(directories), world_size)]
 
     def get_datasets(self, directories: list) -> list:
