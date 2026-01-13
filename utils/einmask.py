@@ -13,35 +13,48 @@ class EinMask(torch.nn.Module):
         self.network = network
         self.world = world
 
+        # pre-compute positional embedding
+        self.cpe = ContinuousPositionalEmbedding(network.dim_coords, network.wavelengths, model_dim= None)
+        idcs = torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape)
+        idcs = torch.stack(idcs, dim = -1)
+        pos = self.cpe(idcs)
+        self.register_buffer('coordinates', pos)
+
         # I/O
         self.to_tokens = EinMix(
-            pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} di", 
-            weight_shape=f'v di {world.patch_pattern}', 
-            di = network.dim_in, **world.patch_sizes, **world.token_sizes
+            pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} d", 
+            weight_shape=f'v {world.patch_pattern} d', 
+            bias_shape='v d',
+            d = network.dim, 
+            **world.patch_sizes, **world.token_sizes
             )
         
         self.to_fields = EinMix(
             pattern=f"b {world.flat_token_pattern} d -> {world.field_pattern} e", 
-            weight_shape=f'e v {world.patch_pattern} d', 
-            d = network.dim, e = default(network.num_tails, 1), 
+            weight_shape=f'v d {world.patch_pattern} e', 
+            bias_shape='v e',
+            d = network.dim, 
+            e = default(network.num_tails, 1), 
             **world.patch_sizes, **world.token_sizes 
             )
         
-        if network.dim_noise > 0:
-            self.to_context = GatedFFN(network.dim_noise, bias= False)
+        # maybe context projection
+        if default(network.dim_noise, 0) > 0:
+            self.to_context = GatedFFN(network.dim_noise, bias= True)
 
-        # learnable embeddings
-        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
-        self.queries = torch.nn.Embedding(world.num_tokens, network.dim_in)
-        self.positions = torch.nn.Embedding(world.num_tokens, network.dim - network.dim_in)
+        # positional projections
+        self.to_positions = torch.nn.Linear(self.cpe.embedding_dim, network.dim)
+        self.to_queries = torch.nn.Linear(self.cpe.embedding_dim, network.dim)
 
         # latent transformer
+        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
         self.encoder = torch.nn.ModuleList([
             TransformerBlock(
                 dim = network.dim, 
                 dim_heads = network.dim_heads, 
                 dim_ctx = network.dim_noise,
                 drop_path = network.drop_path,
+                bias=True,
                 ) 
                 for _ in range(network.num_layers)
             ])
@@ -49,7 +62,8 @@ class EinMask(torch.nn.Module):
                 dim = network.dim, 
                 dim_heads = network.dim_heads, 
                 dim_ctx = network.dim_noise,
-                has_skip = False
+                has_skip = False,
+                bias=True,
                 )
 
         # Weight initialization
@@ -89,7 +103,7 @@ class EinMask(torch.nn.Module):
 
         # maybe sample noise
         if exists(self.to_context):
-            eta = torch.randn((S, B * E, self.network.dim_noise), generator = rng, device = fields.device)
+            eta = torch.randn((S, B * E, 1, self.network.dim_noise), generator = rng, device = fields.device)
         else:
             eta = [None] * S
 
@@ -106,33 +120,26 @@ class EinMask(torch.nn.Module):
         return xs
     
     def _step(self, fields: torch.FloatTensor, visible: torch.LongTensor, noise: torch.FloatTensor) -> torch.FloatTensor:
-        # prepare tokens
-        tokens = self.to_tokens(fields)
-        
-        # expand to batch size
-        positions = einops.repeat(self.positions.weight, "n dc -> b n dc", b = tokens.size(0))
-        queries = einops.repeat(self.queries.weight, 'n di -> b n di', b = tokens.size(0))
-        latents = einops.repeat(self.latents.weight, 'm d -> b m d', b = tokens.size(0))
+        # expand embeddings to batch size
+        B = fields.size(0)
+        latents = einops.repeat(self.latents.weight, 'm d -> b m d', b = B)
+        coords = einops.repeat(self.coordinates, "n d -> b n d", b = B)
+
+        # prepare tokens and queries        
+        tokens = self.to_positions(coords) + self.to_tokens(fields)
+        queries = self.to_queries(coords)
 
         # maybe prepare context
-        if exists(self.to_context):
-            context = self.to_context(noise)
-        else:
-            context = None
-
-        # augment tokens and queries with positions
-        tokens = torch.cat([tokens, positions], dim = -1)        
-        queries = torch.cat([queries, positions], dim = -1)
+        context = self.to_context(noise) if exists(self.to_context) else None        
 
         # only encode visible tokens
         tokens = tokens.gather(1, visible)
 
         # apply flamingo-style transformer
         for block in self.encoder:
-            kv = torch.cat([tokens, latents], dim = 1)
-            latents = block(q = latents, kv = kv, ctx = context)
+            latents = block(q = latents, kv = torch.cat([tokens, latents], dim = 1), ctx = context)
         queries = self.decoder(q = queries, kv = latents, ctx = context)
         
-        # linear prediction
-        prediction = self.to_fields(prediction)
-        return prediction
+        # predict full fields
+        queries = self.to_fields(queries)
+        return queries
