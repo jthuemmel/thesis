@@ -132,13 +132,15 @@ class TransformerBlock(torch.nn.Module):
                  dim_ctx: Optional[int] = None, 
                  drop_path: float = 0.,
                  has_skip: bool = True, 
-                 qk_norm: bool = True, **kwargs):
+                 qk_norm: bool = True, 
+                 bias: bool = False,
+                 **kwargs):
         super().__init__()
         self.att_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.ffn_norm = ConditionalLayerNorm(dim, dim_ctx)
         self.drop_path = DropPath(drop_path)
-        self.att = Attention(dim, dim_heads, qk_norm = qk_norm)
-        self.ffn = GatedFFN(dim)
+        self.att = Attention(dim, dim_heads, qk_norm = qk_norm, bias = bias)
+        self.ffn = GatedFFN(dim, bias = bias)
         self.has_skip = has_skip
 
     def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
