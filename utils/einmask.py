@@ -13,16 +13,10 @@ class EinMask(torch.nn.Module):
         self.network = network
         self.world = world
 
-        # initialize coordinate grid
-        idcs = torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape)
-        idcs = torch.stack(idcs, dim = -1)
-        self.register_buffer('coordinates', idcs)
-
         # I/O
         self.to_tokens = EinMix(
             pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} d", 
             weight_shape=f'v {world.patch_pattern} d', 
-            bias_shape=f'{world.token_pattern} d',
             d = network.dim, 
             **world.patch_sizes, **world.token_sizes
             )
@@ -30,27 +24,26 @@ class EinMask(torch.nn.Module):
         self.to_fields = EinMix(
             pattern=f"b {world.flat_token_pattern} d -> {world.field_pattern} e", 
             weight_shape=f'v d {world.patch_pattern} e', 
-            bias_shape=f'{world.token_pattern} {world.patch_pattern} e',
             d = network.dim, 
             e = default(network.num_tails, 1), 
             **world.patch_sizes, **world.token_sizes 
-            )
-        
-        self.to_queries = ContinuousPositionalEmbedding(network.dim_coords, network.wavelengths, model_dim= network.dim)
+            )        
 
         # maybe context projection
         if default(network.dim_noise, 0) > 0:
-            self.to_context = GatedFFN(network.dim_noise, bias= True)
+            self.to_context = GatedFFN(network.dim_noise)
+
+        # learnable embedddings
+        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
+        self.coordinates = torch.nn.Embedding(world.num_tokens, network.dim)
 
         # latent transformer
-        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
         self.encoder = torch.nn.ModuleList([
             TransformerBlock(
                 dim = network.dim, 
                 dim_heads = network.dim_heads, 
                 dim_ctx = network.dim_noise,
                 drop_path = network.drop_path,
-                bias=True,
                 ) 
                 for _ in range(network.num_layers)
             ])
@@ -58,8 +51,6 @@ class EinMask(torch.nn.Module):
                 dim = network.dim, 
                 dim_heads = network.dim_heads, 
                 dim_ctx = network.dim_noise,
-                has_skip = False,
-                bias=True,
                 )
 
         # Weight initialization
@@ -116,25 +107,22 @@ class EinMask(torch.nn.Module):
         return xs
     
     def _step(self, fields: torch.FloatTensor, visible: torch.LongTensor, noise: torch.FloatTensor) -> torch.FloatTensor:
-        # project tokens and select visible        
-        tokens = self.to_tokens(fields)
+        # prepare coordinates and latents
+        coords = einops.repeat(self.coordinates.weight, 'n d -> b n d', b = fields.size(0))
+        latents = einops.repeat(self.latents.weight, 'm d -> b m d', b = fields.size(0))
+
+        # embed tokens and select visible ones
+        tokens = self.to_tokens(fields) + coords
         tokens = tokens.gather(1, visible)
 
-        # project queries and expand to batch size
-        queries = self.to_queries(self.coordinates)
-        queries = einops.repeat(queries, "n d -> b n d", b = tokens.size(0))
-
-        # expand latents to batch size
-        latents = einops.repeat(self.latents.weight, 'm d -> b m d', b = tokens.size(0))
-
-        # maybe project context
+        # maybe embed noise as context
         context = self.to_context(noise) if exists(self.to_context) else None        
-
-        # apply flamingo-style transformer
+        
+        # latent transformer
         for block in self.encoder:
             latents = block(q = latents, kv = torch.cat([tokens, latents], dim = 1), ctx = context)
-        queries = self.decoder(q = queries, kv = latents, ctx = context)
-        
-        # predict full fields
-        queries = self.to_fields(queries)
-        return queries
+        predictions = self.decoder(q = coords, kv = latents, ctx = context)
+
+        # back to fields
+        predictions = self.to_fields(predictions)
+        return predictions
