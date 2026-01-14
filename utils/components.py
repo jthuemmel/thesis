@@ -92,7 +92,7 @@ class Attention(torch.nn.Module):
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
         q = self.norm_q(q)
         k = self.norm_k(k)
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION], set_priority_order=True):
             attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = self.merge_heads(attn)
         out = self.to_out(out)
@@ -145,10 +145,8 @@ class TransformerBlock(torch.nn.Module):
 
     def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
         skip = q if self.has_skip else 0.
-        q = self.att_norm(q, ctx)
-        kv = self.att_norm(kv, ctx) if kv is not None else q
-        q = skip + self.drop_path(self.att(q, kv, kv, **attn_kwargs))
-        q = q + self.drop_path(self.ffn(self.ffn_norm(q, ctx)))
+        q = skip + self.drop_path(self.att_norm(self.att(q, kv, kv, **attn_kwargs), ctx))
+        q = q + self.drop_path(self.ffn_norm(self.ffn_norm(q), ctx))
         return q
 
 class InterfaceBlock(torch.nn.Module):
