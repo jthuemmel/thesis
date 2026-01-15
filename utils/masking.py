@@ -25,16 +25,16 @@ class ForecastMasking(torch.nn.Module):
 # KUMARASWAMY PRIOR
 class KumaraswamySchedule(torch.nn.Module):
     '''Kumaraswamy Schedule with numerical stable methods courtesy of Wasserman et al 2024'''
-    def __init__(self, objective: ObjectiveConfig):
+    def __init__(self, c1: float = 1., c0: float = 1., epsilon=1e-5):
         super().__init__()
-        assert objective.c1 > 0. and objective.c0 > 0., 'invalid concentration'
+        assert c1 > 0. and c0 > 0., 'invalid concentration'
        
         # Register hyperparameters as buffers for device consistency
-        self.register_buffer("c1", torch.tensor(objective.c1, requires_grad=False))
-        self.register_buffer("c0", torch.tensor(objective.c0, requires_grad=False))
+        self.register_buffer("c1", torch.tensor(c1, requires_grad=False))
+        self.register_buffer("c0", torch.tensor(c0, requires_grad=False))
         
         # Epsilon ensures 't' is not exactly 0 or 1, which causes numerical instability
-        self.epsilon = objective.epsilon
+        self.epsilon = epsilon
     
     # Kumaraswamy with log1mexp
     @staticmethod
@@ -84,7 +84,7 @@ class BernoulliMasking(torch.nn.Module):
         self.objective = objective
 
         # schedule
-        self.schedule = KumaraswamySchedule(objective)
+        self.schedule = KumaraswamySchedule(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
         
         # Events
         assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
@@ -120,7 +120,7 @@ class BernoulliMasking(torch.nn.Module):
         rates, weights = self.expand_events(rates, weights)
         masks = self.sample_masks(rates, rng=rng)
         return masks, weights
-    
+
 class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
         super().__init__()
@@ -129,7 +129,7 @@ class MultinomialMasking(torch.nn.Module):
         self.objective = objective
 
         #schedule
-        self.schedule = KumaraswamySchedule(objective=objective)
+        self.schedule = KumaraswamySchedule(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
 
         # attributes
         self.k_min = default(objective.k_min, 1)
@@ -150,6 +150,12 @@ class MultinomialMasking(torch.nn.Module):
     def sample_binomial(self, shape: tuple, rng: torch.Generator = None):
         u = torch.rand((2, *shape, self.num_events), generator=rng, device = self.alpha.device)
         return torch.where(u[0] > self.alpha, u[1], 1e-7)
+    
+    def sample_kumaraswamy(self, shape: tuple, rng: torch.Generator = None):
+        dist = KumaraswamySchedule(c1= self.objective.alpha)
+        u = torch.rand(( *shape, self.num_events), generator=rng, device = self.alpha.device)
+        t = dist(u)[0]
+        return t
     
     def sample_rate(self, rng: torch.Generator = None):
         t = torch.rand((1,), device= self.alpha.device, generator=rng)
