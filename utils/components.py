@@ -92,7 +92,8 @@ class Attention(torch.nn.Module):
         q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
         q = self.norm_q(q)
         k = self.norm_k(k)
-        attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+            attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = self.merge_heads(attn)
         out = self.to_out(out)
         return out

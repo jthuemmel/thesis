@@ -16,18 +16,19 @@ class EinMask(torch.nn.Module):
         # I/O
         self.to_tokens = EinMix(
             pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} d", 
-            weight_shape=f'v {world.patch_pattern} d', 
+            weight_shape=f'{world.patch_pattern} v d', 
+            bias_shape=f'{world.token_pattern} d',
             d = network.dim, 
             **world.patch_sizes, **world.token_sizes
             )
         
         self.to_fields = EinMix(
-            pattern=f"b {world.flat_token_pattern} d -> {world.field_pattern} e", 
-            weight_shape=f'v d {world.patch_pattern} e', 
+            pattern=f"b {world.flat_token_pattern} d -> {world.field_pattern} k", 
+            weight_shape=f'd v {world.patch_pattern} k', 
             d = network.dim, 
-            e = default(network.num_tails, 1), 
+            k = default(network.num_tails, 1), 
             **world.patch_sizes, **world.token_sizes 
-            )        
+            )     
 
         # maybe context projection
         if default(network.dim_noise, 0) > 0:
@@ -35,7 +36,7 @@ class EinMask(torch.nn.Module):
 
         # learnable embedddings
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
-        self.coordinates = torch.nn.Embedding(world.num_tokens, network.dim)
+        self.queries = torch.nn.Embedding(world.num_tokens, network.dim)
 
         # latent transformer
         self.encoder = torch.nn.ModuleList([
@@ -107,12 +108,12 @@ class EinMask(torch.nn.Module):
         return xs
     
     def _step(self, fields: torch.FloatTensor, visible: torch.LongTensor, noise: torch.FloatTensor) -> torch.FloatTensor:
-        # prepare coordinates and latents
-        coords = einops.repeat(self.coordinates.weight, 'n d -> b n d', b = fields.size(0))
+        # prepare queries and latents
+        queries = einops.repeat(self.queries.weight, 'n d -> b n d', b = fields.size(0))
         latents = einops.repeat(self.latents.weight, 'm d -> b m d', b = fields.size(0))
 
         # embed tokens and select visible ones
-        tokens = self.to_tokens(fields) + coords
+        tokens = self.to_tokens(fields)
         tokens = tokens.gather(1, visible)
 
         # maybe embed noise as context
@@ -120,8 +121,9 @@ class EinMask(torch.nn.Module):
         
         # latent transformer
         for block in self.encoder:
-            latents = block(q = latents, kv = torch.cat([tokens, latents], dim = 1), ctx = context)
-        predictions = self.decoder(q = coords, kv = latents, ctx = context)
+            kv = torch.cat([tokens, latents], dim = 1)
+            latents = block(q = latents, kv = kv, ctx = context)
+        predictions = self.decoder(q = queries, kv = latents, ctx = context)
 
         # back to fields
         predictions = self.to_fields(predictions)
