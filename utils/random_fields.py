@@ -4,6 +4,7 @@ import torch_harmonics
 
 from utils.components import default
 
+
 class SphericalDiffusionNoise(torch.nn.Module):
     def __init__(
             self,
@@ -107,3 +108,29 @@ class SphericalDiffusionNoise(torch.nn.Module):
                 # slice the region of interest
                 eta = eta[..., self.lat_slice, self.lon_slice] 
         return eta
+    
+class RandomField(SphericalDiffusionNoise):
+    def __init__(self, network, world):
+        
+        h = [500, 1000, 2000, 4000]
+        t = [1, 2, 4, 6]
+        l = world.token_sizes['h']
+        start = (180 // world.patch_sizes['hh'] - l) // 2
+        channels = len(h) * len(t)
+
+        super().__init__(
+            num_channels=channels,
+            num_lat=180 // world.patch_sizes['hh'],
+            num_lon=360 // world.patch_sizes['ww'],
+            num_steps=world.token_sizes["t"],
+            horizontal_length= einops.repeat(h, 'h -> (h t)', h = len(h), t = len(t)),
+            temporal_length=einops.repeat(t, 't -> (h t)', h = len(h), t = len(t)),
+            lat_slice= slice(start, start + l),
+            lon_slice=slice(0, 2 * world.token_sizes['w'], 2)
+        )
+
+        self.projection = torch.nn.Linear(channels, network.dim_noise)
+
+    def forward(self, tokens, rng = None):
+        grf = super().forward((tokens.size(0),), rng)
+        return tokens, self.projection(grf)

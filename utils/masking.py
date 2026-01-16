@@ -23,7 +23,7 @@ class ForecastMasking(torch.nn.Module):
             return mask.expand(*shape, -1).bool().logical_not()
     
 # KUMARASWAMY PRIOR
-class KumaraswamySchedule(torch.nn.Module):
+class Kumaraswamy(torch.nn.Module):
     '''Kumaraswamy Schedule with numerical stable methods courtesy of Wasserman et al 2024'''
     def __init__(self, c1: float = 1., c0: float = 1., epsilon=1e-5):
         super().__init__()
@@ -84,7 +84,7 @@ class BernoulliMasking(torch.nn.Module):
         self.objective = objective
 
         # schedule
-        self.schedule = KumaraswamySchedule(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
+        self.schedule = Kumaraswamy(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
         
         # Events
         assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
@@ -129,7 +129,7 @@ class MultinomialMasking(torch.nn.Module):
         self.objective = objective
 
         #schedule
-        self.schedule = KumaraswamySchedule(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
+        self.schedule = Kumaraswamy(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
 
         # attributes
         self.k_min = default(objective.k_min, 1)
@@ -141,21 +141,18 @@ class MultinomialMasking(torch.nn.Module):
         self.event_pattern = f'({" ".join(objective.event_dims)})'
 
         # alpha
-        self.register_buffer("alpha", torch.full((self.num_events,), objective.alpha, requires_grad=False))
-    
+        self.register_buffer("alpha", torch.tensor(objective.alpha))
 
     def sample_dirichlet(self, shape: tuple, rng: torch.Generator = None):
-        return torch._sample_dirichlet(self.alpha.expand(*shape, -1), generator=rng)
+        return torch._sample_dirichlet(self.alpha.expand(*shape, self.num_events), generator=rng)
     
     def sample_binomial(self, shape: tuple, rng: torch.Generator = None):
         u = torch.rand((2, *shape, self.num_events), generator=rng, device = self.alpha.device)
         return torch.where(u[0] > self.alpha, u[1], 1e-7)
     
     def sample_kumaraswamy(self, shape: tuple, rng: torch.Generator = None):
-        dist = KumaraswamySchedule(c1= self.objective.alpha)
-        u = torch.rand(( *shape, self.num_events), generator=rng, device = self.alpha.device)
-        t = dist(u)[0]
-        return t
+        u = torch.rand((*shape, self.num_events), generator=rng, device = self.alpha.device)
+        return Kumaraswamy(c1= self.alpha).quantile(u)
     
     def sample_rate(self, rng: torch.Generator = None):
         t = torch.rand((1,), device= self.alpha.device, generator=rng)

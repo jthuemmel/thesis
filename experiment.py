@@ -298,16 +298,6 @@ class Experiment(DistributedTrainer):
         return loss
     
     # Tokenizers
-    def field_to_tokens(self, field):
-        return einops.rearrange(field, 
-                                f'{self.world.field_pattern} -> {self.world.flatland_pattern}',
-                                **self.world.patch_sizes)
-
-    def tokens_to_field(self, patch):
-        return einops.rearrange(patch, 
-                                f"{self.world.flatland_pattern} ... -> {self.world.field_pattern} ...",
-                                **self.world.token_sizes, **self.world.patch_sizes)
-    
     def mask_to_field(self, mask):
         return einops.repeat(mask,
                              f"b {self.world.flat_token_pattern} -> {self.world.field_pattern}",
