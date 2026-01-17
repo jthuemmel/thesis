@@ -2,6 +2,7 @@ import torch
 import einops
 import torch_harmonics
 
+from einops.layers.torch import EinMix
 from utils.components import default
 
 
@@ -109,28 +110,32 @@ class SphericalDiffusionNoise(torch.nn.Module):
                 eta = eta[..., self.lat_slice, self.lon_slice] 
         return eta
     
-class RandomField(SphericalDiffusionNoise):
-    def __init__(self, network, world):
-        
-        h = [500, 1000, 2000, 4000]
-        t = [1, 2, 4, 6]
-        l = world.token_sizes['h']
-        start = (180 // world.patch_sizes['hh'] - l) // 2
-        channels = len(h) * len(t)
+class RandomField(torch.nn.Module):
+    def __init__(self, model_dim: int, world):
+        super().__init__()
+        horizontal = torch.tensor([500., 1000., 2000., 4000.])
+        temporal = torch.tensor([1, 2, 4, 6])
 
-        super().__init__(
+        start = (180 // world.patch_sizes['hh'] - world.token_sizes['h']) // 2
+        channels = len(horizontal) * len(temporal)
+
+        self.noise_generator = SphericalDiffusionNoise(
             num_channels=channels,
             num_lat=180 // world.patch_sizes['hh'],
             num_lon=360 // world.patch_sizes['ww'],
             num_steps=world.token_sizes["t"],
-            horizontal_length= einops.repeat(h, 'h -> (h t)', h = len(h), t = len(t)),
-            temporal_length=einops.repeat(t, 't -> (h t)', h = len(h), t = len(t)),
-            lat_slice= slice(start, start + l),
+            horizontal_length= einops.repeat(horizontal, 'h -> (h t)', h = len(horizontal), t = len(temporal)),
+            temporal_length=einops.repeat(temporal, 't -> (h t)', h = len(horizontal), t = len(temporal)),
+            lat_slice= slice(start, start + world.token_sizes['h']),
             lon_slice=slice(0, 2 * world.token_sizes['w'], 2)
         )
 
-        self.projection = torch.nn.Linear(channels, network.dim_noise)
+        self.projection = EinMix(
+            pattern = f'... c t h w -> ... {world.flat_token_pattern} d',
+            weight_shape = 'v c d',
+            c = channels, d = model_dim, **world.token_sizes,
+        )
 
     def forward(self, tokens, rng = None):
-        grf = super().forward((tokens.size(0),), rng)
+        grf = self.noise_generator((tokens.size(0),), rng)
         return tokens, self.projection(grf)

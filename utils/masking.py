@@ -30,8 +30,8 @@ class Kumaraswamy(torch.nn.Module):
         assert c1 > 0. and c0 > 0., 'invalid concentration'
        
         # Register hyperparameters as buffers for device consistency
-        self.register_buffer("c1", torch.tensor(c1, requires_grad=False))
-        self.register_buffer("c0", torch.tensor(c0, requires_grad=False))
+        self.register_buffer("c1", torch.as_tensor(c1))
+        self.register_buffer("c0", torch.as_tensor(c0))
         
         # Epsilon ensures 't' is not exactly 0 or 1, which causes numerical instability
         self.epsilon = epsilon
@@ -141,7 +141,7 @@ class MultinomialMasking(torch.nn.Module):
         self.event_pattern = f'({" ".join(objective.event_dims)})'
 
         # alpha
-        self.register_buffer("alpha", torch.tensor(objective.alpha))
+        self.register_buffer("alpha", torch.as_tensor(objective.alpha))
 
     def sample_dirichlet(self, shape: tuple, rng: torch.Generator = None):
         return torch._sample_dirichlet(self.alpha.expand(*shape, self.num_events), generator=rng)
@@ -152,7 +152,7 @@ class MultinomialMasking(torch.nn.Module):
     
     def sample_kumaraswamy(self, shape: tuple, rng: torch.Generator = None):
         u = torch.rand((*shape, self.num_events), generator=rng, device = self.alpha.device)
-        return Kumaraswamy(c1= self.alpha).quantile(u)
+        return Kumaraswamy(c1= self.objective.alpha).quantile(u)
     
     def sample_rate(self, rng: torch.Generator = None):
         t = torch.rand((1,), device= self.alpha.device, generator=rng)
