@@ -99,6 +99,16 @@ class EinMask(torch.nn.Module):
             if m.weight is not None: # CLN weight close to 0
                 torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
 
+    @staticmethod
+    def freeze_weights(m):
+        for param in m.parameters():
+            param.requires_grad = False
+
+    @staticmethod
+    def unfreeze_weights(m):
+        for param in m.parameters():
+            param.requires_grad = True
+
     def forward(self, 
                 fields: torch.FloatTensor, 
                 srcs: torch.LongTensor, 
@@ -106,32 +116,35 @@ class EinMask(torch.nn.Module):
                 members: Optional[int] = None, 
                 rng: Optional[torch.Generator] = None
                 ) -> torch.FloatTensor:
-        # define shapes
+        # shapes
         B = fields.size(0)
         D = self.network.dim
         K = default(self.network.num_tails, 1)
         E = default(members, 1)
         S = srcs.size(0) if srcs.ndim > 2 else 1
         
-        # maybe expand srcs/tgts
+        # maybe expand srcs/tgts to sequence form
         if tgts is None: tgts = self.indices.expand(S, B, -1)
         if tgts.ndim == 2: tgts = tgts.expand(S, -1, -1)
         if srcs.ndim == 2: srcs = srcs.expand(S, -1, -1)
 
-        # expand indices and coordinates
+        # expand to ensemble form
         src_idx = einops.repeat(srcs, 's b ... -> s (b e) ... d', d = D, e = E, b = B, s = S)
         tgt_idx = einops.repeat(tgts, 's b ... -> s (b e) ... d', d = D, e = E, b = B, s = S)
         src_coo = einops.repeat(self.coordinates[srcs], 's b ... -> s (b e) ...', e = E, b = B, s = S)
         tgt_coo = einops.repeat(self.coordinates[tgts], 's b ... -> s (b e) ...', e = E, b = B, s = S)
+        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
 
         # embed full fields as tokens
-        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
         tokens = self.to_tokens(fields)
 
         # iterate
         for s in range(S):
-            # prepare context and queries
-            context = tokens.gather(1, src_idx[s]) + self.src_positions(src_coo[s])
+            # select visible tokens at this step
+            context = tokens.gather(1, src_idx[s])
+
+            # add position codes and prepare queries
+            context = context + self.src_positions(src_coo[s])
             queries = self.tgt_positions(tgt_coo[s])
 
             # maybe condition on noise
