@@ -14,8 +14,8 @@ class EinMask(torch.nn.Module):
         self.network = network
         self.world = world
 
-        # random context
-        self.to_context = RandomField(network.dim, world)
+        # maybe use generative noise
+        self.noise_generator = RandomField(network.dim, world) if default(network.num_tails, 1) <= 1 else None
 
         # I/O
         self.to_tokens = EinMix(
@@ -33,24 +33,27 @@ class EinMask(torch.nn.Module):
             **world.patch_sizes, **world.token_sizes 
             )
                 
-        # position codes
-        self.positions = ContinuousPositionalEmbedding(
+        # positional embeddings
+        self.src_positions = ContinuousPositionalEmbedding(
             dim_per_coord=network.dim_coords, 
             wavelengths=[(1, 2 * k) for k in world.token_shape],
             model_dim=network.dim
         )
 
-        self.queries = ContinuousPositionalEmbedding(
+        self.tgt_positions = ContinuousPositionalEmbedding(
             dim_per_coord=network.dim_coords, 
             wavelengths=[(1, 2 * k) for k in world.token_shape],
             model_dim=network.dim
         )
         
         # pre-computed coordinates
-        idcs = torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape)
-        self.register_buffer("coordinates", torch.stack(idcs, dim = -1))        
+        self.register_buffer('indices', torch.arange(world.num_tokens))
+        self.register_buffer("coordinates", torch.stack(
+            torch.unravel_index(indices = self.indices, shape = world.token_shape), 
+            dim = -1)
+            )        
         
-        # learnable embedddings
+        # learnable latents
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
 
         # latent transformer
@@ -64,7 +67,7 @@ class EinMask(torch.nn.Module):
                 for _ in range(network.num_layers)
             ])
         
-        self.write = TransformerBlock(
+        self.decoder = TransformerBlock(
                 dim = network.dim, 
                 dim_heads = network.dim_heads, 
                 dim_ctx = network.dim_noise,
@@ -76,7 +79,6 @@ class EinMask(torch.nn.Module):
     
     @staticmethod
     def base_init(m):
-        '''Explicit weight initialization'''
         # linear
         if isinstance(m, torch.nn.Linear):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
@@ -97,51 +99,62 @@ class EinMask(torch.nn.Module):
             if m.weight is not None: # CLN weight close to 0
                 torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
 
-    def forward(self, fields: torch.FloatTensor, visible: torch.LongTensor, E: int = 1, rng: torch.Generator = None) -> torch.FloatTensor:
-        # visible: (S, B, v) or (B, v)
-        if visible.ndim == 2: visible = visible.unsqueeze(0)
-        S, B = (visible.size(0), visible.size(1))
+    def forward(self, 
+                fields: torch.FloatTensor, 
+                srcs: torch.LongTensor, 
+                tgts: Optional[torch.LongTensor] = None,
+                members: Optional[int] = None, 
+                rng: Optional[torch.Generator] = None
+                ) -> torch.FloatTensor:
+        # define shapes
+        B = fields.size(0)
+        D = self.network.dim
+        K = default(self.network.num_tails, 1)
+        E = default(members, 1)
+        S = srcs.size(0) if srcs.ndim > 2 else 1
+        
+        # maybe expand srcs/tgts
+        if tgts is None: tgts = self.indices.expand(S, B, -1)
+        if tgts.ndim == 2: tgts = tgts.expand(S, -1, -1)
+        if srcs.ndim == 2: srcs = srcs.expand(S, -1, -1)
 
-        # expand to ensemble form
-        xs = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
-        vs = einops.repeat(visible, 's b ... -> s (b e) ... d', e = E, b = B, s = S, d = self.network.dim)
+        # expand indices and coordinates
+        src_idx = einops.repeat(srcs, 's b ... -> s (b e) ... d', d = D, e = E, b = B, s = S)
+        tgt_idx = einops.repeat(tgts, 's b ... -> s (b e) ... d', d = D, e = E, b = B, s = S)
+        src_coo = einops.repeat(self.coordinates[srcs], 's b ... -> s (b e) ...', e = E, b = B, s = S)
+        tgt_coo = einops.repeat(self.coordinates[tgts], 's b ... -> s (b e) ...', e = E, b = B, s = S)
+
+        # embed full fields as tokens
+        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
+        tokens = self.to_tokens(fields)
 
         # iterate
         for s in range(S):
-            # embed fields as tokens
-            tokens = self.to_tokens(xs)
-
-            # position codes
-            coords = einops.repeat(self.coordinates, "n d -> (b e) n d", e = E, b = B)
-            tokens = tokens + self.positions(coords)
-            queries = self.queries(coords)
+            # prepare context and queries
+            context = tokens.gather(1, src_idx[s]) + self.src_positions(src_coo[s])
+            queries = self.tgt_positions(tgt_coo[s])
 
             # maybe condition on noise
-            if exists(self.to_context):
-                tokens, ctx = self.to_context(tokens, rng = rng)
-                queries = queries + ctx
-                tokens = tokens + ctx
+            if exists(self.noise_generator):
+                context, noise = self.noise_generator(context, rng = rng)
+                queries = queries + noise.gather(1, tgt_idx[s])
+                context = context + noise.gather(1, src_idx[s])
 
-            # select visible tokens
-            tokens = tokens.gather(1, vs[s])
-            
-            # map tokens to latents
-            latents = einops.repeat(self.latents.weight, 'n d -> (b e) n d', b = B, e = E)
+            # map context to latents
+            latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
             for read in self.encoder:
-                kv = torch.cat([tokens, latents], dim = 1)
+                kv = torch.cat([context, latents], dim = 1)
                 latents = read(q = latents, kv = kv)
 
             # map latents to queries
-            queries = self.write(q = queries, kv = latents)
+            queries = self.decoder(q = queries, kv = latents)
 
-            # map back to fields
-            xs = self.to_fields(queries)
+            # update tokens
+            tokens = tokens.scatter(1, tgt_idx[s], queries)
 
-            # detach gradients unless it is the last step
-            if s < S - 1:
-                xs = xs.detach()
+        # map all tokens back to fields
+        fields = self.to_fields(tokens)
         
         # rearrange to ensemble form
-        xs = einops.rearrange(xs, "(b e) ... k -> b ... (e k)", e = E, b = B, k = self.network.num_tails)
-        return xs
-    
+        fields = einops.rearrange(fields, "(b e) ... k -> b ... (e k)", e = E, b = B, k = K)
+        return fields

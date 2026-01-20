@@ -54,7 +54,7 @@ class Experiment(DistributedTrainer):
 
     @property
     def use_fair_crps(self):
-        return self.objective_cfg.ens_size > 1
+        return default(self.objective_cfg.ens_size, 1) > 1
     
     # DATA
     def lens_data(self):
@@ -276,7 +276,7 @@ class Experiment(DistributedTrainer):
 
         src = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
 
-        prediction = model(batch, src, E = self.objective_cfg.ens_size, rng = self.generator)
+        prediction = model(batch, src, members = self.objective_cfg.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
 
@@ -284,11 +284,11 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        src, tgt, weight = self.masking((batch.size(0),), rng = self.generator)
+        src, loss_mask, weight = self.masking((batch.size(0),), rng = self.generator)
 
-        prediction = model(batch, src, E = self.objective_cfg.ens_size, rng = self.generator)
+        prediction = model(batch, src, members = self.objective_cfg.ens_size, rng = self.generator)
 
-        mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
+        mask = torch.logical_and(self.mask_to_field(loss_mask), self.land_sea_mask)
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
 
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
