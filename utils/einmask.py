@@ -135,8 +135,8 @@ class EinMask(torch.nn.Module):
         # iterate
         for src, tgt in zip(srcs, tgts, strict=True):
             # expand src/tgt/latents to ensemble form
-            src = einops.repeat(srcs, 'b ... -> (b e) ...', e = E, b = B)
-            tgt = einops.repeat(tgts, 'b ... -> (b e) ...', e = E, b = B)
+            src = einops.repeat(src, 'b ... -> (b e) ...', e = E, b = B)
+            tgt = einops.repeat(tgt, 'b ... -> (b e) ...', e = E, b = B)
             latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
 
             # gather tokens visible at this step
