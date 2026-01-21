@@ -22,8 +22,8 @@ class ForecastMasking(torch.nn.Module):
             return mask.expand(*shape, -1).bool().logical_not()
     
 # KUMARASWAMY DISTRIBUTION
-class Kumaraswamy(torch.nn.Module):
-    '''Kumaraswamy with numerical stable methods courtesy of Wasserman et al 2024'''
+class StableKumaraswamy(torch.nn.Module):
+    '''Numerically stable methods for Kumaraswamy sampling, courtesy of Wasserman et al 2024'''
     def __init__(self, c1: float = 1., c0: float = 1., epsilon=1e-3):
         super().__init__()
         assert c1 > 0. and c0 > 0., 'invalid concentration'
@@ -31,9 +31,7 @@ class Kumaraswamy(torch.nn.Module):
         # Register hyperparameters as buffers for device consistency
         self.register_buffer("c1", torch.as_tensor(c1))
         self.register_buffer("c0", torch.as_tensor(c0))
-        
-        # Epsilon ensures 't' is not exactly 0 or 1, which causes numerical instability
-        self.epsilon = epsilon
+        self.register_buffer("epsilon", torch.as_tensor(epsilon))
     
     # Kumaraswamy with log1mexp
     @staticmethod
@@ -58,20 +56,10 @@ class Kumaraswamy(torch.nn.Module):
     def cdf(self, t: torch.Tensor): # 1 - (1 - t**c1)**c0
         return -torch.expm1(self.c0 * self.log1mexp(self.c1 * t.log()))
     
-    def forward(self, t: torch.Tensor):
-        # ensure t is in [eps, 1 - eps]
+    def forward(self, shape: tuple, rng: torch.Generator = None):
+        t = torch.rand(shape, device=self.epsilon.device, generator= rng)
         t = t * (1.0 - 2.0 * self.epsilon) + self.epsilon
-        # shared terms
-        log_1_minus_t = torch.log1p(-t)
-        log_exp_inner = self.log1mexp(log_1_minus_t / self.c0) / self.c1
-        # individual terms
-        log_constant = -self.c1.log() - self.c0.log()
-        log_outer = ((1 - self.c0) / self.c0) * log_1_minus_t
-        log_inner = (1 - self.c1) * log_exp_inner
-        # combine
-        quantile = torch.exp(log_exp_inner)
-        quantile_dt = torch.exp(log_constant + log_inner + log_outer)
-        return quantile, quantile_dt
+        return self.quantile(t), self.quantile_dt(t)
 
 # MASKING STRATEGIES
 class MultinomialMasking(torch.nn.Module):
@@ -82,7 +70,8 @@ class MultinomialMasking(torch.nn.Module):
         self.objective = objective
 
         #schedule
-        self.schedule = Kumaraswamy(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
+        self.schedule = StableKumaraswamy(c0=objective.c0, c1=objective.c1)
+        self.prior = StableKumaraswamy(c1= self.objective.alpha)
 
         # attributes
         self.k_min = default(objective.k_min, 1)
@@ -93,33 +82,12 @@ class MultinomialMasking(torch.nn.Module):
         self.num_events = torch.tensor([world.token_sizes[d] for d in objective.event_dims]).prod()
         self.event_pattern = f'({" ".join(objective.event_dims)})'
 
-        # alpha
-        self.register_buffer("alpha", torch.as_tensor(objective.alpha))
-
-    def sample_dirichlet(self, shape: tuple, rng: torch.Generator = None):
-        return torch._sample_dirichlet(self.alpha.expand(*shape, self.num_events), generator=rng)
-    
-    def sample_binomial(self, shape: tuple, rng: torch.Generator = None):
-        u = torch.rand((2, *shape, self.num_events), generator=rng, device = self.alpha.device)
-        return torch.where(u[0] > self.alpha, u[1], 1e-7)
-    
-    def sample_kumaraswamy(self, shape: tuple, rng: torch.Generator = None):
-        u = torch.rand((*shape, self.num_events), generator=rng, device = self.alpha.device)
-        return Kumaraswamy(c1= self.objective.alpha).quantile(u)
-    
-    def sample_rate(self, rng: torch.Generator = None):
-        t = torch.rand((1,), device= self.alpha.device, generator=rng)
-        t, w = self.schedule(t)
-        k = self.k_min + (self.k_max - self.k_min) * t
-        return k, w
-    
     def forward(self, shape: tuple, rng: torch.Generator = None):
-        prior_fn = getattr(self, f"sample_{self.objective.prior}")
-        prior = einops.repeat(prior_fn(shape, rng), 
-                             f'... {self.event_pattern} -> ... {self.world.flat_token_pattern}', 
+        p, _ = self.prior((*shape, self.num_events), rng)
+        p = einops.repeat(p, f'... {self.event_pattern} -> ... {self.world.flat_token_pattern}', 
                              **self.world.token_sizes)
-        k, w = self.sample_rate(rng)
-        src = torch.multinomial(prior, int(k), generator=rng)
-        mask = torch.ones_like(prior, dtype= torch.bool).scatter_(1, src, False)
-        return src, mask, w
-    
+        r, w = self.schedule((1,), rng)
+        k = self.k_min + (self.k_max - self.k_min) * r
+        indices = torch.multinomial(p, int(k), generator=rng)
+        mask = torch.ones_like(p, dtype= torch.bool).scatter_(1, indices, False)
+        return indices, mask, w
