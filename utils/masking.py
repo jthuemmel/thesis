@@ -1,6 +1,5 @@
 import torch
 import einops
-from math import prod
 from utils.config import WorldConfig, ObjectiveConfig, default
     
 class ForecastMasking(torch.nn.Module):
@@ -22,10 +21,10 @@ class ForecastMasking(torch.nn.Module):
         else:
             return mask.expand(*shape, -1).bool().logical_not()
     
-# KUMARASWAMY PRIOR
+# KUMARASWAMY DISTRIBUTION
 class Kumaraswamy(torch.nn.Module):
-    '''Kumaraswamy Schedule with numerical stable methods courtesy of Wasserman et al 2024'''
-    def __init__(self, c1: float = 1., c0: float = 1., epsilon=1e-5):
+    '''Kumaraswamy with numerical stable methods courtesy of Wasserman et al 2024'''
+    def __init__(self, c1: float = 1., c0: float = 1., epsilon=1e-3):
         super().__init__()
         assert c1 > 0. and c0 > 0., 'invalid concentration'
        
@@ -75,52 +74,6 @@ class Kumaraswamy(torch.nn.Module):
         return quantile, quantile_dt
 
 # MASKING STRATEGIES
-class BernoulliMasking(torch.nn.Module):
-    '''BernoulliMasking strategy'''
-    def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
-        super().__init__()
-        # configs
-        self.world = world
-        self.objective = objective
-
-        # schedule
-        self.schedule = Kumaraswamy(c0=objective.c0, c1=objective.c1, epsilon=objective.epsilon)
-        
-        # Events
-        assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
-        self.num_events = prod([world.token_sizes[d] for d in objective.event_dims])
-        self.event_pattern = f'({" ".join(objective.event_dims)})'
-        
-    # Masking
-    def sample_prior(self, shape: tuple, rng: torch.Generator = None):
-        if self.objective.stratify:
-            t = torch.rand(shape[:-1] + (1,) + (self.num_events,), device=self.c1.device, generator=rng)
-            t = (t + torch.linspace(0, 1, shape[-1], device=self.c1.device).view(-1, 1)) % 1
-        else:
-            t = torch.rand(shape + (self.num_events,), device=self.c1.device, generator=rng)
-        t = t * (1.0 - 2.0 * self.epsilon) + self.epsilon
-        return t
-
-    def expand_events(self, *args):
-        return einops.repeat(
-            [*args],
-            f'args ... {self.event_pattern} -> args ... {self.world.flat_token_pattern}', 
-            **self.world.token_sizes
-            )
-
-    def sample_masks(self, rates: torch.Tensor, rng: torch.Generator = None):
-        return rates > torch.rand(rates.shape, device=self.c1.device, generator=rng)
-
-    # Forward
-    def forward(self, shape: tuple, rng: torch.Generator = None) -> tuple[torch.BoolTensor, torch.FloatTensor]:
-        t = self.sample_prior(shape, rng=rng)
-        if self.objective.progressive: t = t.sort(0, descending = True).values
-        if self.objective.discretise: t = t.round(decimals=2)
-        rates, weights = self.schedule(t)
-        rates, weights = self.expand_events(rates, weights)
-        masks = self.sample_masks(rates, rng=rng)
-        return masks, weights
-
 class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
         super().__init__()
@@ -137,7 +90,7 @@ class MultinomialMasking(torch.nn.Module):
 
         # Events
         assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
-        self.num_events = prod([world.token_sizes[d] for d in objective.event_dims])
+        self.num_events = torch.tensor([world.token_sizes[d] for d in objective.event_dims]).prod()
         self.event_pattern = f'({" ".join(objective.event_dims)})'
 
         # alpha
