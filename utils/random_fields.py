@@ -3,7 +3,8 @@ import einops
 import torch_harmonics
 
 from einops.layers.torch import EinMix
-from utils.components import default
+from utils.components import default, GatedFFN
+from utils.config import WorldConfig
 
 
 class SphericalDiffusionNoise(torch.nn.Module):
@@ -111,7 +112,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
         return eta
     
 class RandomField(torch.nn.Module):
-    def __init__(self, model_dim: int, world):
+    def __init__(self, model_dim: int, world: WorldConfig, has_ffn: bool = True):
         super().__init__()
         horizontal = torch.tensor([500., 1000., 2000., 4000.])
         temporal = torch.tensor([1, 2, 4, 6])
@@ -130,11 +131,23 @@ class RandomField(torch.nn.Module):
             lon_slice=slice(0, 2 * world.token_sizes['w'], 2)
         )
 
-        self.projection = EinMix(
-            pattern = f'... c t h w -> ... {world.flat_token_pattern} d',
-            weight_shape = 'v c d',
-            c = channels, d = model_dim, **world.token_sizes,
+        self.projection = torch.nn.Sequential()
+        
+        self.projection.add_module(
+            name = 'einmix', 
+            module = EinMix(
+                pattern = f'... c t h w -> ... {world.flat_token_pattern} d',
+                weight_shape = 'v c d',
+                c = channels, d = model_dim, **world.token_sizes,
+            )
         )
+        
+        if has_ffn:
+            self.projection.add_module(
+                name = 'ffn',
+                module = GatedFFN(model_dim)
+            )
+            
 
     def forward(self, tokens, rng = None):
         grf = self.noise_generator((tokens.size(0),), rng)

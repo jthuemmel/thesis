@@ -140,7 +140,7 @@ class EinMask(torch.nn.Module):
 
         # iterate
         for s in range(S):
-            # select visible tokens at this step
+            # gather tokens visible at this step
             context = tokens.gather(1, src_idx[s])
 
             # add position codes and prepare queries
@@ -156,13 +156,12 @@ class EinMask(torch.nn.Module):
             # map context to latents
             latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
             for read in self.encoder:
-                kv = torch.cat([context, latents], dim = 1)
-                latents = read(q = latents, kv = kv)
+                latents = read(q = latents, kv = torch.cat([context, latents], dim = 1))
 
             # map latents to queries
             queries = self.decoder(q = queries, kv = latents)
 
-            # update tokens
+            # scatter tokens predicted at this step
             tokens = tokens.scatter(1, tgt_idx[s], queries)
 
         # map all tokens back to fields
