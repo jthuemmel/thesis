@@ -49,12 +49,8 @@ class Experiment(DistributedTrainer):
         return self._cfg.world
     
     @property
-    def objective_cfg(self):
-        return self._cfg.objective       
-
-    @property
     def use_fair_crps(self):
-        return default(self.objective_cfg.ens_size, 1) > 1
+        return default(self.world.ens_size, 1) > 1
     
     # DATA
     def lens_data(self):
@@ -201,11 +197,11 @@ class Experiment(DistributedTrainer):
     def create_model(self):
         self.frcst_masking = ForecastMasking(
             world = self.world, 
-            objective=self.objective_cfg
             ).to(self.device)
+        
         self.masking = MultinomialMasking(
             world = self.world, 
-            objective=self.objective_cfg
+            objective=self._cfg.objective
         ).to(self.device)
 
         model = EinMask(network=self.model_cfg, world=self.world)
@@ -276,7 +272,7 @@ class Experiment(DistributedTrainer):
 
         src = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
 
-        prediction = model(batch, src, members = self.objective_cfg.ens_size, rng = self.generator)
+        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
 
@@ -284,12 +280,14 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        src, loss_mask, weight = self.masking((batch.size(0),), rng = self.generator)
+        src, tgt, binary_tgt, mask_weight = self.masking((batch.size(0),), rng = self.generator)
 
-        prediction = model(batch, src, members = self.objective_cfg.ens_size, rng = self.generator)
+        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
 
-        mask = torch.logical_and(self.mask_to_field(loss_mask), self.land_sea_mask)
-        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = weight)
+        mask = torch.logical_and(self.mask_to_field(binary_tgt), self.land_sea_mask)
+        mask_weight = self.mask_to_field(mask_weight)
+        
+        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = mask_weight)
 
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
@@ -341,7 +339,7 @@ class Experiment(DistributedTrainer):
         meta_data = self.val_dataset.dataset
         time, lat, lon = meta_data.time, meta_data.lat, meta_data.lon
         ens = np.arange(pred.shape[-1])
-        tau = self.objective_cfg.tau
+        tau = self.world.tau
         T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
         lag = np.arange(1, 1 + ((T - tau) * tt))
         history = tau * tt

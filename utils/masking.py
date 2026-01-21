@@ -2,25 +2,6 @@ import torch
 import einops
 from utils.config import WorldConfig, ObjectiveConfig, default
     
-class ForecastMasking(torch.nn.Module):
-    def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
-        super().__init__()
-        self.world = world
-        self.objective = objective
-        self.event_pattern = 't'
-        self.register_buffer("prefix_frames", torch.tensor(objective.tau, dtype = torch.long))
-        self.register_buffer("total_frames", torch.tensor(world.token_sizes["t"], dtype = torch.long))
-    
-    def forward(self, shape: tuple, return_indices: bool = True):
-        mask = torch.zeros((self.total_frames,), device = self.total_frames.device)
-        mask[:self.prefix_frames] = 1
-        mask = einops.repeat(mask, f'{self.event_pattern} -> {self.world.flat_token_pattern}', **self.world.token_sizes)
-        if return_indices:
-            indices = mask.nonzero(as_tuple=True)[0]
-            return indices.expand(*shape,-1)
-        else:
-            return mask.expand(*shape, -1).bool().logical_not()
-    
 # KUMARASWAMY DISTRIBUTION
 class StableKumaraswamy(torch.nn.Module):
     '''Numerically stable methods for Kumaraswamy sampling, courtesy of Wasserman et al 2024'''
@@ -62,6 +43,24 @@ class StableKumaraswamy(torch.nn.Module):
         return self.quantile(t), self.quantile_dt(t)
 
 # MASKING STRATEGIES
+class ForecastMasking(torch.nn.Module):
+    def __init__(self, world: WorldConfig):
+        super().__init__()
+        self.world = world
+        self.event_pattern = 't'
+        self.register_buffer("prefix_frames", torch.tensor(world.tau, dtype = torch.long))
+        self.register_buffer("total_frames", torch.tensor(world.token_sizes["t"], dtype = torch.long))
+    
+    def forward(self, shape: tuple, return_indices: bool = True):
+        mask = torch.zeros((self.total_frames,), device = self.total_frames.device)
+        mask[:self.prefix_frames] = 1
+        mask = einops.repeat(mask, f'{self.event_pattern} -> {self.world.flat_token_pattern}', **self.world.token_sizes)
+        if return_indices:
+            indices = mask.nonzero(as_tuple=True)[0]
+            return indices.expand(*shape,-1)
+        else:
+            return mask.expand(*shape, -1).bool().logical_not()
+        
 class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
         super().__init__()
@@ -70,8 +69,9 @@ class MultinomialMasking(torch.nn.Module):
         self.objective = objective
 
         #schedule
-        self.schedule = StableKumaraswamy(c0=objective.c0, c1=objective.c1)
-        self.prior = StableKumaraswamy(c1= self.objective.alpha)
+        self.src_rates = StableKumaraswamy(c0=objective.c0_src, c1=objective.c1_src)
+        self.tgt_rates = StableKumaraswamy(c0=objective.c0_tgt, c1=objective.c1_tgt)
+        self.prior = StableKumaraswamy(c0=objective.c0_prior, c1= objective.c1_prior)
 
         # attributes
         self.k_min = default(objective.k_min, 1)
@@ -82,12 +82,29 @@ class MultinomialMasking(torch.nn.Module):
         self.num_events = torch.tensor([world.token_sizes[d] for d in objective.event_dims]).prod()
         self.event_pattern = f'({" ".join(objective.event_dims)})'
 
+    def expand_events(self, *args):
+        return einops.repeat(
+            [*args],
+            f'args ... {self.event_pattern} -> args ... {self.world.flat_token_pattern}', 
+            **self.world.token_sizes
+            )
+    
+    def k_from_rates(self, r: float):
+        return int(self.k_min + (self.k_max - self.k_min) * r)
+
     def forward(self, shape: tuple, rng: torch.Generator = None):
-        p, _ = self.prior((*shape, self.num_events), rng)
-        p = einops.repeat(p, f'... {self.event_pattern} -> ... {self.world.flat_token_pattern}', 
-                             **self.world.token_sizes)
-        r, w = self.schedule((1,), rng)
-        k = self.k_min + (self.k_max - self.k_min) * r
-        indices = torch.multinomial(p, int(k), generator=rng)
-        mask = torch.ones_like(p, dtype= torch.bool).scatter_(1, indices, False)
-        return indices, mask, w
+        # sample prior
+        p, w = self.prior((*shape, self.num_events), rng)
+        p, w = self.expand_events(p, w)
+        
+        # sample rates
+        r_src, _ = self.src_rates((1,), rng)
+        r_tgt, _ = self.tgt_rates((1,), rng)
+        k_src = self.k_from_rates(r_src)
+        k_tgt = self.k_from_rates(r_tgt)
+
+        # sample indices
+        src = torch.multinomial(p, k_src, generator=rng)
+        tgt = torch.multinomial(1 - p, k_tgt, generator = rng)
+        binary = torch.zeros_like(p, dtype= torch.bool).scatter_(1, tgt, True)
+        return src, tgt, binary, w

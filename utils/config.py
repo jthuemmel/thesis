@@ -107,34 +107,28 @@ class DatasetConfig:
 
 @dataclass
 class ObjectiveConfig:
-    # prior
-    prior: str = 'dirichlet'
-    # frcst context
-    tau: int = 2
-    # args for masked diffusion sampling
-    stratify: bool = True
-    progressive: bool = False
-    discretise: bool = False
-    # ens size
-    ens_size: int = 1
     # event dims for prior
     event_dims: List[str] = field(default_factory=lambda: ['t'])
-    # kumaraswamy concentrations
-    c1: float = 1.
-    c0: float = 1.
-    # dirichlet concentration
-    alpha: float = 0.5
+    # concentrations:
+    c0_src: float = 1.
+    c1_src: float = 1.
+    c0_tgt: float = 1.
+    c1_tgt: float = 1.
+    c0_prior: float = 1.
+    c1_prior: float = 1.
     # multinomial bounds
     k_min: Optional[int] = None
     k_max: Optional[int] = None
     # schedule bounded [eps, 1-eps]
-    epsilon: float = 0.05
+    epsilon: float = 1e-2
 
 @dataclass
 class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
     batch_size: int
+    ens_size: int = 1
+    tau: int = 2   
 
     # derived fields
     field_layout: tuple = field(init=False)
@@ -242,5 +236,5 @@ class MTMConfig:
             data=DatasetConfig(**cfg.data),
             model =  NetworkConfig(**cfg.model),
             world=WorldConfig(**cfg.world),
-            objective=ObjectiveConfig(**cfg.objective)
+            objective=ObjectiveConfig(**cfg.objective),
         )

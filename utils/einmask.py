@@ -108,7 +108,7 @@ class EinMask(torch.nn.Module):
     def unfreeze_weights(m):
         for param in m.parameters():
             param.requires_grad = True
-
+    
     def forward(self, 
                 fields: torch.FloatTensor, 
                 srcs: List[torch.LongTensor] | torch.LongTensor, 
@@ -134,23 +134,25 @@ class EinMask(torch.nn.Module):
 
         # iterate
         for src, tgt in zip(srcs, tgts, strict=True):
-            # expand src/tgt/latents to ensemble form
-            src = einops.repeat(src, 'b ... -> (b e) ...', e = E, b = B)
-            tgt = einops.repeat(tgt, 'b ... -> (b e) ...', e = E, b = B)
+            # expand src/tgt and latents to ensemble form
             latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
+            src_coo = einops.repeat(self.coordinates[src], 'b ... -> (b e) ...', e = E, b = B)
+            tgt_coo = einops.repeat(self.coordinates[tgt], 'b ... -> (b e) ...', e = E, b = B)
+            src_idx = einops.repeat(src, 'b ... -> (b e) ... d', d = D, e = E, b = B)
+            tgt_idx = einops.repeat(tgt, 'b ... -> (b e) ... d', d = D, e = E, b = B)
 
             # gather tokens visible at this step
-            context = tokens.gather(1, einops.repeat(src, '... -> ... d', d = D))
+            context = tokens.gather(1, src_idx)
 
             # add position codes and prepare queries
-            context = context + self.src_positions(self.coordinates[src])
-            queries = self.tgt_positions(self.coordinates[tgt])
+            context = context + self.src_positions(src_coo)
+            queries = self.tgt_positions(tgt_coo)
 
             # maybe condition on noise
             if exists(self.noise_generator):
                 context, noise = self.noise_generator(context, rng = rng)
-                queries = queries + noise.gather(1, einops.repeat(tgt, '... -> ... d', d = D))
-                context = context + noise.gather(1, einops.repeat(src, '... -> ... d', d = D))
+                queries = queries + noise.gather(1, tgt_idx)
+                context = context + noise.gather(1, src_idx)
 
             # map context to latents
             for read in self.encoder:
@@ -160,7 +162,7 @@ class EinMask(torch.nn.Module):
             queries = self.decoder(q = queries, kv = latents)
 
             # scatter tokens predicted at this step
-            tokens = tokens.scatter(1, einops.repeat(tgt, '... -> ... d', d = D), queries)
+            tokens = tokens.scatter(1, tgt_idx, queries)
 
         # map all tokens back to fields
         fields = self.to_fields(tokens)
