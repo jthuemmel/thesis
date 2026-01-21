@@ -15,7 +15,7 @@ class EinMask(torch.nn.Module):
         self.world = world
 
         # maybe use generative noise
-        self.noise_generator = RandomField(network.dim, world) if default(network.num_tails, 1) <= 1 else None
+        self.noise_generator = RandomField(network.dim, world, has_ffn=True) if default(network.num_tails, 1) <= 1 else None
 
         # I/O
         self.to_tokens = EinMix(
@@ -111,50 +111,48 @@ class EinMask(torch.nn.Module):
 
     def forward(self, 
                 fields: torch.FloatTensor, 
-                srcs: torch.LongTensor, 
-                tgts: Optional[torch.LongTensor] = None,
+                srcs: List[torch.LongTensor] | torch.LongTensor, 
+                tgts: List[torch.LongTensor] | torch.LongTensor = None,
                 members: Optional[int] = None, 
                 rng: Optional[torch.Generator] = None
                 ) -> torch.FloatTensor:
-        # shapes
         B = fields.size(0)
         D = self.network.dim
         K = default(self.network.num_tails, 1)
         E = default(members, 1)
-        S = srcs.size(0) if srcs.ndim > 2 else 1
-        
-        # maybe expand srcs/tgts to sequence form
-        if tgts is None: tgts = self.indices.expand(S, B, -1)
-        if tgts.ndim == 2: tgts = tgts.expand(S, -1, -1)
-        if srcs.ndim == 2: srcs = srcs.expand(S, -1, -1)
 
-        # expand to ensemble form
-        src_idx = einops.repeat(srcs, 's b ... -> s (b e) ... d', d = D, e = E, b = B, s = S)
-        tgt_idx = einops.repeat(tgts, 's b ... -> s (b e) ... d', d = D, e = E, b = B, s = S)
-        src_coo = einops.repeat(self.coordinates[srcs], 's b ... -> s (b e) ...', e = E, b = B, s = S)
-        tgt_coo = einops.repeat(self.coordinates[tgts], 's b ... -> s (b e) ...', e = E, b = B, s = S)
-        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
+        # default tgts as all indices    
+        tgts = default(tgts, self.indices.expand(B, -1))
 
         # embed full fields as tokens
+        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
         tokens = self.to_tokens(fields)
 
+        # ensure srcs/tgts are lists
+        if not isinstance(srcs, list): srcs = [srcs]
+        if not isinstance(tgts, list): tgts = [tgts] * len(srcs)
+
         # iterate
-        for s in range(S):
+        for src, tgt in zip(srcs, tgts, strict=True):
+            # expand src/tgt/latents to ensemble form
+            src = einops.repeat(srcs, 'b ... -> (b e) ...', e = E, b = B)
+            tgt = einops.repeat(tgts, 'b ... -> (b e) ...', e = E, b = B)
+            latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
+
             # gather tokens visible at this step
-            context = tokens.gather(1, src_idx[s])
+            context = tokens.gather(1, einops.repeat(src, '... -> ... d', d = D))
 
             # add position codes and prepare queries
-            context = context + self.src_positions(src_coo[s])
-            queries = self.tgt_positions(tgt_coo[s])
+            context = context + self.src_positions(self.coordinates[src])
+            queries = self.tgt_positions(self.coordinates[tgt])
 
             # maybe condition on noise
             if exists(self.noise_generator):
                 context, noise = self.noise_generator(context, rng = rng)
-                queries = queries + noise.gather(1, tgt_idx[s])
-                context = context + noise.gather(1, src_idx[s])
+                queries = queries + noise.gather(1, einops.repeat(tgt, '... -> ... d', d = D))
+                context = context + noise.gather(1, einops.repeat(src, '... -> ... d', d = D))
 
             # map context to latents
-            latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
             for read in self.encoder:
                 latents = read(q = latents, kv = torch.cat([context, latents], dim = 1))
 
@@ -162,7 +160,7 @@ class EinMask(torch.nn.Module):
             queries = self.decoder(q = queries, kv = latents)
 
             # scatter tokens predicted at this step
-            tokens = tokens.scatter(1, tgt_idx[s], queries)
+            tokens = tokens.scatter(1, einops.repeat(tgt, '... -> ... d', d = D), queries)
 
         # map all tokens back to fields
         fields = self.to_fields(tokens)
