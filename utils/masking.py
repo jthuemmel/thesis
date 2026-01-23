@@ -61,6 +61,7 @@ class ForecastMasking(torch.nn.Module):
         else:
             return mask.expand(*shape, -1).bool().logical_not()
         
+        
 class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
         super().__init__()
@@ -79,7 +80,7 @@ class MultinomialMasking(torch.nn.Module):
 
         # Events
         assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
-        self.num_events = torch.tensor([world.token_sizes[d] for d in objective.event_dims]).prod()
+        self.register_buffer('events', torch.tensor([world.token_sizes[d] for d in objective.event_dims]).prod())
         self.event_pattern = f'({" ".join(objective.event_dims)})'
 
     def expand_events(self, *args):
@@ -94,17 +95,18 @@ class MultinomialMasking(torch.nn.Module):
 
     def forward(self, shape: tuple, rng: torch.Generator = None):
         # sample prior
-        p, w = self.prior((*shape, self.num_events), rng)
-        p, w = self.expand_events(p, w)
+        t = torch.rand((*shape, self.events), device=self.events.device, generator= rng)
+        t = t * (1.0 - 2.0 * self.prior.epsilon) + self.prior.epsilon
+        psrc, ptgt = self.prior.quantile(t), self.prior.quantile(1 - t)
+        psrc, ptgt = self.expand_events(psrc, ptgt)
         
         # sample rates
         r_src, _ = self.src_rates((1,), rng)
         r_tgt, _ = self.tgt_rates((1,), rng)
-        k_src = self.k_from_rates(r_src)
-        k_tgt = self.k_from_rates(r_tgt)
 
         # sample indices
-        src = torch.multinomial(p, k_src, generator=rng)
-        tgt = torch.multinomial(1 - p, k_tgt, generator = rng)
-        binary = torch.zeros_like(p, dtype= torch.bool).scatter_(1, tgt, True)
-        return src, tgt, binary, w
+        src = torch.multinomial(psrc, self.k_from_rates(r_src), generator=rng)
+        tgt = torch.multinomial(ptgt, self.k_from_rates(r_tgt), generator = rng)
+
+        binary = torch.zeros_like(psrc, dtype= torch.bool).scatter_(1, tgt, True)
+        return src, tgt, binary, None

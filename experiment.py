@@ -285,7 +285,7 @@ class Experiment(DistributedTrainer):
         prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
 
         mask = torch.logical_and(self.mask_to_field(binary_tgt), self.land_sea_mask)
-        mask_weight = self.mask_to_field(mask_weight)
+        mask_weight = self.mask_to_field(mask_weight) if exists(mask_weight) else torch.ones_like(mask, dtype = torch.float32)
         
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = mask_weight)
 
