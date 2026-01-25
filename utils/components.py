@@ -145,7 +145,7 @@ class TransformerBlock(torch.nn.Module):
     def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, ctx: Optional[torch.Tensor] = None, **attn_kwargs):
         skip = q if self.has_skip else 0.
         q = self.att_norm(q, ctx)
-        kv = default(self.att_norm(kv, ctx), q)
+        kv = self.att_norm(kv, ctx) if exists(kv) else q
         q = skip + self.drop_path(self.att(q, kv, kv, **attn_kwargs))
         q = q + self.drop_path(self.ffn(self.ffn_norm(q, ctx)))
         return q
