@@ -58,7 +58,11 @@ class EinMask(torch.nn.Module):
 
         # latent transformer
         self.transformer = torch.nn.ModuleList([
-            InterfaceBlock(network.dim, network.num_compute_blocks, drop_path=network.drop_path) for _ in range(network.num_layers)
+            InterfaceBlock(network.dim, 
+                           network.num_compute_blocks, 
+                           drop_path=network.drop_path, 
+                           use_checkpoint=network.use_checkpoint)
+            for _ in range(network.num_layers)
         ])
 
         # Weight initialization
