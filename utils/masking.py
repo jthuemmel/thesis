@@ -56,10 +56,11 @@ class ForecastMasking(torch.nn.Module):
         mask[:self.prefix_frames] = 1
         mask = einops.repeat(mask, f'{self.event_pattern} -> {self.world.flat_token_pattern}', **self.world.token_sizes)
         if return_indices:
-            indices = mask.nonzero(as_tuple=True)[0]
-            return indices.expand(*shape,-1)
+            src = mask.nonzero(as_tuple=True)[0]
+            tgt = mask.bool().logical_not().nonzero(as_tuple=True)[0]
+            return src.expand(*shape,-1), tgt.expand(*shape,-1)
         else:
-            return mask.expand(*shape, -1).bool().logical_not()
+            return mask.expand(*shape, -1).bool().logical_not(), mask.expand(*shape, -1).bool()
         
         
 class MultinomialMasking(torch.nn.Module):

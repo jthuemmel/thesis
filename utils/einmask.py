@@ -15,7 +15,7 @@ class EinMask(torch.nn.Module):
         self.world = world
 
         # maybe use generative noise
-        self.noise_generator = RandomField(network.dim, world, has_ffn=False) if default(network.num_tails, 1) <= 1 else None
+        self.noise_generator = RandomField(network.dim, world, has_ffn=False) if default(network.num_tails, 1) == 1 else None
 
         # I/O
         self.to_tokens = EinMix(

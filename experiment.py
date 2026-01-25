@@ -270,9 +270,9 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        src = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
+        src, tgt = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
 
-        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
+        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
 
