@@ -57,22 +57,9 @@ class EinMask(torch.nn.Module):
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
 
         # latent transformer
-        self.encoder = torch.nn.ModuleList([
-            TransformerBlock(
-                dim = network.dim, 
-                dim_heads = network.dim_heads, 
-                dim_ctx = network.dim_noise,
-                drop_path = network.drop_path,
-                ) 
-                for _ in range(network.num_layers)
-            ])
-        
-        self.decoder = TransformerBlock(
-                dim = network.dim, 
-                dim_heads = network.dim_heads, 
-                dim_ctx = network.dim_noise,
-                has_skip=False,
-                )
+        self.transformer = torch.nn.ModuleList([
+            InterfaceBlock(network.dim, network.num_compute_blocks, drop_path=network.drop_path) for _ in range(network.num_layers)
+        ])
 
         # Weight initialization
         self.apply(self.base_init)
@@ -155,11 +142,10 @@ class EinMask(torch.nn.Module):
                 context = context + noise.gather(1, src_idx)
 
             # map context to latents
-            for read in self.encoder:
-                latents = read(q = latents, kv = torch.cat([context, latents], dim = 1))
-
-            # map latents to queries
-            queries = self.decoder(q = queries, kv = latents)
+            for block in self.transformer:
+                queries, latents = block(
+                    x = torch.cat([queries, context], dim = 1), z = latents, q = queries
+                )
 
             # scatter tokens predicted at this step
             tokens = tokens.scatter(1, tgt_idx, queries)

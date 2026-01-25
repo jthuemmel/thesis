@@ -7,7 +7,7 @@ class InterfaceNetwork(torch.nn.Module):
         self.transformer = torch.nn.ModuleList([
             InterfaceBlock(model.dim, 
                            dim_heads=model.dim_heads, 
-                           num_blocks= model.num_compute_blocks, 
+                           num_compute= model.num_compute_blocks, 
                            dim_ctx = model.dim_noise,
                            use_checkpoint=model.use_checkpoint)
             for _ in range(model.num_layers)
@@ -27,7 +27,7 @@ class Perceiver(torch.nn.Module):
         super().__init__()
         self.transformer = InterfaceBlock(
             dim=model.dim, 
-            num_blocks=model.num_layers,
+            num_compute=model.num_layers,
             dim_ctx=model.dim_noise, 
             dim_heads=model.dim_heads, 
             write_has_skip=False, 
@@ -41,7 +41,7 @@ class Perceiver(torch.nn.Module):
                 ctx: Optional[torch.Tensor] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         q = self.queries.weight.expand(x.size(0), -1, -1)
-        return self.transformer(x = x, z = z, query = q, ctx = ctx)
+        return self.transformer(x = x, z = z, q = q, ctx = ctx)
 
 class ViT(torch.nn.Module):
     def __init__(self, model, world):

@@ -89,7 +89,7 @@ class NetworkConfig:
     drop_path: Optional[float] = 0.0
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
-    use_checkpoint: Optional[bool] = True
+    use_checkpoint: Optional[bool] = False
     backbone: Optional[str] = None
 
 @dataclass

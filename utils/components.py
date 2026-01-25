@@ -151,21 +151,28 @@ class TransformerBlock(torch.nn.Module):
         return q
 
 class InterfaceBlock(torch.nn.Module):
-    def __init__(self, dim: int, num_blocks: int = 1, dim_heads: int = 64, dim_ctx: Optional[int] = None, 
+    def __init__(self, 
+                 dim: int, 
+                 num_compute: int = 1, 
+                 dim_heads: int = 64, 
+                 dim_ctx: Optional[int] = None, 
+                 drop_path: float = 0.,
                  write_has_skip: bool = True, 
                  use_checkpoint: bool = False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.read = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx)
-        self.compute = torch.nn.ModuleList([TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx) for _ in range(num_blocks)])
+        self.compute = torch.nn.ModuleList([
+            TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, drop_path=drop_path) for _ in range(num_compute)
+            ])
         self.write = TransformerBlock(dim, dim_heads=dim_heads, dim_ctx=dim_ctx, has_skip= write_has_skip)
 
     def forward(self, 
                 x: torch.Tensor,
                 z: torch.Tensor, 
-                query: Optional[torch.Tensor] = None, 
+                q: Optional[torch.Tensor] = None, 
                 ctx: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        q = query if exists(query) else x
+        q = default(q, x)
         z = checkpoint(self.read, z, x, ctx, use_reentrant=False) if self.use_checkpoint else self.read(z, x, ctx)
         for block in self.compute:
             z = block(z, ctx = ctx)
