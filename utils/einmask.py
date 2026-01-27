@@ -115,13 +115,13 @@ class EinMask(torch.nn.Module):
         # default tgts as all indices    
         tgts = default(tgts, self.indices.expand(B, -1))
 
-        # embed full fields as tokens
-        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
-        tokens = self.to_tokens(fields)
-
         # ensure srcs/tgts are lists
         if not isinstance(srcs, list): srcs = [srcs]
         if not isinstance(tgts, list): tgts = [tgts] * len(srcs)
+        
+        # embed full fields as tokens
+        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
+        tokens = self.to_tokens(fields)
 
         # iterate
         for src, tgt in zip(srcs, tgts, strict=True):
@@ -147,9 +147,7 @@ class EinMask(torch.nn.Module):
 
             # map context to latents
             for block in self.transformer:
-                queries, latents = block(
-                    x = torch.cat([queries, context], dim = 1), z = latents, q = queries
-                )
+                queries, latents = block(x = context, z = latents, q = queries)
 
             # scatter tokens predicted at this step
             tokens = tokens.scatter(1, tgt_idx, queries)

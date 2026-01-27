@@ -121,6 +121,8 @@ class ObjectiveConfig:
     k_max: Optional[int] = None
     # schedule bounded [eps, 1-eps]
     epsilon: float = 1e-2
+    # stratification
+    stratify: Optional[bool] = False
 
 @dataclass
 class WorldConfig:
