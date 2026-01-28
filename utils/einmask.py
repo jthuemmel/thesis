@@ -57,16 +57,17 @@ class EinMask(torch.nn.Module):
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
 
         # latent transformer
-        self.transformer = torch.nn.ModuleList([
-            InterfaceBlock(network.dim, 
+        self.transformer = InterfaceBlock(network.dim, 
                            network.num_compute_blocks, 
                            drop_path=network.drop_path, 
+                           write_has_skip= False,
                            use_checkpoint=network.use_checkpoint)
-            for _ in range(network.num_layers)
-        ])
 
         # Weight initialization
         self.apply(self.base_init)
+
+        if self.network.zero_init:
+            self.apply(self.zero_init)
     
     @staticmethod
     def base_init(m):
@@ -89,6 +90,12 @@ class EinMask(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
             if m.weight is not None: # CLN weight close to 0
                 torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
+
+    @staticmethod
+    def zero_init(m):
+        if isinstance(m, TransformerBlock):
+            torch.nn.init.zeros_(m.attn.out_proj.weight)
+            torch.nn.init.zeros_(m.ff.out_proj.weight)
 
     @staticmethod
     def freeze_weights(m):
@@ -146,8 +153,7 @@ class EinMask(torch.nn.Module):
                 context = context + noise.gather(1, src_idx)
 
             # map context to latents
-            for block in self.transformer:
-                queries, latents = block(x = context, z = latents, q = queries)
+            queries, latents = self.transformer(x = context, z = latents, q = queries)
 
             # scatter tokens predicted at this step
             tokens = tokens.scatter(1, tgt_idx, queries)

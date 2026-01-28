@@ -91,6 +91,7 @@ class NetworkConfig:
     wavelengths: Optional[List] = None
     use_checkpoint: Optional[bool] = False
     backbone: Optional[str] = None
+    zero_init: Optional[bool] = False
 
 @dataclass
 class DatasetConfig:
