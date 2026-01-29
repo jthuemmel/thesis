@@ -94,8 +94,8 @@ class EinMask(torch.nn.Module):
     @staticmethod
     def zero_init(m):
         if isinstance(m, TransformerBlock):
-            torch.nn.init.zeros_(m.attn.out_proj.weight)
-            torch.nn.init.zeros_(m.ff.out_proj.weight)
+            torch.nn.init.zeros_(m.att.to_out.weight)
+            torch.nn.init.zeros_(m.ffn.to_out.weight)
 
     @staticmethod
     def freeze_weights(m):
