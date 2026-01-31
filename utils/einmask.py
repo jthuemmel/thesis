@@ -6,6 +6,13 @@ from einops.layers.torch import EinMix
 from utils.components import *
 from utils.config import *
 from utils.random_fields import RandomField
+import einops
+import torch
+
+from einops.layers.torch import EinMix
+
+from utils.components import *
+from utils.config import *
 
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
@@ -13,9 +20,6 @@ class EinMask(torch.nn.Module):
         # store configs
         self.network = network
         self.world = world
-
-        # maybe use generative noise
-        self.noise_generator = RandomField(network.dim, world, has_ffn=False) if default(network.num_tails, 1) == 1 else None
 
         # I/O
         self.to_tokens = EinMix(
@@ -33,6 +37,17 @@ class EinMask(torch.nn.Module):
             **world.patch_sizes, **world.token_sizes 
             )
                 
+        # noise mapping
+        if default(network.num_tails, 1) > 1:
+            self.to_noise = None
+            self.noise_generator = None
+        elif exists(network.dim_noise):
+            self.to_noise = GatedFFN(network.dim_noise)
+            self.noise_generator = None
+        else:
+            self.noise_generator = RandomField(network.dim, world, has_ffn=False)
+            self.to_noise = None
+        
         # positional embeddings
         self.src_positions = ContinuousPositionalEmbedding(
             dim_per_coord=network.dim_coords, 
@@ -57,20 +72,21 @@ class EinMask(torch.nn.Module):
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
 
         # latent transformer
-        self.transformer = InterfaceBlock(network.dim, 
-                           network.num_compute_blocks, 
-                           drop_path=network.drop_path, 
-                           write_has_skip= False,
-                           use_checkpoint=network.use_checkpoint)
+        self.encoder = torch.nn.ModuleList([
+            TransformerBlock(network.dim, drop_path=network.drop_path, dim_ctx=network.dim_noise)
+            for _ in range(network.num_layers)
+        ])
+        
+        self.decoder = torch.nn.ModuleList([
+            TransformerBlock(network.dim, drop_path=network.drop_path, dim_ctx=network.dim_noise)
+            for _ in range(network.num_compute_blocks)
+        ])
 
         # Weight initialization
         self.apply(self.base_init)
 
-        if self.network.zero_init:
-            self.apply(self.zero_init)
-    
     @staticmethod
-    def base_init(m):
+    def base_init(m: torch.nn.Module):
         # linear
         if isinstance(m, torch.nn.Linear):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
@@ -90,22 +106,6 @@ class EinMask(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
             if m.weight is not None: # CLN weight close to 0
                 torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
-
-    @staticmethod
-    def zero_init(m):
-        if isinstance(m, TransformerBlock):
-            torch.nn.init.zeros_(m.att.to_out.weight)
-            torch.nn.init.zeros_(m.ffn.to_out.weight)
-
-    @staticmethod
-    def freeze_weights(m):
-        for param in m.parameters():
-            param.requires_grad = False
-
-    @staticmethod
-    def unfreeze_weights(m):
-        for param in m.parameters():
-            param.requires_grad = True
     
     def forward(self, 
                 fields: torch.FloatTensor, 
@@ -118,45 +118,46 @@ class EinMask(torch.nn.Module):
         D = self.network.dim
         K = default(self.network.num_tails, 1)
         E = default(members, 1)
-
-        # default tgts as all indices    
         tgts = default(tgts, self.indices.expand(B, -1))
 
-        # ensure srcs/tgts are lists
-        if not isinstance(srcs, list): srcs = [srcs]
-        if not isinstance(tgts, list): tgts = [tgts] * len(srcs)
+        # expand to ensemble form
+        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
+        latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
+        coo = einops.repeat(self.coordinates, '... -> (b e) ...', b = B, e = E)
+        src_idx = einops.repeat(srcs, 'b ... -> (b e) ... d', d = D, e = E, b = B)
+        tgt_idx = einops.repeat(tgts, 'b ... -> (b e) ... d', d = D, e = E, b = B)
         
         # embed full fields as tokens
-        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
-        tokens = self.to_tokens(fields)
+        tokens = self.to_tokens(fields) + self.src_positions(coo)
 
-        # iterate
-        for src, tgt in zip(srcs, tgts, strict=True):
-            # expand src/tgt and latents to ensemble form
-            latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
-            src_coo = einops.repeat(self.coordinates[src], 'b ... -> (b e) ...', e = E, b = B)
-            tgt_coo = einops.repeat(self.coordinates[tgt], 'b ... -> (b e) ...', e = E, b = B)
-            src_idx = einops.repeat(src, 'b ... -> (b e) ... d', d = D, e = E, b = B)
-            tgt_idx = einops.repeat(tgt, 'b ... -> (b e) ... d', d = D, e = E, b = B)
+        # gather tokens visible at this step
+        context = tokens.gather(1, src_idx)
 
-            # gather tokens visible at this step
-            context = tokens.gather(1, src_idx)
+        # prepare queries
+        queries = self.tgt_positions(coo).gather(1, tgt_idx)
 
-            # add position codes and prepare queries
-            context = context + self.src_positions(src_coo)
-            queries = self.tgt_positions(tgt_coo)
+        # maybe create functional noise
+        if exists(self.to_noise):
+            ctx = torch.randn(B * E, 1, self.network.dim_noise, generator = rng, device = fields.device)
+            ctx = self.to_noise(ctx)
+        elif exists(self.noise_generator):
+            context, noise = self.noise_generator(context, rng = rng)
+            queries = queries + noise.gather(1, tgt_idx)
+            context = context + noise.gather(1, src_idx)
+            ctx = None
+        else:
+            ctx = None
 
-            # maybe condition on noise
-            if exists(self.noise_generator):
-                context, noise = self.noise_generator(context, rng = rng)
-                queries = queries + noise.gather(1, tgt_idx)
-                context = context + noise.gather(1, src_idx)
+        # map context to latents
+        for read in self.encoder:
+            latents = read(q = latents, kv = torch.cat([latents, context], dim = 1), ctx = ctx)
 
-            # map context to latents
-            queries, latents = self.transformer(x = context, z = latents, q = queries)
+        # map latents to queries
+        for write in self.decoder:
+            queries = write(q = queries, kv = torch.cat([queries, latents], dim = 1), ctx = ctx)
 
-            # scatter tokens predicted at this step
-            tokens = tokens.scatter(1, tgt_idx, queries)
+        # scatter tokens predicted at this step
+        tokens = tokens.scatter(1, tgt_idx, queries)
 
         # map all tokens back to fields
         fields = self.to_fields(tokens)

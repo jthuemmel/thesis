@@ -323,7 +323,11 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot()
+            plt.figure(figsize=(12,4))
+            plt.subplot(121)
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(122)
+            ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 

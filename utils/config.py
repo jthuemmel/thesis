@@ -11,6 +11,8 @@ OmegaConf.register_new_resolver(
     replace=True,
 )
 
+OmegaConf.register_new_resolver("idiv", lambda a, b: int(a // b), replace=True)
+
 OmegaConf.register_new_resolver(
     "len",
     lambda x: len(x),

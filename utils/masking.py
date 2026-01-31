@@ -141,4 +141,4 @@ class MultinomialMasking(torch.nn.Module):
         src_binary = torch.zeros_like(src_probs, dtype= torch.bool).scatter_(1, src_indices, True)
         tgt_binary = torch.zeros_like(src_probs, dtype= torch.bool).scatter_(1, tgt_indices, True)
 
-        return src_indices, None, tgt_binary, None
+        return src_indices, tgt_indices, tgt_binary, None
