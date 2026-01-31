@@ -80,7 +80,9 @@ class NetworkConfig:
     dim: int
     num_layers: Optional[int] = None
     num_latents: Optional[int] = None
+    num_read_blocks: Optional[int] = None
     num_compute_blocks: Optional[int] = None
+    num_write_blocks: Optional[int] = None
     num_cls: Optional[int] = None
     num_tails: Optional[int] = None
     dim_in: Optional[int] = None
