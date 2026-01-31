@@ -73,7 +73,7 @@ class EinMask(torch.nn.Module):
 
         # latent transformer
         self.encoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim, drop_path=0.0, dim_ctx=network.dim_noise)
+            TransformerBlock(network.dim, dim_ctx=network.dim_noise)
             for _ in range(network.num_read_blocks)
         ])
 
@@ -83,8 +83,8 @@ class EinMask(torch.nn.Module):
         ])
         
         self.decoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim, drop_path=0.0, dim_ctx=network.dim_noise)
-            for _ in range(network.num_write_blocks)
+            TransformerBlock(network.dim, dim_ctx=network.dim_noise, has_skip= n > 0)
+            for n in range(network.num_write_blocks)
         ])
 
         # Weight initialization
@@ -155,7 +155,7 @@ class EinMask(torch.nn.Module):
 
         # map context to latents
         for read in self.encoder:
-            latents = read(q = latents, kv = torch.cat([context, latents]), ctx = ctx)
+            latents = read(q = latents, kv = torch.cat([context, latents], dim = 1), ctx = ctx)
 
         # process latents
         for process in self.processor:

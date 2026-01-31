@@ -212,7 +212,7 @@ class Experiment(DistributedTrainer):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
             w_spectral = self.cfg.spectral_loss_weight
             if w_spectral > 0:
-                spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
+                spectral_loss = self.spectral_crps_time(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
                 node_loss = self.node_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
                 loss = w_spectral * spectral_loss + node_loss  
             else:
@@ -258,6 +258,17 @@ class Experiment(DistributedTrainer):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
         score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2)) #[B, V, T]
+        correction = w_v * w_m / (1.0 - m.clamp(max = 1 / self.world.num_elements))
+        return (score * correction).mean()
+
+    def spectral_crps_time(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
+        m = mask.float().mean(dim = (-1, -2, -3))
+        w_v = self.per_variable_weights.mean(dim = (-1, -2, -3))
+        w_m = mask_weight if mask_weight.numel() == 1 else mask_weight.mean(dim = (-1, -2, -3))
+        with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
+            e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
+            o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2, -3))
+        score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2, -3)) #[B, V]
         correction = w_v * w_m / (1.0 - m.clamp(max = 1 / self.world.num_elements))
         return (score * correction).mean()
 
