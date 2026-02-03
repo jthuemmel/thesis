@@ -147,6 +147,11 @@ class RandomField(torch.nn.Module):
                 name = 'ffn',
                 module = GatedFFN(model_dim)
             )
+
+        self.projection.add_module(
+            name = 'norm',
+            module = torch.nn.LayerNorm(model_dim)
+        )
             
 
     def forward(self, tokens, rng = None):

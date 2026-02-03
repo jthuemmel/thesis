@@ -6,13 +6,6 @@ from einops.layers.torch import EinMix
 from utils.components import *
 from utils.config import *
 from utils.random_fields import RandomField
-import einops
-import torch
-
-from einops.layers.torch import EinMix
-
-from utils.components import *
-from utils.config import *
 
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
@@ -155,7 +148,7 @@ class EinMask(torch.nn.Module):
 
         # map context to latents
         for read in self.encoder:
-            latents = read(q = latents, kv = torch.cat([context, latents], dim = 1), ctx = ctx)
+            latents = read(q = latents, kv = context, ctx = ctx)
 
         # process latents
         for process in self.processor:
@@ -163,7 +156,7 @@ class EinMask(torch.nn.Module):
 
         # map latents to queries
         for write in self.decoder:
-            queries = write(q = queries, kv = torch.cat([queries, latents], dim = 1), ctx = ctx)
+            queries = write(q = queries, kv = latents, ctx = ctx)
 
         # scatter tokens predicted at this step
         tokens = tokens.scatter(1, tgt_idx, queries)
