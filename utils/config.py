@@ -111,7 +111,7 @@ class DatasetConfig:
     max_dirs: int = 100
 
 @dataclass
-class ObjectiveConfig:
+class OldObjectiveConfig:
     # event dims for prior
     event_dims: List[str] = field(default_factory=lambda: ['t'])
     # concentrations:
@@ -126,6 +126,20 @@ class ObjectiveConfig:
     k_max: Optional[int] = None
     # schedule bounded [eps, 1-eps]
     epsilon: float = 1e-2
+    # stratification
+    stratify: Optional[bool] = False
+
+@dataclass
+class ObjectiveConfig:
+    # event dims for prior
+    event_dims: dict = field(default_factory=lambda: {})
+    # integer multinomial bounds
+    src_low: Optional[int] = None
+    src_high: Optional[int] = None
+    tgt_low: Optional[int] = None
+    tgt_high: Optional[int] = None
+    # schedule bounded [eps, 1-eps]
+    epsilon: Optional[float] = 1e-7
     # stratification
     stratify: Optional[bool] = False
 

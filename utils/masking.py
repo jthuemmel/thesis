@@ -62,83 +62,69 @@ class ForecastMasking(torch.nn.Module):
         else:
             return mask.expand(*shape, -1).bool().logical_not(), mask.expand(*shape, -1).bool()
         
-        
 class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
         super().__init__()
-        # configs
+
         self.world = world
         self.objective = objective
 
-        # Events
-        assert all([d in world.flat_token_pattern for d in objective.event_dims]), 'event dims not in token pattern'
-        self.num_events = torch.tensor([world.token_sizes[d] for d in objective.event_dims]).prod()
-        self.event_pattern = f'({" ".join(objective.event_dims)})'
-        self.event_sizes = {d: world.token_sizes[d] for d in objective.event_dims}
+        self.register_buffer('epsilon', torch.tensor(self.objective.epsilon))
 
-        #schedule
-        self.src_rates = StableKumaraswamy(c0=objective.c0_src, c1=objective.c1_src)
-        self.tgt_rates = StableKumaraswamy(c0=objective.c0_tgt, c1=objective.c1_tgt)
-        self.prior = StableKumaraswamy(c0= objective.c0_prior, c1= objective.c1_prior, epsilon=1e-2)
-        
-        # attributes
-        self.k_min = default(objective.k_min, 2)
-        self.k_max = default(objective.k_max, world.num_tokens)
+    @property
+    def device(self): return self.epsilon.device
 
-    def expand_events(self, *args):
-        return einops.repeat(
-            [*args],
-            f'args ... {self.event_pattern} -> args ... {self.world.flat_token_pattern}', 
-            **self.world.token_sizes
-            )
-    
-    def k_from_rates(self, r: float):
-        return int(self.k_min + (self.k_max - self.k_min) * r)
-
-    def _compute_event_weights(self, shape: tuple, rng: torch.Generator = None) -> torch.Tensor:
-            """Generates factorized probability weights for source and target masking."""
-            device = self.prior.c1.device
-            
-            # Generate independent factors for each event dimension
-            dim_factors = [
-                einops.repeat(
-                    torch.rand((*shape, s), device=device, generator=rng),
-                    f"... {d} -> ... {self.event_pattern}",
-                    **self.event_sizes
-                )
-                for d, s in self.event_sizes.items()
-            ]
-            
-            # Multiply factors to get joint probabilities
-            # Source uses the factors directly; target uses the complements
-            stacked_factors = torch.stack(dim_factors)
-            src_weights = stacked_factors.prod(dim=0)
-            tgt_weights = (1 - stacked_factors).prod(dim=0)
-            
-            return src_weights, tgt_weights
-
-    def forward(self, shape: tuple, rng: torch.Generator = None):
-        assert len(shape) == 1, "Currently only supports 1D batch shapes."
-        
-        src_w, tgt_w = self._compute_event_weights((1,) if self.objective.stratify else shape, rng)
-
+    def uniform_(self, B: int, N: int, rng: torch.Generator):
         if self.objective.stratify:
-            # Shift the base weights across the batch to ensure uniform coverage
-            offsets = torch.linspace(0, 1, shape[0], device=src_w.device).view(-1, 1)
-            src_w = (src_w + offsets) % 1
-            tgt_w = (tgt_w + offsets) % 1
+            U = torch.rand(1, N, device = self.device, generator=rng)
+            L = torch.linspace(0, 1, B, device= self.device).view(-1, 1)
+            U = (U + L) % 1
+        else:
+            U = torch.rand(B, N, device = self.device, generator=rng)
+        return U.clamp(self.epsilon, 1 - self.epsilon)
+    
+    def prior_(self, B: int, rng: torch.Generator = None):
+        # baseline factors are constant
+        F_src, F_tgt = torch.ones(2, B, self.world.num_tokens, device= self.device)
 
-        src_probs, tgt_probs = self.expand_events(
-             self.prior.quantile(src_w), self.prior.quantile(tgt_w)
-             )
+        # for each event dimension
+        for dim, alpha in self.objective.event_dims.items():
+            alpha = torch.as_tensor(alpha, device = self.device)
 
-        k_src = self.k_from_rates(self.src_rates((1,), rng)[0])
-        k_tgt = self.k_from_rates(self.tgt_rates((1,), rng)[0])
+            # sample uniform variate along the dimension
+            U = self.uniform_(B, self.world.token_sizes[dim], rng)
 
-        src_indices = torch.multinomial(src_probs, k_src, generator=rng)
-        tgt_indices = torch.multinomial(tgt_probs, k_tgt, generator=rng)
+            # broadcast to the size of the full event space
+            U = einops.repeat(U, f'b {dim} -> b {self.world.flat_token_pattern}', **self.world.token_sizes)
 
-        src_binary = torch.zeros_like(src_probs, dtype= torch.bool).scatter_(1, src_indices, True)
-        tgt_binary = torch.zeros_like(src_probs, dtype= torch.bool).scatter_(1, tgt_indices, True)
+            # apply quantile function for Kumaraswamy(alpha, 1) and Kumaraswamy(1, alpha) and multiply factors
+            F_src *= U.log().div(alpha).exp()
+            F_tgt *= (1 - U).log().div(alpha).exp()
 
+        return F_src.clamp(self.epsilon, 1 - self.epsilon), F_tgt.clamp(self.epsilon, 1 - self.epsilon)
+    
+    def rates_(self, rng: torch.Generator = None):
+        src_bounds = default(self.objective.src_low, 1), default(self.objective.src_high, self.world.num_tokens)
+        tgt_bounds = default(self.objective.tgt_low, 1), default(self.objective.tgt_high, self.world.num_tokens)
+        K_src = torch.randint(*src_bounds, (1, ), generator= rng, device = self.device).item()
+        K_tgt = torch.randint(*tgt_bounds, (1, ), generator= rng, device = self.device).item()
+        return K_src, K_tgt
+    
+    def forward(self, B: int, rng: torch.Generator = None):
+        B = B[0] if isinstance(B, tuple) else B
+
+        # sample joint prior
+        P_src, P_tgt = self.prior_(B, rng)
+
+       # sample uniform rates from (low, high)
+        K_src, K_tgt = self.rates_(rng)
+
+        # sample multinomial 
+        src_indices = torch.multinomial(P_src, K_src, generator=rng)
+        tgt_indices = torch.multinomial(P_tgt, K_tgt, generator=rng)
+        
+        # create binary masks
+        src_binary = torch.zeros_like(P_src, dtype= torch.bool).scatter_(1, src_indices, True)
+        tgt_binary = torch.zeros_like(P_tgt, dtype= torch.bool).scatter_(1, tgt_indices, True)
+        
         return src_indices, tgt_indices, tgt_binary, None
