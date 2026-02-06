@@ -92,7 +92,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
 
     def forward(self, shape, rng = None):
         with torch.no_grad():
-            with torch.amp.autocast(device_type="cuda", enabled=False):
+            with torch.amp.autocast(device_type=self.phi.device.type, enabled=False):
                 # sample white noise
                 eta_l = torch.empty(
                     (*shape, self.nchannels, self.nsteps, self.lmax, self.mmax, 2), 
@@ -154,6 +154,6 @@ class RandomField(torch.nn.Module):
         )
             
 
-    def forward(self, tokens, rng = None):
-        grf = self.noise_generator((tokens.size(0),), rng)
-        return tokens, self.projection(grf)
+    def forward(self, shape: tuple, rng: torch.Generator = None):
+        grf = self.noise_generator(shape, rng)
+        return self.projection(grf)
