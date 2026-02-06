@@ -104,10 +104,10 @@ class MultinomialMasking(torch.nn.Module):
         return F_src.clamp(self.epsilon, 1 - self.epsilon), F_tgt.clamp(self.epsilon, 1 - self.epsilon)
     
     def rates_(self, rng: torch.Generator = None):
-        src_bounds = default(self.objective.src_low, 1), default(self.objective.src_high, self.world.num_tokens)
-        tgt_bounds = default(self.objective.tgt_low, 1), default(self.objective.tgt_high, self.world.num_tokens)
-        K_src = torch.randint(*src_bounds, (1, ), generator= rng, device = self.device).item()
-        K_tgt = torch.randint(*tgt_bounds, (1, ), generator= rng, device = self.device).item()
+        src_bounds = default(self.objective.src_low, 1), default(self.objective.src_high, self.world.num_tokens - 1)
+        tgt_bounds = default(self.objective.tgt_low, 1), default(self.objective.tgt_high, self.world.num_tokens - 1)
+        K_src = torch.randint(*src_bounds, (1,), generator= rng, device = self.device).item()
+        K_tgt = torch.randint(*tgt_bounds, (1,), generator= rng, device = self.device).item()
         return K_src, K_tgt
     
     def forward(self, B: int, rng: torch.Generator = None):
@@ -116,15 +116,12 @@ class MultinomialMasking(torch.nn.Module):
         # sample joint prior
         P_src, P_tgt = self.prior_(B, rng)
 
-       # sample uniform rates from (low, high)
+
+        #  sample uniform rates from (low, high)
         K_src, K_tgt = self.rates_(rng)
 
         # sample multinomial 
         src_indices = torch.multinomial(P_src, K_src, generator=rng)
         tgt_indices = torch.multinomial(P_tgt, K_tgt, generator=rng)
         
-        # create binary masks
-        src_binary = torch.zeros_like(P_src, dtype= torch.bool).scatter_(1, src_indices, True)
-        tgt_binary = torch.zeros_like(P_tgt, dtype= torch.bool).scatter_(1, tgt_indices, True)
-        
-        return src_indices, tgt_indices, tgt_binary, None
+        return src_indices, tgt_indices
