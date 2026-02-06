@@ -32,14 +32,9 @@ class EinMask(torch.nn.Module):
                 
         # noise mapping
         if default(network.num_tails, 1) > 1:
-            self.to_noise = None
-            self.noise_generator = None
-        elif exists(network.dim_noise):
-            self.to_noise = GatedFFN(network.dim_noise)
             self.noise_generator = None
         else:
             self.noise_generator = RandomField(network.dim, world, has_ffn=False)
-            self.to_noise = None
         
         # positional embeddings
         self.src_positions = ContinuousPositionalEmbedding(
@@ -116,53 +111,40 @@ class EinMask(torch.nn.Module):
         D = self.network.dim
         K = default(self.network.num_tails, 1)
         E = default(members, 1)
-        tgts = default(tgts, self.indices.expand(B, -1))
 
         # expand to ensemble form
         fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
         latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
         coo = einops.repeat(self.coordinates, '... -> (b e) ...', b = B, e = E)
         src_idx = einops.repeat(srcs, 'b ... -> (b e) ... d', d = D, e = E, b = B)
-        tgt_idx = einops.repeat(tgts, 'b ... -> (b e) ... d', d = D, e = E, b = B)
         
         # embed full fields as tokens
-        tokens = self.to_tokens(fields) + self.src_positions(coo)
+        tokens = self.to_tokens(fields).gather(1, src_idx)
 
-        # gather tokens visible at this step
-        context = tokens.gather(1, src_idx)
+        # prepare tgt and src
+        tgt = self.tgt_positions(coo)
+        src = self.src_positions(coo).scatter_add_(1, src_idx, tokens)
 
-        # prepare queries
-        queries = self.tgt_positions(coo).gather(1, tgt_idx)
+        # maybe add random field
+        if exists(self.noise_generator):
+            noise = self.noise_generator(shape = (B * E,), rng = rng).to(src.dtype)
+            tgt = tgt + noise
+            src = src + noise
 
-        # maybe create functional noise
-        if exists(self.to_noise):
-            ctx = torch.randn(B * E, 1, self.network.dim_noise, generator = rng, device = fields.device)
-            ctx = self.to_noise(ctx)
-        elif exists(self.noise_generator):
-            context, noise = self.noise_generator(context, rng = rng)
-            queries = queries + noise.gather(1, tgt_idx)
-            context = context + noise.gather(1, src_idx)
-            ctx = None
-        else:
-            ctx = None
-
-        # map context to latents
+        # map ctx to latents
         for read in self.encoder:
-            latents = read(q = latents, kv = context, ctx = ctx)
+            latents = read(q = latents, kv = src)
 
         # process latents
         for process in self.processor:
-            latents = process(q = latents, ctx = ctx)
+            latents = process(q = latents)
 
-        # map latents to queries
+        # map latents to tgt
         for write in self.decoder:
-            queries = write(q = queries, kv = latents, ctx = ctx)
-
-        # scatter tokens predicted at this step
-        tokens = tokens.scatter(1, tgt_idx, queries)
+            tgt = write(q = tgt, kv = latents)
 
         # map all tokens back to fields
-        fields = self.to_fields(tokens)
+        fields = self.to_fields(tgt)
         
         # rearrange to ensemble form
         fields = einops.rearrange(fields, "(b e) ... k -> b ... (e k)", e = E, b = B, k = K)
