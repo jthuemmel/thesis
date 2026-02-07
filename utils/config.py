@@ -194,7 +194,7 @@ class WorldConfig:
 @dataclass
 class TrainerConfig:
     # Experiment settings
-    seed: Optional[int] = 42
+    seed: Optional[int] = None
     job_name: Optional[str] = None # for resuming training
     stage1_id: Optional[str] = None # for loading pre-trained model
     resume_training: bool = True
