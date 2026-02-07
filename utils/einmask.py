@@ -133,7 +133,7 @@ class EinMask(torch.nn.Module):
 
         # map ctx to latents
         for read in self.encoder:
-            latents = read(q = latents, kv = src)
+            latents = read(q = latents, kv = torch.cat([src, latents], dim = 1))
 
         # process latents
         for process in self.processor:
