@@ -103,12 +103,17 @@ class MultinomialMasking(torch.nn.Module):
 
         return F_src.clamp(self.epsilon, 1 - self.epsilon), F_tgt.clamp(self.epsilon, 1 - self.epsilon)
     
-    def rates_(self, rng: torch.Generator = None):
-        src_bounds = default(self.objective.src_low, 1), default(self.objective.src_high, self.world.num_tokens - 1)
-        tgt_bounds = default(self.objective.tgt_low, 1), default(self.objective.tgt_high, self.world.num_tokens - 1)
-        K_src = torch.randint(*src_bounds, (1,), generator= rng, device = self.device).item()
-        K_tgt = torch.randint(*tgt_bounds, (1,), generator= rng, device = self.device).item()
-        return K_src, K_tgt
+    def rates_(self, rng: torch.Generator = None, step_size: int = 64):
+        src_low, src_high = default(self.objective.src_low, 1), default(self.objective.src_high, self.world.num_tokens - 1)
+        tgt_low, tgt_high = default(self.objective.tgt_low, 1), default(self.objective.tgt_high, self.world.num_tokens - 1)
+
+        src_low_scaled, src_high_scaled = (src_low + step_size - 1) // step_size, src_high // step_size
+        tgt_low_scaled, tgt_high_scaled = (tgt_low + step_size - 1) // step_size, tgt_high // step_size
+
+        K_src_scaled = torch.randint(src_low_scaled, src_high_scaled + 1, (1,), generator=rng, device=self.device).item()
+        K_tgt_scaled = torch.randint(tgt_low_scaled, tgt_high_scaled + 1, (1,), generator=rng, device=self.device).item()
+
+        return K_src_scaled * step_size, K_tgt_scaled * step_size
     
     def forward(self, B: int, rng: torch.Generator = None):
         B = B[0] if isinstance(B, tuple) else B
