@@ -156,6 +156,8 @@ class WorldConfig:
     patch_layout: tuple = field(init=False)
     token_sizes: dict = field(init=False)
     token_shape: tuple = field(init=False)
+    field_shape: tuple = field(init=False)
+    patch_shape: tuple = field(init=False)
     
     num_tokens: int = field(init=False)
     num_elements: int = field(init=False)
@@ -176,14 +178,16 @@ class WorldConfig:
             ax: (self.field_sizes[ax] // self.patch_sizes[f'{ax*2}'])
             for ax in self.field_layout
         }
+
+        self.field_shape = tuple(self.field_sizes[ax] for ax in self.field_layout)
         self.token_shape = tuple(self.token_sizes[ax] for ax in self.field_layout)
+        self.patch_shape = tuple(self.patch_sizes[ax] for ax in self.patch_layout)
         
         self.num_tokens = prod(self.token_sizes.values())
         self.num_elements = prod(self.field_sizes.values())
         self.dim_tokens = prod(self.patch_sizes.values())
 
-        field = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
-        self.field_pattern = f"b {field}"
+        self.field_pattern = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
         self.patch_pattern = ' '.join(self.patch_layout)
         self.token_pattern = ' '.join(self.field_layout)
         
