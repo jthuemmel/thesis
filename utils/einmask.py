@@ -16,14 +16,14 @@ class EinMask(torch.nn.Module):
 
         # I/O
         self.to_tokens = EinMix(
-            pattern=f"{world.field_pattern} -> b {world.flat_token_pattern} d", 
+            pattern=f"b {world.field_pattern} -> b {world.flat_token_pattern} d", 
             weight_shape=f'{world.patch_pattern} v d', 
             d = network.dim, 
             **world.patch_sizes, **world.token_sizes
             )
         
         self.to_fields = EinMix(
-            pattern=f"b {world.flat_token_pattern} d -> {world.field_pattern} k", 
+            pattern=f"b {world.flat_token_pattern} d -> b {world.field_pattern} k", 
             weight_shape=f'd v {world.patch_pattern} k', 
             d = network.dim, 
             k = default(network.num_tails, 1), 
@@ -62,17 +62,17 @@ class EinMask(torch.nn.Module):
         # latent transformer
         self.encoder = torch.nn.ModuleList([
             TransformerBlock(network.dim, dim_ctx=network.dim_noise)
-            for _ in range(network.num_read_blocks)
+            for _ in range(default(network.num_read_blocks, 1))
         ])
 
         self.processor = torch.nn.ModuleList([
             TransformerBlock(network.dim, drop_path=network.drop_path, dim_ctx=network.dim_noise)
-            for _ in range(network.num_compute_blocks)
+            for _ in range(default(network.num_compute_blocks, 1))
         ])
         
         self.decoder = torch.nn.ModuleList([
             TransformerBlock(network.dim, dim_ctx=network.dim_noise, has_skip= n > 0)
-            for n in range(network.num_write_blocks)
+            for n in range(default(network.num_write_blocks, 1))
         ])
 
         # Weight initialization
