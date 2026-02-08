@@ -235,14 +235,14 @@ class Experiment(DistributedTrainer):
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w, 
-                             f"(v vv) -> {self.world.field_pattern}", 
+                             f"(v vv) -> b {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
     
     @property
     def land_sea_mask(self):
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
         return einops.repeat(lsm, 
-                             f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
+                             f"1 (h hh) (w ww) -> b {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
     
     def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
@@ -313,7 +313,7 @@ class Experiment(DistributedTrainer):
     # Tokenizers
     def mask_to_field(self, mask):
         return einops.repeat(mask,
-                             f"b {self.world.flat_token_pattern} -> {self.world.field_pattern}",
+                             f"b {self.world.flat_token_pattern} -> b {self.world.field_pattern}",
                                 **self.world.token_sizes, **self.world.patch_sizes)
 
     # EVAL
