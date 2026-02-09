@@ -22,13 +22,7 @@ class EinMask(torch.nn.Module):
             **world.patch_sizes, **world.token_sizes
             )
         
-        self.to_fields = EinMix(
-            pattern=f"b {world.flat_token_pattern} d -> b {world.field_pattern} k", 
-            weight_shape=f'd v {world.patch_pattern} k', 
-            d = network.dim, 
-            k = default(network.num_tails, 1), 
-            **world.patch_sizes, **world.token_sizes 
-            )
+        self.to_fields = EinDecoder(network, world)
                 
         # noise mapping
         if default(network.num_tails, 1) > 1:
@@ -71,12 +65,21 @@ class EinMask(torch.nn.Module):
         ])
         
         self.decoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim, dim_ctx=network.dim_noise, has_skip= n > 0)
+            TransformerBlock(network.dim, dim_ctx=network.dim_noise)
             for n in range(default(network.num_write_blocks, 1))
         ])
 
         # Weight initialization
         self.apply(self.base_init)
+        self.apply(self.zero_init)
+
+    @staticmethod
+    def zero_init(m: torch.nn.Module):
+        # residual blocks zero out their last layer 
+        if isinstance(m, (TransformerBlock, ConvNextBlock, ConvInterpolate)):
+            for name, sm in m.named_modules():
+                if "_out" in name and hasattr(sm, 'weight'):
+                    torch.nn.init.trunc_normal_(sm.weight, std = 1e-7)
 
     @staticmethod
     def base_init(m: torch.nn.Module):
@@ -86,15 +89,20 @@ class EinMask(torch.nn.Module):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
         # embedding
-        if isinstance(m, torch.nn.Embedding):
+        elif isinstance(m, torch.nn.Embedding):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
         # einmix
-        if isinstance(m, EinMix):
+        elif isinstance(m, EinMix):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
             if m.bias is not None:
                 torch.nn.init.trunc_normal_(m.bias, std = 0.02)
+        # convolution
+        elif isinstance(m, torch.nn.Conv3d):
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
         # conditional layer norm
-        if isinstance(m, ConditionalLayerNorm):
+        elif isinstance(m, ConditionalLayerNorm):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
             if m.weight is not None: # CLN weight close to 0
@@ -131,7 +139,7 @@ class EinMask(torch.nn.Module):
             tgt = tgt + noise
             src = src + noise
 
-        # map ctx to latents
+        # map src to latents
         for read in self.encoder:
             latents = read(q = latents, kv = torch.cat([src, latents], dim = 1))
 
