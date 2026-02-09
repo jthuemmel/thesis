@@ -7,6 +7,51 @@ from utils.components import *
 from utils.config import *
 from utils.random_fields import RandomField
 
+class EinDecoder(torch.nn.Module):
+    def __init__(self, network: NetworkConfig, world: WorldConfig):
+        super().__init__()
+        # config attributes 
+        c = network.dim_out
+        k = default(network.num_tails, 1)
+        vv = world.patch_sizes['vv']
+        v = world.token_sizes['v']
+        groups = v * vv * k
+
+        # project tokens to low dimensional space before upsampling
+        self.token_to_grid = EinMix(
+            pattern=f"b {world.flat_token_pattern} d -> b (v vv k c) t h w",
+            weight_shape=f"v vv k c d",
+            d = network.dim, c = c, k = k, vv = vv,
+            **world.token_sizes
+        )
+
+        # small CNN for post-processing
+        self.cnn = torch.nn.ModuleList([
+            ConvNextBlock(c * groups, (3, 7, 7), groups) 
+            for _ in range(default(network.num_cnn_blocks, 0))
+            ])
+
+        # upsample grid via interpolate + depthwise separable convolution
+        self.upsample = ConvInterpolate(c * groups, (3, 5, 5), 
+                                        num_groups= c * groups,
+                                        out_size= tuple(world.field_sizes[ax] for ax in ['t', 'h', 'w']),
+                                        mode='nearest-exact')
+        
+        # pointwise projection to output
+        self.grid_to_field = EinMix(
+            f'b (v vv k c) (t tt) (h hh) (w ww) -> b {world.field_pattern} k',
+            weight_shape="v vv k c",
+            k = k, c = c, **world.patch_sizes, **world.token_sizes
+        )
+
+    def forward(self, x: torch.FloatTensor):
+        x = self.token_to_grid(x)
+        for block in self.cnn:
+            x = block(x)
+        x = self.upsample(x)
+        x = self.grid_to_field(x)
+        return x
+
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
@@ -22,7 +67,16 @@ class EinMask(torch.nn.Module):
             **world.patch_sizes, **world.token_sizes
             )
         
-        self.to_fields = EinDecoder(network, world)
+        if exists(network.num_cnn_blocks):
+            self.to_fields = EinDecoder(network, world)  
+        else:
+            self.to_fields =EinMix(
+                pattern=f"b {world.flat_token_pattern} d -> b {world.field_pattern} k", 
+                weight_shape=f'd v {world.patch_pattern} k', 
+                d = network.dim, 
+                k = default(network.num_tails, 1), 
+                **world.patch_sizes, **world.token_sizes 
+                )
                 
         # noise mapping
         if default(network.num_tails, 1) > 1:
