@@ -124,6 +124,69 @@ class SelfConditioning(torch.nn.Module):
         x = self.scale * self.norm(previous + self.ffn(previous)) + initial
         return x
 
+class ConvNextBlock(torch.nn.Module):
+    def __init__(self, dim: int, kernel_size: tuple, num_groups: int = 1, expansion_factor: int = 4):
+        super().__init__()
+        k = len(kernel_size)
+        assert 4 > k > 0, 'kernel must be 1, 2 or 3d'
+        conv_fn = getattr(torch.nn, f"Conv{k}d")
+
+        self.norm = torch.nn.GroupNorm(num_groups= num_groups, num_channels= dim)
+
+        self.dw_conv = conv_fn(
+                in_channels = dim,
+                out_channels = dim,
+                padding = 'same',
+                kernel_size = kernel_size,
+                groups = dim,
+            )
+
+        self.pw_in = conv_fn(
+                in_channels = dim,
+                out_channels = dim * expansion_factor,
+                kernel_size = 1,
+                groups = num_groups,
+            )
+
+        self.silu = torch.nn.SiLU()
+
+        self.pw_out = conv_fn(
+                in_channels = dim * expansion_factor,
+                out_channels = dim,
+                kernel_size = 1,
+                groups = num_groups,
+            )
+        
+    def forward(self, x: torch.FloatTensor):
+        skip = x
+        x = self.norm(x)
+        x = self.dw_conv(x)
+        x = self.pw_in(x)
+        x = self.silu(x)
+        x = self.pw_out(x)
+        return skip + x
+    
+class ConvInterpolate(torch.nn.Module):
+    def __init__(self, dim: int, kernel_size: tuple, out_size: tuple, num_groups: int, mode: str = "nearest-exact"):
+        super().__init__()
+        self._out_size = out_size
+        self._mode = mode
+        k = len(kernel_size)
+        assert 4 > k > 0, 'kernel must be 1, 2 or 3d'
+        conv_fn = getattr(torch.nn, f"Conv{k}d")
+        self.conv_out = conv_fn(
+                in_channels = dim,
+                out_channels = dim,
+                padding = 'same',
+                kernel_size = kernel_size,
+                groups = num_groups,
+            )
+            
+    def forward(self, x: torch.FloatTensor):
+        x = torch.nn.functional.interpolate(x, size = self._out_size, mode = self._mode)
+        x = x + self.conv_out(x)
+        return x
+
 class TransformerBlock(torch.nn.Module):
     def __init__(self, 
                  dim: int, 
