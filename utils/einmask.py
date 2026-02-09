@@ -15,13 +15,15 @@ class EinDecoder(torch.nn.Module):
         k = default(network.num_tails, 1)
         vv = world.patch_sizes['vv']
         v = world.token_sizes['v']
-        groups = v * vv * k
+        groups = v * k
+        self._out_size = tuple(world.field_sizes[ax] for ax in ['t', 'h', 'w'])
+        self._mode = 'nearest-exact'
 
         # project tokens to low dimensional space before upsampling
         self.token_to_grid = EinMix(
-            pattern=f"b {world.flat_token_pattern} d -> b (v vv k c) t h w",
-            weight_shape=f"v vv k c d",
-            d = network.dim, c = c, k = k, vv = vv,
+            pattern=f"b {world.flat_token_pattern} d -> b (v k c) t h w",
+            weight_shape=f"v k c d",
+            d = network.dim, c = c, k = k,
             **world.token_sizes
         )
 
@@ -31,16 +33,10 @@ class EinDecoder(torch.nn.Module):
             for _ in range(default(network.num_cnn_blocks, 0))
             ])
 
-        # upsample grid via interpolate + depthwise separable convolution
-        self.upsample = ConvInterpolate(c * groups, (3, 5, 5), 
-                                        num_groups= c * groups,
-                                        out_size= tuple(world.field_sizes[ax] for ax in ['t', 'h', 'w']),
-                                        mode='nearest-exact')
-        
         # pointwise projection to output
         self.grid_to_field = EinMix(
-            f'b (v vv k c) (t tt) (h hh) (w ww) -> b {world.field_pattern} k',
-            weight_shape="v vv k c",
+            f'b (v k c) t h w -> b {world.field_pattern} k',
+            weight_shape=f"v {world.patch_pattern} k c",
             k = k, c = c, **world.patch_sizes, **world.token_sizes
         )
 
@@ -48,7 +44,6 @@ class EinDecoder(torch.nn.Module):
         x = self.token_to_grid(x)
         for block in self.cnn:
             x = block(x)
-        x = self.upsample(x)
         x = self.grid_to_field(x)
         return x
 
@@ -67,7 +62,7 @@ class EinMask(torch.nn.Module):
             **world.patch_sizes, **world.token_sizes
             )
         
-        if exists(network.num_cnn_blocks):
+        if exists(network.dim_out):
             self.to_fields = EinDecoder(network, world)  
         else:
             self.to_fields =EinMix(
