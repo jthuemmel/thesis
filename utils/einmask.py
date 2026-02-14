@@ -1,51 +1,11 @@
 import einops
 import torch
 
-from einops.layers.torch import EinMix
+from einops.layers.torch import EinMix, Rearrange
 
 from utils.components import *
 from utils.config import *
 from utils.random_fields import RandomField
-
-class EinDecoder(torch.nn.Module):
-    def __init__(self, network: NetworkConfig, world: WorldConfig):
-        super().__init__()
-        # config attributes 
-        c = network.dim_out
-        k = default(network.num_tails, 1)
-        vv = world.patch_sizes['vv']
-        v = world.token_sizes['v']
-        groups = v * k
-        self._out_size = tuple(world.field_sizes[ax] for ax in ['t', 'h', 'w'])
-        self._mode = 'nearest-exact'
-
-        # project tokens to low dimensional space before upsampling
-        self.token_to_grid = EinMix(
-            pattern=f"b {world.flat_token_pattern} d -> b (v k c) t h w",
-            weight_shape=f"v k c d",
-            d = network.dim, c = c, k = k,
-            **world.token_sizes
-        )
-
-        # small CNN for post-processing
-        self.cnn = torch.nn.ModuleList([
-            ConvNextBlock(c * groups, (3, 7, 7), groups) 
-            for _ in range(default(network.num_cnn_blocks, 0))
-            ])
-
-        # pointwise projection to output
-        self.grid_to_field = EinMix(
-            f'b (v k c) t h w -> b {world.field_pattern} k',
-            weight_shape=f"v {world.patch_pattern} k c",
-            k = k, c = c, **world.patch_sizes, **world.token_sizes
-        )
-
-    def forward(self, x: torch.FloatTensor):
-        x = self.token_to_grid(x)
-        for block in self.cnn:
-            x = block(x)
-        x = self.grid_to_field(x)
-        return x
 
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
@@ -57,78 +17,33 @@ class EinMask(torch.nn.Module):
         # I/O
         self.to_tokens = EinMix(
             pattern=f"b {world.field_pattern} -> b {world.flat_token_pattern} d", 
-            weight_shape=f'{world.patch_pattern} v d', 
+            weight_shape=f'v {world.patch_pattern} d', 
             d = network.dim, 
             **world.patch_sizes, **world.token_sizes
             )
         
-        if exists(network.dim_out):
-            self.to_fields = EinDecoder(network, world)  
-        else:
-            self.to_fields =EinMix(
-                pattern=f"b {world.flat_token_pattern} d -> b {world.field_pattern} k", 
-                weight_shape=f'd v {world.patch_pattern} k', 
-                d = network.dim, 
-                k = default(network.num_tails, 1), 
-                **world.patch_sizes, **world.token_sizes 
-                )
-                
-        # noise mapping
-        if default(network.num_tails, 1) > 1:
-            self.noise_generator = None
-        else:
-            self.noise_generator = RandomField(network.dim, world, has_ffn=False)
+        self.to_fields =EinMix(
+            pattern=f"b {world.flat_token_pattern} d -> b {world.field_pattern}", 
+            weight_shape=f'v d {world.patch_pattern}', 
+            d = network.dim, 
+            **world.patch_sizes, **world.token_sizes 
+            )
         
-        # positional embeddings
-        self.src_positions = ContinuousPositionalEmbedding(
-            dim_per_coord=network.dim_coords, 
-            wavelengths=[(1, 2 * k) for k in world.token_shape],
-            model_dim=network.dim
-        )
+        # Noise
+        self.noise_generator = RandomField(network.dim, world, has_ffn=False)
 
-        self.tgt_positions = ContinuousPositionalEmbedding(
-            dim_per_coord=network.dim_coords, 
-            wavelengths=[(1, 2 * k) for k in world.token_shape],
-            model_dim=network.dim
-        )
-        
-        # pre-computed coordinates
-        self.register_buffer('indices', torch.arange(world.num_tokens))
-        self.register_buffer("coordinates", torch.stack(
-            torch.unravel_index(indices = self.indices, shape = world.token_shape), 
-            dim = -1)
-            )        
-        
-        # learnable latents
-        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
+        # learnable tokens
+        self.mask_embedding = torch.nn.Embedding(1, network.dim)
+        self.position_embedding = torch.nn.Embedding(world.num_tokens, network.dim)
 
-        # latent transformer
-        self.encoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim, dim_ctx=network.dim_noise)
-            for _ in range(default(network.num_read_blocks, 1))
-        ])
-
-        self.processor = torch.nn.ModuleList([
-            TransformerBlock(network.dim, drop_path=network.drop_path, dim_ctx=network.dim_noise)
-            for _ in range(default(network.num_compute_blocks, 1))
-        ])
-        
-        self.decoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim, dim_ctx=network.dim_noise)
-            for n in range(default(network.num_write_blocks, 1))
+        # transformer
+        self.transformer = torch.nn.Sequential(*[
+            NattenBlock(network.dim, drop_path= network.drop_path, kernel_size=world.num_tokens)
+            for _ in range(network.num_layers)
         ])
 
         # Weight initialization
         self.apply(self.base_init)
-        self.apply(self.zero_init)
-
-    @staticmethod
-    def zero_init(m: torch.nn.Module):
-        # residual blocks zero out their last layer 
-        if isinstance(m, (TransformerBlock, ConvNextBlock, ConvInterpolate)):
-            for name, sm in m.named_modules():
-                if "_out" in name and hasattr(sm, 'weight'):
-                    torch.nn.init.trunc_normal_(sm.weight, std = 1e-7)
 
     @staticmethod
     def base_init(m: torch.nn.Module):
@@ -145,64 +60,38 @@ class EinMask(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
             if m.bias is not None:
                 torch.nn.init.trunc_normal_(m.bias, std = 0.02)
-        # convolution
-        elif isinstance(m, torch.nn.Conv3d):
-            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
-            if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
-        # conditional layer norm
-        elif isinstance(m, ConditionalLayerNorm):
-            if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
-            if m.weight is not None: # CLN weight close to 0
-                torch.nn.init.trunc_normal_(m.weight, std = 1e-7)
     
     def forward(self, 
                 fields: torch.FloatTensor, 
-                srcs: List[torch.LongTensor] | torch.LongTensor, 
-                tgts: List[torch.LongTensor] | torch.LongTensor = None,
+                visible: torch.BoolTensor, 
                 members: Optional[int] = None, 
                 rng: Optional[torch.Generator] = None
                 ) -> torch.FloatTensor:
         B = fields.size(0)
-        D = self.network.dim
-        K = default(self.network.num_tails, 1)
         E = default(members, 1)
 
         # expand to ensemble form
         fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
-        latents = einops.repeat(self.latents.weight, '... -> (b e) ...', b = B, e = E)
-        coo = einops.repeat(self.coordinates, '... -> (b e) ...', b = B, e = E)
-        src_idx = einops.repeat(srcs, 'b ... -> (b e) ... d', d = D, e = E, b = B)
+        visible = einops.repeat(visible, 'b ... -> (b e) ... d', d = self.network.dim, e = E, b = B)
         
         # embed full fields as tokens
-        tokens = self.to_tokens(fields).gather(1, src_idx)
+        tokens = self.to_tokens(fields)
 
-        # prepare tgt and src
-        tgt = self.tgt_positions(coo)
-        src = self.src_positions(coo).scatter_add_(1, src_idx, tokens)
+        # apply mask
+        tokens = torch.where(visible, tokens, self.mask_embedding.weight)
 
-        # maybe add random field
-        if exists(self.noise_generator):
-            noise = self.noise_generator(shape = (B * E,), rng = rng).to(src.dtype)
-            tgt = tgt + noise
-            src = src + noise
+        # create random field
+        noise = self.noise_generator(shape = (B * E,), rng = rng).to(tokens.dtype)
 
-        # map src to latents
-        for read in self.encoder:
-            latents = read(q = latents, kv = torch.cat([src, latents], dim = 1))
-
-        # process latents
-        for process in self.processor:
-            latents = process(q = latents)
-
-        # map latents to tgt
-        for write in self.decoder:
-            tgt = write(q = tgt, kv = latents)
-
+        # add noise and positions
+        tokens = tokens + noise + self.position_embedding.weight      
+        
+        # apply Natten-transformer
+        tokens = self.transformer(tokens)
+        
         # map all tokens back to fields
-        fields = self.to_fields(tgt)
+        fields = self.to_fields(tokens)
         
         # rearrange to ensemble form
-        fields = einops.rearrange(fields, "(b e) ... k -> b ... (e k)", e = E, b = B, k = K)
+        fields = einops.rearrange(fields, "(b e) ... -> b ... e", e = E, b = B)
         return fields

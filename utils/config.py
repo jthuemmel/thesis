@@ -139,6 +139,7 @@ class ObjectiveConfig:
     src_high: Optional[int] = None
     tgt_low: Optional[int] = None
     tgt_high: Optional[int] = None
+    step_size: Optional[int] = None
     # schedule bounded [eps, 1-eps]
     epsilon: Optional[float] = 1e-7
     # stratification
@@ -191,7 +192,7 @@ class WorldConfig:
         self.field_pattern = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
         self.patch_pattern = ' '.join(self.patch_layout)
         self.token_pattern = ' '.join(self.field_layout)
-        
+
         self.flat_token_pattern = f"({self.token_pattern})"
         self.flat_patch_pattern = f"({self.patch_pattern})"
         self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"

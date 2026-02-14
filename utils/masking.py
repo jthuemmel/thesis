@@ -103,9 +103,10 @@ class MultinomialMasking(torch.nn.Module):
 
         return F_src.clamp(self.epsilon, 1 - self.epsilon), F_tgt.clamp(self.epsilon, 1 - self.epsilon)
     
-    def rates_(self, rng: torch.Generator = None, step_size: int = 64):
-        src_low, src_high = default(self.objective.src_low, 1), default(self.objective.src_high, self.world.num_tokens - 1)
-        tgt_low, tgt_high = default(self.objective.tgt_low, 1), default(self.objective.tgt_high, self.world.num_tokens - 1)
+    def rates_(self, rng: torch.Generator = None):
+        step_size = default(self.objective.step_size, 1)
+        src_low, src_high = default(self.objective.src_low, 0), default(self.objective.src_high, self.world.num_tokens - 1)
+        tgt_low, tgt_high = default(self.objective.tgt_low, 0), default(self.objective.tgt_high, self.world.num_tokens - 1)
 
         src_low_scaled, src_high_scaled = (src_low + step_size - 1) // step_size, src_high // step_size
         tgt_low_scaled, tgt_high_scaled = (tgt_low + step_size - 1) // step_size, tgt_high // step_size
@@ -121,12 +122,11 @@ class MultinomialMasking(torch.nn.Module):
         # sample joint prior
         P_src, P_tgt = self.prior_(B, rng)
 
-
         #  sample uniform rates from (low, high)
         K_src, K_tgt = self.rates_(rng)
 
         # sample multinomial 
-        src_indices = torch.multinomial(P_src, K_src, generator=rng)
-        tgt_indices = torch.multinomial(P_tgt, K_tgt, generator=rng)
+        src_indices = torch.multinomial(P_src, K_src, generator=rng) if K_src > 0 else None
+        tgt_indices = torch.multinomial(P_src, K_tgt, generator=rng) if K_tgt > 0 else None
         
         return src_indices, tgt_indices

@@ -6,6 +6,8 @@ from torch.nn.functional import scaled_dot_product_attention, silu, linear
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from natten.functional import neighborhood_attention_generic, na1d, na2d, na3d
+
 from typing import Optional, Tuple, List
 
 def exists(val):
@@ -78,20 +80,18 @@ class GatedFFN(torch.nn.Module):
 class Attention(torch.nn.Module):
     def __init__(self, dim: int, dim_heads: int = 64, bias: bool = False, qk_norm: bool = True):
         super().__init__()
-        self.split_heads = Rearrange('... n (h d) -> ... h n d', d = dim_heads)
-        self.merge_heads = Rearrange('... h n d -> ... n (h d)')
+        self.split_heads = Rearrange('... n (h hd) -> ... h n hd', hd = dim_heads)
+        self.merge_heads = Rearrange('... h n hd -> ... n (h hd)')
         self.to_q = torch.nn.Linear(dim, dim, bias = bias)
         self.to_k = torch.nn.Linear(dim, dim, bias = bias)
         self.to_v = torch.nn.Linear(dim, dim, bias = bias)
-        self.norm_q = torch.nn.LayerNorm(dim_heads, bias=False) if qk_norm else torch.nn.Identity()
-        self.norm_k = torch.nn.LayerNorm(dim_heads, bias=False) if qk_norm else torch.nn.Identity()
+        self.norm_qk = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **attn_kwargs) -> torch.Tensor:
         q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, k, v])
-        q, k, v = map(self.split_heads, [q, k, v]) # split heads and merge any leading dimensions into the batch
-        q = self.norm_q(q)
-        k = self.norm_k(k)
+        q, k, v = map(self.split_heads, [q, k, v])
+        q, k = map(self.norm_qk, [q, k])
         attn = scaled_dot_product_attention(q, k, v, **attn_kwargs)
         out = self.merge_heads(attn)
         out = self.to_out(out)
@@ -112,80 +112,65 @@ class ConditionalLayerNorm(torch.nn.Module):
         x = (1. + scale) * self.norm(x) + shift
         return x
     
-class SelfConditioning(torch.nn.Module):
-    def __init__(self, dim: int):
+class NeighbourhoodAttention(torch.nn.Module):
+    def __init__(self, 
+                 dim: int, 
+                 kernel_size: tuple | int,
+                 stride: tuple | int = 1,
+                 dilation: tuple | int = 1,
+                 dim_heads: int = 64, 
+                 bias: bool = False, 
+                 qk_norm: bool = True):
         super().__init__()
-        self.ffn = GatedFFN(dim)
-        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
-        self.scale = torch.nn.Parameter(torch.zeros(dim))
-
-    def forward(self, initial: torch.FloatTensor, previous: torch.FloatTensor = None):
-        previous = default(previous, torch.zeros_like(initial))
-        x = self.scale * self.norm(previous + self.ffn(previous)) + initial
-        return x
-
-class ConvNextBlock(torch.nn.Module):
-    def __init__(self, dim: int, kernel_size: tuple, num_groups: int = 1, expansion_factor: int = 4):
-        super().__init__()
-        k = len(kernel_size)
-        assert 4 > k > 0, 'kernel must be 1, 2 or 3d'
-        conv_fn = getattr(torch.nn, f"Conv{k}d")
-
-        self.norm = torch.nn.GroupNorm(num_groups= num_groups, num_channels= dim)
-
-        self.dw_conv = conv_fn(
-                in_channels = dim,
-                out_channels = dim,
-                padding = 'same',
-                kernel_size = kernel_size,
-                groups = dim,
-            )
-
-        self.pw_in = conv_fn(
-                in_channels = dim,
-                out_channels = dim * expansion_factor,
-                kernel_size = 1,
-                groups = num_groups,
-            )
-
-        self.silu = torch.nn.SiLU()
-
-        self.pw_out = conv_fn(
-                in_channels = dim * expansion_factor,
-                out_channels = dim,
-                kernel_size = 1,
-                groups = num_groups,
-            )
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        self.split_heads = Rearrange('... (hh d) ->  ... hh d', d = dim_heads)
+        self.merge_heads = Rearrange('... hh d -> ... (hh d)')
         
-    def forward(self, x: torch.FloatTensor):
-        skip = x
-        x = self.norm(x)
-        x = self.dw_conv(x)
-        x = self.pw_in(x)
-        x = self.silu(x)
-        x = self.pw_out(x)
-        return skip + x
-    
-class ConvInterpolate(torch.nn.Module):
-    def __init__(self, dim: int, kernel_size: tuple, out_size: tuple, num_groups: int, mode: str = "nearest-exact"):
-        super().__init__()
-        self._out_size = out_size
-        self._mode = mode
-        k = len(kernel_size)
-        assert 4 > k > 0, 'kernel must be 1, 2 or 3d'
-        conv_fn = getattr(torch.nn, f"Conv{k}d")
-        self.conv_out = conv_fn(
-                in_channels = dim,
-                out_channels = dim,
-                padding = 'same',
-                kernel_size = kernel_size,
-                groups = num_groups,
+        self.to_qkv = torch.nn.Linear(dim, 3 * dim, bias = bias)
+        self.norm_qk = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
+        self.to_out = torch.nn.Linear(dim, dim, bias = bias)
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        q, k, v = self.to_qkv(q).chunk(3, dim = -1)
+        q, k, v = map(self.split_heads, [q, k, v])
+        q, k = map(self.norm_qk, [q, k])
+        attn = neighborhood_attention_generic(
+            query = q, key = k, value = v,
+            kernel_size = self.kernel_size, dilation = self.dilation, stride = self.stride,
             )
-            
-    def forward(self, x: torch.FloatTensor):
-        x = torch.nn.functional.interpolate(x, size = self._out_size, mode = self._mode)
-        x = x + self.conv_out(x)
-        return x
+        out = self.merge_heads(attn)
+        out = self.to_out(out)
+        return out
+    
+class NattenBlock(torch.nn.Module):
+    def __init__(self, 
+                 dim: int, 
+                 kernel_size: tuple | int,
+                 stride: tuple | int = 1,
+                 dilation: tuple | int = 1,
+                 dim_heads: int = 64, 
+                 drop_path: float = 0.,
+                 has_skip: bool = True, 
+                 qk_norm: bool = True, 
+                 bias: bool = False,
+                 **kwargs):
+        super().__init__()
+        self.att_norm = torch.nn.RMSNorm(dim)
+        self.ffn_norm = torch.nn.RMSNorm(dim)
+        self.drop_path = DropPath(drop_path)
+        self.att = NeighbourhoodAttention(dim, 
+                                          kernel_size= kernel_size, stride= stride, dilation = dilation, 
+                                          dim_heads= dim_heads, qk_norm=qk_norm, bias=bias)
+        self.ffn = GatedFFN(dim, bias = bias)
+        self.has_skip = has_skip
+
+    def forward(self, q: torch.Tensor, **attn_kwargs):
+        skip = q if self.has_skip else 0.
+        q = skip + self.drop_path(self.att(self.att_norm(q)))
+        q = q + self.drop_path(self.ffn(self.ffn_norm(q)))
+        return q
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, 

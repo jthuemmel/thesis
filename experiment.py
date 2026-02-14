@@ -278,7 +278,7 @@ class Experiment(DistributedTrainer):
         batch = batch.to(self.device)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        src, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = True)
+        src, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
 
         prediction = model(batch, src, None, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
@@ -291,7 +291,12 @@ class Experiment(DistributedTrainer):
         
         # sample src and tgt
         src, tgt = self.masking((B, ), rng = self.generator)
-        mask = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool).scatter_(1, tgt, True)
+        visible = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool)
+        if exists(src):
+            visible = visible.scatter_(1, src, True)
+        mask = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool)
+        if exists(tgt):
+            mask = mask.scatter_(1, tgt, True)
         mask_weight = None
         
         # prepare mask and mask_weight (if md4)
@@ -299,7 +304,7 @@ class Experiment(DistributedTrainer):
         mask_weight = self.mask_to_field(mask_weight) if exists(mask_weight) else torch.ones_like(mask, dtype = torch.float32)
 
         # model and loss
-        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
+        prediction = model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = mask_weight)
 

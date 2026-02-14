@@ -112,21 +112,22 @@ class SphericalDiffusionNoise(torch.nn.Module):
         return eta
     
 class RandomField(torch.nn.Module):
-    def __init__(self, model_dim: int, world: WorldConfig, has_ffn: bool = True):
+    def __init__(self, model_dim: int, world: WorldConfig, has_ffn: bool = False):
         super().__init__()
-        horizontal = torch.tensor([500., 1000., 2000., 4000.])
-        temporal = torch.tensor([2, 4, 6, 8, 12])
+        horizontal = torch.tensor([512., 1024., 2048., 4096.])
+        temporal = torch.tensor([1, 2, 4, 8])
+        channels = 8
 
         start = (180 // world.patch_sizes['hh'] - world.token_sizes['h']) // 2
-        channels = len(horizontal) * len(temporal)
+        c = channels * len(horizontal) * len(temporal)
 
         self.noise_generator = SphericalDiffusionNoise(
-            num_channels=channels,
+            num_channels=c,
             num_lat=180 // world.patch_sizes['hh'],
             num_lon=360 // world.patch_sizes['ww'],
             num_steps=world.token_sizes["t"],
-            horizontal_length= einops.repeat(horizontal, 'h -> (h t)', h = len(horizontal), t = len(temporal)),
-            temporal_length=einops.repeat(temporal, 't -> (h t)', h = len(horizontal), t = len(temporal)),
+            horizontal_length= einops.repeat(horizontal, 'h -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
+            temporal_length=einops.repeat(temporal, 't -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
             lat_slice= slice(start, start + world.token_sizes['h']),
             lon_slice=slice(0, 2 * world.token_sizes['w'], 2)
         )
@@ -138,7 +139,7 @@ class RandomField(torch.nn.Module):
             module = EinMix(
                 pattern = f'... c t h w -> ... {world.flat_token_pattern} d',
                 weight_shape = 'v c d',
-                c = channels, d = model_dim, **world.token_sizes,
+                c = c, d = model_dim, **world.token_sizes,
             )
         )
         

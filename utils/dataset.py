@@ -40,9 +40,9 @@ class NinoData(Dataset):
         # Gets the xarray dataset
         data_arrays = self._load_netcdf_files(path, self.config.variables)
         try:
-            ds = xr.merge(data_arrays, join='exact')
+            ds = xr.merge(data_arrays, join='exact', compat = 'no_conflicts')
         except ValueError:
-            ds = xr.merge(data_arrays, join='inner')
+            ds = xr.merge(data_arrays, join='inner', compat = 'no_conflicts')
             print("Warning: Inner merge")
         return xr.merge([ds[var] for var in self.variables])
     
