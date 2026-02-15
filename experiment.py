@@ -199,7 +199,7 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             ).to(self.device)
         
-        self.masking = MultinomialMasking(
+        self.masking = BinaryMasking(
             world = self.world, 
             objective=self._cfg.objective
         ).to(self.device)
@@ -290,12 +290,7 @@ class Experiment(DistributedTrainer):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample src and tgt
-        src, tgt = self.masking((B, ), rng = self.generator)
-        visible = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool)
-        if exists(src): visible = visible.scatter_(1, src, True)
-        mask = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool)
-        if exists(tgt): mask = mask.scatter_(1, tgt, True)
-        mask_weight = None
+        visible, mask, mask_weight = self.masking((B, ), rng = self.generator)
         
         # prepare mask and mask_weight (if md4)
         mask = torch.logical_and(self.mask_to_field(mask), self.land_sea_mask)

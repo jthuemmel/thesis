@@ -85,9 +85,8 @@ class EinMask(torch.nn.Module):
             "coordinates", 
             torch.stack(
                 torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape), 
-                dim = -1
-                ).view(1, world.num_tokens, len(world.token_shape)) # shape: 1, N, Coo
-            )
+                dim = -1)
+                )
 
         # transformer
         if network.backbone == 'natten':

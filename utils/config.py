@@ -143,8 +143,11 @@ class ObjectiveConfig:
     tgt_low: Optional[int] = None
     tgt_high: Optional[int] = None
     step_size: Optional[int] = None
+    # schedule_fn and args
+    src_schedule: Optional[str] = 'cosine'
+    tgt_schedule: Optional[str] = 'sine'
     # schedule bounded [eps, 1-eps]
-    epsilon: Optional[float] = 1e-7
+    epsilon: Optional[float] = 1e-3
     # stratification
     stratify: Optional[bool] = False
 
