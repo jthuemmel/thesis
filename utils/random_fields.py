@@ -114,9 +114,9 @@ class SphericalDiffusionNoise(torch.nn.Module):
 class RandomField(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
-        horizontal = torch.tensor(network.grf_horizontal, dtype = torch.float32)
-        temporal = torch.tensor(network.grf_temporal, dtype = torch.float32)
-        channels = int(network.grf_channels)
+        horizontal = torch.tensor(default(network.grf_horizontal, [512]), dtype = torch.float32)
+        temporal = torch.tensor(default(network.grf_temporal, [1]), dtype = torch.float32)
+        channels = int(default(network.grf_channels, 1))
 
         start = (180 // world.patch_sizes['hh'] - world.token_sizes['h']) // 2
         c = channels * len(horizontal) * len(temporal)

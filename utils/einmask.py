@@ -70,7 +70,7 @@ class EinMask(torch.nn.Module):
             )
         
         # Noise
-        self.noise_generator = RandomField(network.dim, world)
+        self.noise_generator = RandomField(network, world)
 
         # learnable tokens
         self.mask_embedding = torch.nn.Embedding(1, network.dim)
@@ -81,10 +81,12 @@ class EinMask(torch.nn.Module):
         )
 
         # pre-computed coordinates
-        self.register_buffer('indices', torch.arange(world.num_tokens))
-        self.register_buffer("coordinates", torch.stack(
-            torch.unravel_index(indices = self.indices, shape = world.token_shape), 
-            dim = -1)
+        self.register_buffer(
+            "coordinates", 
+            torch.stack(
+                torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape), 
+                dim = -1
+                ).view(1, world.num_tokens, len(world.token_shape)) # shape: 1, N, Coo
             )
 
         # transformer
@@ -93,10 +95,8 @@ class EinMask(torch.nn.Module):
             NattenBlock(network.dim, drop_path= network.drop_path, kernel_size=world.num_tokens)
             for _ in range(network.num_layers)
             ])
-        elif network.backbone == 'perceiver':
-            self.transformer = LatentTransformer(network)
         else:
-            raise NotImplementedError
+            self.transformer = LatentTransformer(network)
         
         # Weight initialization
         self.apply(self.base_init)
@@ -129,7 +129,6 @@ class EinMask(torch.nn.Module):
         # expand to ensemble form
         fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
         visible = einops.repeat(visible, 'b ... -> (b e) ... d', d = self.network.dim, e = E, b = B)
-        coo = einops.repeat(self.coordinates, '... -> (b e) ...', b = B, e = E)
 
         # embed full fields as tokens
         tokens = self.to_tokens(fields)
@@ -141,9 +140,9 @@ class EinMask(torch.nn.Module):
         noise = self.noise_generator(shape = (B * E,), rng = rng).to(tokens.dtype)
 
         # add noise and positions
-        tokens = tokens + noise + self.position_embedding(coo)      
+        tokens = tokens + noise + self.position_embedding(self.coordinates)      
         
-        # apply Natten-transformer
+        # apply transformer
         tokens = self.transformer(tokens)
         
         # map all tokens back to fields
