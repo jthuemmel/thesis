@@ -7,6 +7,46 @@ from utils.components import *
 from utils.config import *
 from utils.random_fields import RandomField
 
+    
+class LatentTransformer(torch.nn.Module):
+    def __init__(self, network: NetworkConfig):
+        super().__init__()
+        # learnable latents
+        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
+
+        # latent transformer
+        self.encoder = torch.nn.ModuleList([
+            TransformerBlock(network.dim)
+            for _ in range(default(network.num_read_blocks, 1))
+        ])
+
+        self.processor = torch.nn.ModuleList([
+            TransformerBlock(network.dim, drop_path=network.drop_path)
+            for _ in range(default(network.num_compute_blocks, 1))
+        ])
+        
+        self.decoder = torch.nn.ModuleList([
+            TransformerBlock(network.dim)
+            for n in range(default(network.num_write_blocks, 1))
+        ])
+
+    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None):
+        kv = default(kv, q)
+        latents = self.latents.weight.expand(q.size(0), -1, -1)
+        # map src to latents
+        for read in self.encoder:
+            latents = read(q = latents, kv = torch.cat([kv, latents], dim = 1))
+
+        # process latents
+        for process in self.processor:
+            latents = process(q = latents)
+
+        # map latents to tgt
+        for write in self.decoder:
+            q = write(q = q, kv = latents)
+
+        return q
+    
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
@@ -30,18 +70,34 @@ class EinMask(torch.nn.Module):
             )
         
         # Noise
-        self.noise_generator = RandomField(network.dim, world, has_ffn=False)
+        self.noise_generator = RandomField(network.dim, world)
 
         # learnable tokens
         self.mask_embedding = torch.nn.Embedding(1, network.dim)
-        self.position_embedding = torch.nn.Embedding(world.num_tokens, network.dim)
+        self.position_embedding = ContinuousPositionalEmbedding(
+            dim_per_coord=network.dim_coords, 
+            wavelengths=[(1, 2 * k) for k in world.token_shape],
+            model_dim=network.dim
+        )
+
+        # pre-computed coordinates
+        self.register_buffer('indices', torch.arange(world.num_tokens))
+        self.register_buffer("coordinates", torch.stack(
+            torch.unravel_index(indices = self.indices, shape = world.token_shape), 
+            dim = -1)
+            )
 
         # transformer
-        self.transformer = torch.nn.Sequential(*[
+        if network.backbone == 'natten':
+            self.transformer = torch.nn.Sequential(*[
             NattenBlock(network.dim, drop_path= network.drop_path, kernel_size=world.num_tokens)
             for _ in range(network.num_layers)
-        ])
-
+            ])
+        elif network.backbone == 'perceiver':
+            self.transformer = LatentTransformer(network)
+        else:
+            raise NotImplementedError
+        
         # Weight initialization
         self.apply(self.base_init)
 
@@ -73,7 +129,8 @@ class EinMask(torch.nn.Module):
         # expand to ensemble form
         fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
         visible = einops.repeat(visible, 'b ... -> (b e) ... d', d = self.network.dim, e = E, b = B)
-        
+        coo = einops.repeat(self.coordinates, '... -> (b e) ...', b = B, e = E)
+
         # embed full fields as tokens
         tokens = self.to_tokens(fields)
 
@@ -84,7 +141,7 @@ class EinMask(torch.nn.Module):
         noise = self.noise_generator(shape = (B * E,), rng = rng).to(tokens.dtype)
 
         # add noise and positions
-        tokens = tokens + noise + self.position_embedding.weight      
+        tokens = tokens + noise + self.position_embedding(coo)      
         
         # apply Natten-transformer
         tokens = self.transformer(tokens)

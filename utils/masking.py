@@ -60,7 +60,7 @@ class ForecastMasking(torch.nn.Module):
             tgt = mask.bool().logical_not().nonzero(as_tuple=True)[0]
             return src.expand(*shape,-1), tgt.expand(*shape,-1)
         else:
-            return mask.expand(*shape, -1).bool().logical_not(), mask.expand(*shape, -1).bool()
+            return mask.expand(*shape, -1).bool(), mask.expand(*shape, -1).bool().logical_not()
         
 class MultinomialMasking(torch.nn.Module):
     def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
@@ -127,6 +127,6 @@ class MultinomialMasking(torch.nn.Module):
 
         # sample multinomial 
         src_indices = torch.multinomial(P_src, K_src, generator=rng) if K_src > 0 else None
-        tgt_indices = torch.multinomial(P_src, K_tgt, generator=rng) if K_tgt > 0 else None
+        tgt_indices = torch.multinomial(P_tgt, K_tgt, generator=rng) if K_tgt > 0 else None
         
         return src_indices, tgt_indices

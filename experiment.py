@@ -280,7 +280,7 @@ class Experiment(DistributedTrainer):
 
         src, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
 
-        prediction = model(batch, src, None, members = self.world.ens_size, rng = self.generator)
+        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
 
@@ -292,11 +292,9 @@ class Experiment(DistributedTrainer):
         # sample src and tgt
         src, tgt = self.masking((B, ), rng = self.generator)
         visible = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool)
-        if exists(src):
-            visible = visible.scatter_(1, src, True)
+        if exists(src): visible = visible.scatter_(1, src, True)
         mask = torch.zeros((B, self.world.num_tokens), device = self.device, dtype = torch.bool)
-        if exists(tgt):
-            mask = mask.scatter_(1, tgt, True)
+        if exists(tgt): mask = mask.scatter_(1, tgt, True)
         mask_weight = None
         
         # prepare mask and mask_weight (if md4)

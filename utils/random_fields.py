@@ -116,7 +116,7 @@ class RandomField(torch.nn.Module):
         super().__init__()
         horizontal = torch.tensor([512., 1024., 2048., 4096.])
         temporal = torch.tensor([1, 2, 4, 8])
-        channels = 8
+        channels = 1
 
         start = (180 // world.patch_sizes['hh'] - world.token_sizes['h']) // 2
         c = channels * len(horizontal) * len(temporal)
