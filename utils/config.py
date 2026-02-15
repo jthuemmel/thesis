@@ -97,6 +97,9 @@ class NetworkConfig:
     use_checkpoint: Optional[bool] = False
     backbone: Optional[str] = None
     zero_init: Optional[bool] = False
+    grf_channels: Optional[int] = None
+    grf_horizontal: Optional[List[int]] = None
+    grf_temporal: Optional[List[int]] = None
 
 @dataclass
 class DatasetConfig:

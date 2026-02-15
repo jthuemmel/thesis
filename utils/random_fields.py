@@ -4,7 +4,7 @@ import torch_harmonics
 
 from einops.layers.torch import EinMix
 from utils.components import default, GatedFFN
-from utils.config import WorldConfig
+from utils.config import WorldConfig, NetworkConfig
 
 
 class SphericalDiffusionNoise(torch.nn.Module):
@@ -112,11 +112,11 @@ class SphericalDiffusionNoise(torch.nn.Module):
         return eta
     
 class RandomField(torch.nn.Module):
-    def __init__(self, model_dim: int, world: WorldConfig, has_ffn: bool = False):
+    def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
-        horizontal = torch.tensor([512., 1024., 2048., 4096.])
-        temporal = torch.tensor([1, 2, 4, 8])
-        channels = 1
+        horizontal = torch.tensor(network.grf_horizontal, dtype = torch.float32)
+        temporal = torch.tensor(network.grf_temporal, dtype = torch.float32)
+        channels = int(network.grf_channels)
 
         start = (180 // world.patch_sizes['hh'] - world.token_sizes['h']) // 2
         c = channels * len(horizontal) * len(temporal)
@@ -132,27 +132,15 @@ class RandomField(torch.nn.Module):
             lon_slice=slice(0, 2 * world.token_sizes['w'], 2)
         )
 
-        self.projection = torch.nn.Sequential()
-        
-        self.projection.add_module(
-            name = 'einmix', 
-            module = EinMix(
+        self.projection = torch.nn.Sequential(
+            EinMix(
                 pattern = f'... c t h w -> ... {world.flat_token_pattern} d',
                 weight_shape = 'v c d',
-                c = c, d = model_dim, **world.token_sizes,
-            )
+                c = c, d = network.dim, **world.token_sizes,
+            ),
+            torch.nn.LayerNorm(network.dim)
         )
         
-        if has_ffn:
-            self.projection.add_module(
-                name = 'ffn',
-                module = GatedFFN(model_dim)
-            )
-
-        self.projection.add_module(
-            name = 'norm',
-            module = torch.nn.LayerNorm(model_dim)
-        )
             
 
     def forward(self, shape: tuple, rng: torch.Generator = None):
