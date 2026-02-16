@@ -74,11 +74,7 @@ class BinaryMasking(torch.nn.Module):
 
     @staticmethod
     def binary_topk_(P: torch.FloatTensor, K: torch.LongTensor) -> torch.BoolTensor:
-        # sort indices according to prior
-        idx = P.argsort(dim=-1, descending=True)
-        # rank indices for top-k selection
-        rank = idx.argsort(dim=-1)
-        return K > rank
+        return K > P.argsort(descending=True).argsort()
     
     @staticmethod
     def sine_schedule(t: torch.FloatTensor) -> tuple[torch.FloatTensor, torch.FloatTensor]:
