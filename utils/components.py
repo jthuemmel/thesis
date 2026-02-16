@@ -128,18 +128,30 @@ class NeighbourhoodAttention(torch.nn.Module):
         self.split_heads = Rearrange('... (hh d) ->  ... hh d', d = dim_heads)
         self.merge_heads = Rearrange('... hh d -> ... (hh d)')
         
-        self.to_qkv = torch.nn.Linear(dim, 3 * dim, bias = bias)
+        self.to_q = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_k = torch.nn.Linear(dim, dim, bias = bias)
+        self.to_v = torch.nn.Linear(dim, dim, bias = bias)
         self.norm_qk = torch.nn.RMSNorm(dim_heads) if qk_norm else torch.nn.Identity()
         self.to_out = torch.nn.Linear(dim, dim, bias = bias)
 
-    def forward(self, q: torch.Tensor) -> torch.Tensor:
-        q, k, v = self.to_qkv(q).chunk(3, dim = -1)
+    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # project to qkv, split heads and norm
+        q, k, v = map(lambda fn, x: fn(x), [self.to_q, self.to_k, self.to_v], [q, q, q])
         q, k, v = map(self.split_heads, [q, k, v])
         q, k = map(self.norm_qk, [q, k])
+        # maybe process additional context
+        add_k, add_v = (None, None)
+        if exists(kv):
+            add_k, add_v = map(lambda fn, x: fn(x), [self.to_k, self.to_v], [kv, kv])
+            add_k, add_v = map(self.split_heads, [add_k, add_v])
+            add_k = self.norm_qk(add_k)
+        # call functional attention kernel
         attn = neighborhood_attention_generic(
             query = q, key = k, value = v,
+            additional_keys = add_k, additional_values = add_v,
             kernel_size = self.kernel_size, dilation = self.dilation, stride = self.stride,
             )
+        # merge heads and project out
         out = self.merge_heads(attn)
         out = self.to_out(out)
         return out
@@ -152,7 +164,6 @@ class NattenBlock(torch.nn.Module):
                  dilation: tuple | int = 1,
                  dim_heads: int = 64, 
                  drop_path: float = 0.,
-                 has_skip: bool = True, 
                  qk_norm: bool = True, 
                  bias: bool = False,
                  **kwargs):
@@ -164,11 +175,10 @@ class NattenBlock(torch.nn.Module):
                                           kernel_size= kernel_size, stride= stride, dilation = dilation, 
                                           dim_heads= dim_heads, qk_norm=qk_norm, bias=bias)
         self.ffn = GatedFFN(dim, bias = bias)
-        self.has_skip = has_skip
 
-    def forward(self, q: torch.Tensor, **attn_kwargs):
-        skip = q if self.has_skip else 0.
-        q = skip + self.drop_path(self.att(self.att_norm(q)))
+    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None, **attn_kwargs):
+        kv = self.att_norm(kv) if exists(kv) else kv
+        q = q + self.drop_path(self.att(self.att_norm(q), kv))
         q = q + self.drop_path(self.ffn(self.ffn_norm(q)))
         return q
 
