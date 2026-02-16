@@ -103,7 +103,7 @@ class BinaryMasking(torch.nn.Module):
         # for each event dimension
         for dim, alpha in self.objective.event_dims.items():
             # sample uniform variate along the dimension
-            U = self.uniform_((B, self.world.token_sizes[dim]), rng).sort(dim=-1).values
+            U = self.uniform_((B, self.world.token_sizes[dim]), rng)
 
             # broadcast to the size of the full event space
             U = einops.repeat(U, f'b {dim} -> b {self.world.flat_token_pattern}', **self.world.token_sizes)
