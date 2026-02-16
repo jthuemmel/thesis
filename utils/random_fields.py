@@ -3,8 +3,7 @@ import einops
 import torch_harmonics
 
 from einops.layers.torch import EinMix
-from utils.components import default, GatedFFN
-from utils.config import WorldConfig, NetworkConfig
+from utils.config import WorldConfig, NetworkConfig, default
 
 
 class SphericalDiffusionNoise(torch.nn.Module):
@@ -141,8 +140,6 @@ class RandomField(torch.nn.Module):
             torch.nn.LayerNorm(network.dim)
         )
         
-            
-
     def forward(self, shape: tuple, rng: torch.Generator = None):
         grf = self.noise_generator(shape, rng)
         return self.projection(grf)
