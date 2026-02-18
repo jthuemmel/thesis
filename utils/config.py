@@ -146,6 +146,9 @@ class ObjectiveConfig:
     # schedule_fn and args
     src_schedule: Optional[str] = 'cosine'
     tgt_schedule: Optional[str] = 'sine'
+    # kumaraswamy schedules
+    src_alpha: Optional[float] = 1.
+    tgt_alpha: Optional[float] = 1.
     # schedule bounded [eps, 1-eps]
     epsilon: Optional[float] = 1e-3
     # stratification
