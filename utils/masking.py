@@ -70,25 +70,25 @@ class BinaryMasking(torch.nn.Module):
         self.register_buffer('epsilon', torch.tensor(self.objective.epsilon))
 
     @property
-    def device(self): return self.epsilon.device
+    def device(self) -> torch.device: return self.epsilon.device
 
     @staticmethod
     def binary_topk_(P: torch.FloatTensor, K: torch.LongTensor) -> torch.BoolTensor:
         return K > P.argsort(descending=True).argsort()
     
     @staticmethod
-    def kumaraswamy_quantile(t: torch.FloatTensor, alpha: float = 1.):
-        return t.log().div(alpha).exp()
+    def kumaraswamy_quantile(U: torch.FloatTensor, alpha: float = 1.):
+        return U.log().div(alpha).exp()
     
     @staticmethod
-    def kumaraswamy_quantile_dt(t: torch.FloatTensor, alpha: float = 1.):
-        return t.log().mul((1 / alpha) - 1).exp().div(alpha)
+    def kumaraswamy_quantile_dt(U: torch.FloatTensor, alpha: float = 1.):
+        return U.log().mul((1 / alpha) - 1).exp().div(alpha)
             
-    def k_from_rates_(self, rates: torch.FloatTensor):
-        return rates.mul(self.world.num_tokens).long()
+    def k_from_rates_(self, R: torch.FloatTensor):
+        return R.mul(self.world.num_tokens).long()
     
-    def uniform_(self, shape: tuple, rng: torch.Generator):
-        return torch.rand(*shape, device = self.device, generator=rng).clamp(self.epsilon, 1 - self.epsilon)
+    def uniform_(self, shape: tuple, rng: torch.Generator, eps: float = 1e-6):
+        return torch.rand(*shape, device = self.device, generator=rng).clamp(eps, 1-eps)
 
     def weight_prior(self, B: int, rng: torch.Generator = None):
         # baseline factors are log-uniform -> Kumaraswamy(1, 1)
@@ -103,9 +103,8 @@ class BinaryMasking(torch.nn.Module):
             U = einops.repeat(U, f'b {dim} -> b {self.world.flat_token_pattern}', **self.world.token_sizes)
 
             # apply quantile function for Kumaraswamy(alpha, 1) and Kumaraswamy(1, alpha) and sum log factors
-            F_src += self.kumaraswamy_quantile(U, alpha)
-            F_tgt += self.kumaraswamy_quantile(1 - U, alpha)
-
+            F_src += U.log().div(alpha)
+            F_tgt += (1 - U).log().div(alpha)
         return F_src, F_tgt
     
     def rate_prior(self, B: int, rng: torch.Generator = None):
@@ -118,10 +117,10 @@ class BinaryMasking(torch.nn.Module):
             U = (L + U) % 1
         else:
             # sample a random rate for each batch element
-            U = self.uniform_((B, ), rng)
+            U = self.uniform_((B,), rng).clamp(self.epsilon, 1 - self.epsilon)
         # broadcast to event size
         U = einops.repeat(U, "b -> b n", n = self.world.num_tokens)
-        # schedule fn
+        # schedule 
         R_src = self.kumaraswamy_quantile(U, self.objective.src_alpha)
         R_tgt = self.kumaraswamy_quantile(1 - U, self.objective.tgt_alpha)
         dR = self.kumaraswamy_quantile_dt(U, self.objective.src_alpha)

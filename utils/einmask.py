@@ -9,8 +9,9 @@ from utils.random_fields import RandomField
 
     
 class LatentTransformer(torch.nn.Module):
-    def __init__(self, network: NetworkConfig):
+    def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
+
         # learnable latents
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
 
@@ -30,12 +31,11 @@ class LatentTransformer(torch.nn.Module):
             for n in range(default(network.num_write_blocks, 1))
         ])
 
-    def forward(self, q: torch.Tensor, kv: Optional[torch.Tensor] = None):
-        kv = default(kv, q)
-        latents = self.latents.weight.expand(q.size(0), -1, -1)
+    def forward(self, queries: torch.Tensor):
+        latents = einops.repeat(self.latents.weight, 'n d -> b n d', b = queries.size(0))
         # map src to latents
         for read in self.encoder:
-            latents = read(q = latents, kv = torch.cat([kv, latents], dim = 1))
+            latents = read(q = latents, kv = torch.cat([queries, latents], dim = -2))
 
         # process latents
         for process in self.processor:
@@ -43,9 +43,9 @@ class LatentTransformer(torch.nn.Module):
 
         # map latents to tgt
         for write in self.decoder:
-            q = write(q = q, kv = latents)
+            queries = write(q = queries, kv = latents)
 
-        return q
+        return queries
     
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
@@ -89,13 +89,7 @@ class EinMask(torch.nn.Module):
                 )
 
         # transformer
-        if network.backbone == 'natten':
-            self.transformer = torch.nn.Sequential(*[
-            NattenBlock(network.dim, drop_path= network.drop_path, kernel_size=world.num_tokens)
-            for _ in range(network.num_layers)
-            ])
-        else:
-            self.transformer = LatentTransformer(network)
+        self.transformer = LatentTransformer(network, world)
         
         # Weight initialization
         self.apply(self.base_init)
