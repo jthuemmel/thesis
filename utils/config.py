@@ -163,8 +163,7 @@ class WorldConfig:
     tau: int = 2   
 
     # derived fields
-    field_layout: tuple = field(init=False)
-    patch_layout: tuple = field(init=False)
+    layout: tuple = field(init=False)
     token_sizes: dict = field(init=False)
     token_shape: tuple = field(init=False)
     field_shape: tuple = field(init=False)
@@ -177,35 +176,29 @@ class WorldConfig:
     field_pattern: str = field(init=False)
     token_pattern: str = field(init=False)
     patch_pattern: str = field(init=False)
-    flat_token_pattern: str = field(init=False)
-    flat_patch_pattern: str = field(init=False)
-    flatland_pattern: str = field(init=False)
+    flat_pattern: str = field(init=False)
 
     def __post_init__(self):
-        self.field_layout = tuple(self.field_sizes.keys())
-        self.patch_layout = tuple(self.patch_sizes.keys())
+        self.layout = tuple(self.field_sizes.keys())
 
         self.token_sizes = {
             ax: (self.field_sizes[ax] // self.patch_sizes[f'{ax*2}'])
-            for ax in self.field_layout
+            for ax in self.layout
         }
 
-        self.field_shape = tuple(self.field_sizes[ax] for ax in self.field_layout)
-        self.token_shape = tuple(self.token_sizes[ax] for ax in self.field_layout)
-        self.patch_shape = tuple(self.patch_sizes[ax] for ax in self.patch_layout)
+        self.field_shape = tuple(self.field_sizes.values())
+        self.token_shape = tuple(self.token_sizes.values())
+        self.patch_shape = tuple(self.patch_sizes.values())
         
         self.num_tokens = prod(self.token_sizes.values())
         self.num_elements = prod(self.field_sizes.values())
         self.dim_tokens = prod(self.patch_sizes.values())
 
-        self.field_pattern = " ".join(f"({f} {p})" for f, p in zip(self.field_layout, self.patch_layout))
-        self.patch_pattern = ' '.join(self.patch_layout)
-        self.token_pattern = ' '.join(self.field_layout)
-
-        self.flat_token_pattern = f"({self.token_pattern})"
-        self.flat_patch_pattern = f"({self.patch_pattern})"
-        self.flatland_pattern = f"b {self.flat_token_pattern} {self.flat_patch_pattern}"
-
+        self.field_pattern = " ".join(f"({f} {f*2})" for f in self.layout)
+        self.patch_pattern = ' '.join(f"{f*2}" for f in self.layout)
+        self.token_pattern = ' '.join(f"{f}" for f in self.layout)
+        self.flat_pattern = ' '.join(f"{f} {f*2}" for f in self.layout)
+        
 @dataclass
 class TrainerConfig:
     # Experiment settings

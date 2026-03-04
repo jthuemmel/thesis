@@ -7,6 +7,259 @@ from utils.components import *
 from utils.config import *
 from utils.random_fields import *
 
+import einops
+import torch
+
+from einops.layers.torch import EinMix, Rearrange
+
+from utils.components import *
+from utils.config import *
+from utils.random_fields import RandomField
+
+# KUMARASWAMY DISTRIBUTION
+class StableKumaraswamy(torch.nn.Module):
+    '''Numerically stable methods for Kumaraswamy sampling, courtesy of Wasserman et al 2024'''
+    def __init__(self, c1: float = 1., c0: float = 1., epsilon=1e-3):
+        super().__init__()
+        assert c1 > 0. and c0 > 0., 'invalid concentration'
+       
+        # Register hyperparameters as buffers for device consistency
+        self.register_buffer("c1", torch.as_tensor(c1))
+        self.register_buffer("c0", torch.as_tensor(c0))
+        self.register_buffer("epsilon", torch.as_tensor(epsilon))
+    
+    # Kumaraswamy with log1mexp
+    @staticmethod
+    def log1mexp(t: torch.FloatTensor): #numerically stable log(1 - e**x)
+        return torch.where(
+        t < -0.69314718, #~ -log2
+        torch.log1p(-torch.exp(t)), 
+        torch.log(-torch.expm1(t))
+    )
+
+    def quantile_dt(self, t: torch.Tensor): # time derivative of the quantile function
+        #(1 - t)**((1 - c0) / c0) * (1 - (1 - t)**(1 / c0))**((1 - c1) / c1) / (c1 * c0)
+        log_1_minus_t = torch.log1p(-t) # 1 - t
+        log_constant = -self.c1.log() - self.c0.log() # 1 / c0 * c1
+        log_outer = log_1_minus_t * ((1 - self.c0) / self.c0) # (1 - t)**(1-c0)/c0
+        log_inner = ((1 - self.c1) / self.c1) * self.log1mexp(log_1_minus_t / self.c0)
+        return torch.exp(log_constant + log_inner + log_outer)
+
+    def quantile(self, t: torch.Tensor): # (1 - (1 - t)**(1 / c0))**(1 / c1)
+        return torch.exp(self.log1mexp(torch.log1p(-t) / self.c0) / self.c1)
+    
+    def cdf(self, t: torch.Tensor): # 1 - (1 - t**c1)**c0
+        return -torch.expm1(self.c0 * self.log1mexp(self.c1 * t.log()))
+    
+    def forward(self, shape: tuple, rng: torch.Generator = None):
+        t = torch.rand(shape, device=self.epsilon.device, generator= rng)
+        t = t * (1.0 - 2.0 * self.epsilon) + self.epsilon
+        return self.quantile(t), self.quantile_dt(t)
+
+class MultinomialMasking(torch.nn.Module):
+    def __init__(self, world: WorldConfig, objective: ObjectiveConfig):
+        super().__init__()
+
+        self.world = world
+        self.objective = objective
+
+        self.register_buffer('epsilon', torch.tensor(self.objective.epsilon))
+
+    @property
+    def device(self): return self.epsilon.device
+
+    def uniform_(self, B: int, N: int, rng: torch.Generator):
+        if self.objective.stratify:
+            U = torch.rand(1, N, device = self.device, generator=rng)
+            L = torch.linspace(0, 1, B, device= self.device).view(-1, 1)
+            U = (U + L) % 1
+        else:
+            U = torch.rand(B, N, device = self.device, generator=rng)
+        return U.clamp(self.epsilon, 1 - self.epsilon)
+    
+    def prior_(self, B: int, rng: torch.Generator = None):
+        # baseline factors are constant
+        F_src, F_tgt = torch.ones(2, B, self.world.num_tokens, device= self.device)
+
+        # for each event dimension
+        for dim, alpha in self.objective.event_dims.items():
+            # sample uniform variate along the dimension
+            U = self.uniform_(B, self.world.token_sizes[dim], rng)
+
+            # broadcast to the size of the full event space
+            U = einops.repeat(U, f'b {dim} -> b {self.world.flat_token_pattern}', **self.world.token_sizes)
+
+            # apply quantile function for Kumaraswamy(alpha, 1) and Kumaraswamy(1, alpha) and multiply factors
+            F_src *= U.log().div(alpha).exp()
+            F_tgt *= (1 - U).log().div(alpha).exp()
+
+        return F_src.clamp(self.epsilon, 1 - self.epsilon), F_tgt.clamp(self.epsilon, 1 - self.epsilon)
+    
+    def rates_(self, rng: torch.Generator = None):
+        step_size = default(self.objective.step_size, 1)
+        src_low, src_high = default(self.objective.src_low, 0), default(self.objective.src_high, self.world.num_tokens - 1)
+        tgt_low, tgt_high = default(self.objective.tgt_low, 0), default(self.objective.tgt_high, self.world.num_tokens - 1)
+
+        src_low_scaled, src_high_scaled = (src_low + step_size - 1) // step_size, src_high // step_size
+        tgt_low_scaled, tgt_high_scaled = (tgt_low + step_size - 1) // step_size, tgt_high // step_size
+
+        K_src_scaled = torch.randint(src_low_scaled, src_high_scaled + 1, (1,), generator=rng, device=self.device).item()
+        K_tgt_scaled = torch.randint(tgt_low_scaled, tgt_high_scaled + 1, (1,), generator=rng, device=self.device).item()
+
+        return K_src_scaled * step_size, K_tgt_scaled * step_size
+    
+    def forward(self, B: int, rng: torch.Generator = None):
+        B = B[0] if isinstance(B, tuple) else B
+
+        # sample joint prior
+        P_src, P_tgt = self.prior_(B, rng)
+
+        #  sample uniform rates from (low, high)
+        K_src, K_tgt = self.rates_(rng)
+
+        # sample multinomial 
+        src_indices = torch.multinomial(P_src, K_src, generator=rng) if K_src > 0 else None
+        tgt_indices = torch.multinomial(P_tgt, K_tgt, generator=rng) if K_tgt > 0 else None
+        
+        return src_indices, tgt_indices
+    
+class LatentTransformer(torch.nn.Module):
+    def __init__(self, network: NetworkConfig, world: WorldConfig):
+        super().__init__()
+
+        # learnable latents
+        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
+
+        # latent transformer
+        self.encoder = torch.nn.ModuleList([
+            TransformerBlock(network.dim)
+            for _ in range(default(network.num_read_blocks, 1))
+        ])
+
+        self.processor = torch.nn.ModuleList([
+            TransformerBlock(network.dim, drop_path=network.drop_path)
+            for _ in range(default(network.num_compute_blocks, 1))
+        ])
+        
+        self.decoder = torch.nn.ModuleList([
+            TransformerBlock(network.dim)
+            for n in range(default(network.num_write_blocks, 1))
+        ])
+
+    def forward(self, queries: torch.Tensor):
+        latents = einops.repeat(self.latents.weight, 'n d -> b n d', b = queries.size(0))
+        # map src to latents
+        for read in self.encoder:
+            latents = read(q = latents, kv = torch.cat([queries, latents], dim = -2))
+
+        # process latents
+        for process in self.processor:
+            latents = process(q = latents)
+
+        # map latents to tgt
+        for write in self.decoder:
+            queries = write(q = queries, kv = latents)
+
+        return queries
+    
+class EinMask(torch.nn.Module):
+    def __init__(self, network: NetworkConfig, world: WorldConfig):
+        super().__init__()
+        # store configs
+        self.network = network
+        self.world = world
+
+        # I/O
+        self.to_tokens = EinMix(
+            pattern=f"b {world.field_pattern} -> b {world.flat_token_pattern} d", 
+            weight_shape=f'v {world.patch_pattern} d', 
+            d = network.dim, 
+            **world.patch_sizes, **world.token_sizes
+            )
+        
+        self.to_fields =EinMix(
+            pattern=f"b {world.flat_token_pattern} d -> b {world.field_pattern}", 
+            weight_shape=f'v d {world.patch_pattern}', 
+            d = network.dim, 
+            **world.patch_sizes, **world.token_sizes 
+            )
+        
+        # Noise
+        self.noise_generator = RandomField(network, world)
+
+        # learnable tokens
+        self.mask_embedding = torch.nn.Embedding(1, network.dim)
+        self.position_embedding = ContinuousPositionalEmbedding(
+            dim_per_coord=network.dim_coords, 
+            wavelengths=[(1, 2 * k) for k in world.token_shape],
+            model_dim=network.dim
+        )
+
+        # pre-computed coordinates
+        self.register_buffer(
+            "coordinates", 
+            torch.stack(
+                torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape), 
+                dim = -1)
+                )
+
+        # transformer
+        self.transformer = LatentTransformer(network, world)
+        
+        # Weight initialization
+        self.apply(self.base_init)
+
+    @staticmethod
+    def base_init(m: torch.nn.Module):
+        # linear
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+        # embedding
+        elif isinstance(m, torch.nn.Embedding):
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+        # einmix
+        elif isinstance(m, EinMix):
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            if m.bias is not None:
+                torch.nn.init.trunc_normal_(m.bias, std = 0.02)
+    
+    def forward(self, 
+                fields: torch.FloatTensor, 
+                visible: torch.BoolTensor, 
+                members: Optional[int] = None, 
+                rng: Optional[torch.Generator] = None
+                ) -> torch.FloatTensor:
+        B = fields.size(0)
+        E = default(members, 1)
+
+        # expand to ensemble form
+        fields = einops.repeat(fields, "b ... -> (b e) ...", e = E, b = B)
+        visible = einops.repeat(visible, 'b ... -> (b e) ... d', d = self.network.dim, e = E, b = B)
+
+        # embed full fields as tokens
+        tokens = self.to_tokens(fields)
+
+        # apply mask
+        tokens = torch.where(visible, tokens, self.mask_embedding.weight)
+
+        # create random field
+        noise = self.noise_generator(shape = (B * E,), rng = rng).to(tokens.dtype)
+
+        # add noise and positions
+        tokens = tokens + noise + self.position_embedding(self.coordinates)      
+        
+        # apply transformer
+        tokens = self.transformer(tokens)
+        
+        # map all tokens back to fields
+        fields = self.to_fields(tokens)
+        
+        # rearrange to ensemble form
+        fields = einops.rearrange(fields, "(b e) ... -> b ... e", e = E, b = B)
+        return fields
+
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()

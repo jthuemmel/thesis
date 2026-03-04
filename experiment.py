@@ -311,7 +311,7 @@ class Experiment(DistributedTrainer):
     # Tokenizers
     def mask_to_field(self, mask):
         return einops.repeat(mask,
-                             f"b {self.world.flat_token_pattern} -> b {self.world.field_pattern}",
+                             f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
                                 **self.world.token_sizes, **self.world.patch_sizes)
 
     # EVAL
