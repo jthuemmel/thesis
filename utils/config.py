@@ -91,6 +91,7 @@ class NetworkConfig:
     dim_noise: Optional[int] = None
     dim_heads: Optional[int] = 64
     dim_coords: Optional[int] = 32
+    dim_ctx: Optional[int] = None
     drop_path: Optional[float] = 0.0
     expansion_factor: Optional[int] = 2
     wavelengths: Optional[List] = None
@@ -160,11 +161,14 @@ class WorldConfig:
     patch_sizes: dict
     batch_size: int
     ens_size: int = 1
-    tau: int = 2   
+    tau: int = 2
+    offsets: dict = field(default_factory=lambda: {'vv': 1, 'tt': 2, 'hh': 2, 'ww': 2})
 
     # derived fields
     layout: tuple = field(init=False)
     token_sizes: dict = field(init=False)
+    kernel_sizes: dict = field(init=False)
+
     token_shape: tuple = field(init=False)
     field_shape: tuple = field(init=False)
     patch_shape: tuple = field(init=False)
@@ -184,6 +188,10 @@ class WorldConfig:
         self.token_sizes = {
             ax: (self.field_sizes[ax] // self.patch_sizes[f'{ax*2}'])
             for ax in self.layout
+        }
+
+        self.kernel_sizes = {
+            2*ax: self.patch_sizes[2*ax] + self.offsets[2*ax] for ax in self.layout
         }
 
         self.field_shape = tuple(self.field_sizes.values())

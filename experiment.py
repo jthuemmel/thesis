@@ -275,7 +275,7 @@ class Experiment(DistributedTrainer):
         return max(1, self.total_steps // len(self.train_dl))
     
     def frcst_step(self, batch_idx, batch):
-        batch = batch.to(self.device)
+        batch = batch.to(self.device, dtype = torch.half)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
         visible, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
@@ -285,12 +285,13 @@ class Experiment(DistributedTrainer):
         return prediction
 
     def forward_step(self, batch_idx, batch):
-        batch = batch.to(self.device)
+        batch = batch.to(self.device, dtype = torch.half)
         B = batch.size(0)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample src and tgt
         visible, mask, mask_weight = self.masking((B, ), rng = self.generator)
+        mask_weight = None
         
         # prepare mask and mask_weight (if md4)
         mask = torch.logical_and(self.mask_to_field(mask), self.land_sea_mask)
