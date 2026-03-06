@@ -366,6 +366,7 @@ class DistributedTrainer(TrainerInterface):
     def train_epoch(self):
         self.switch_mode(train=True)
         for batch_idx, batch in enumerate(self.train_dl):
+            batch = batch.to(self.device)
             self.optimizer.zero_grad()
             #automatic mixed precision
             with autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
@@ -394,6 +395,7 @@ class DistributedTrainer(TrainerInterface):
         if not exists(self.val_dl):
             return
         for batch_idx, batch in enumerate(self.val_dl):
+            batch = batch.to(self.device)
             with torch.no_grad():
                 with autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
                     _ = self.forward_step(batch_idx, batch)

@@ -103,19 +103,19 @@ class Experiment(DistributedTrainer):
             self.train_dataset,
             batch_size=self.world.batch_size,
             num_workers=self.cfg.num_workers,
-            pin_memory=True,
             drop_last=True,
             shuffle=True,
+            pin_memory=True,
         )
 
         val_dl = torch.utils.data.DataLoader(
             self.val_dataset,
             batch_size=self.world.batch_size,
             num_workers=self.cfg.num_workers,
-            pin_memory=True,
             drop_last=True,
-            shuffle=False
-        )
+            shuffle=False,
+            pin_memory=True,
+            )
         return train_dl, val_dl
     
     # SETUP
@@ -275,7 +275,6 @@ class Experiment(DistributedTrainer):
         return max(1, self.total_steps // len(self.train_dl))
     
     def frcst_step(self, batch_idx, batch):
-        batch = batch.to(self.device, dtype = torch.half)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
         visible, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
@@ -285,7 +284,6 @@ class Experiment(DistributedTrainer):
         return prediction
 
     def forward_step(self, batch_idx, batch):
-        batch = batch.to(self.device, dtype = torch.half)
         B = batch.size(0)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
@@ -326,6 +324,7 @@ class Experiment(DistributedTrainer):
             return
         samples = []
         for batch_idx, batch in enumerate(self.val_dl):
+            batch = batch.to(self.device)
             with torch.no_grad():
                 with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
                     prediction = self.frcst_step(batch_idx, batch)
@@ -477,8 +476,8 @@ class Experiment(DistributedTrainer):
         return correction * (spread / skill)
     
     @staticmethod
-    def compute_acc(pred, obs):
-        return (pred * obs).nansum() / (pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt())
+    def compute_acc(pred, obs, eps = 1e-5):
+        return (pred * obs).nansum() / (pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt() + eps)
     
     @staticmethod
     def compute_rmse(pred, obs):
@@ -490,8 +489,8 @@ class Experiment(DistributedTrainer):
         return crps.nanmean()
     
     @staticmethod
-    def compute_ign(pred, obs):
-        ign = f_gaussian_ignorance(observation=obs, mu=pred.mean(-1), sigma=pred.std(-1))
+    def compute_ign(pred, obs, eps = 1e-5):
+        ign = f_gaussian_ignorance(observation=obs, mu=pred.mean(-1), sigma=pred.std(-1) + eps)
         return ign.nanmean()
     
     @staticmethod
@@ -499,12 +498,12 @@ class Experiment(DistributedTrainer):
         return pred.var(-1).mean().sqrt()
 
     @staticmethod
-    def compute_spread_skill(pred, obs):
+    def compute_spread_skill(pred, obs, eps = 1e-5):
         K = pred.shape[-1]
         correction = math.sqrt((K + 1) / K)
         mean = pred.mean(-1)
         spread = pred.var(-1).mean().sqrt()
-        skill = (obs - mean).pow(2).mean().sqrt()
+        skill = (obs - mean).pow(2).mean().sqrt() + eps
         return correction * (spread / skill)
 
 def main():
