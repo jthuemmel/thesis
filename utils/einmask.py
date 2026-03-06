@@ -9,46 +9,55 @@ from utils.random_fields import SphericalDiffusionNoise
 class LatentModel(torch.nn.Module):
     def __init__(self, network: NetworkConfig):
         super().__init__()
-        num_heads = network.dim // network.dim_heads
+        NH = network.dim // network.dim_heads
+        DN = network.dim_noise 
+        DC = network.dim_coords
+        DI = network.dim_in
+        D = network.dim
         # embeddings
-        self.context = torch.nn.Embedding(1, network.dim_ctx)
-        self.latents = torch.nn.Embedding(network.num_latents, network.dim)
+        self.latents = torch.nn.Embedding(network.num_latents, D)
         
         # create task embedding
-        self.task_encoder = TransformerBlock(dim=network.dim_ctx, dim_kv=network.dim_in + network.dim_coords, num_heads= num_heads)
+        self.task_encoder = TransformerBlock(dim=D, dim_kv=DI + DC)
+        self.task_decoder = TransformerBlock(dim=DI + DC, dim_kv= D, num_heads= NH)
         
         # map src to latents
         self.encoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim, dim_kv=network.dim_in + network.dim_noise + network.dim_coords, dim_ctx=network.dim_ctx, num_heads= num_heads)
+            TransformerBlock(D, dim_kv=DI + DN + DC, dim_ctx=D)
             for _ in range(default(network.num_read_blocks, 1))
         ])
         # process latents
         self.processor = torch.nn.ModuleList([
-            TransformerBlock(network.dim, dim_ctx= network.dim_ctx, num_heads= num_heads)
+            TransformerBlock(D, dim_ctx= D)
             for _ in range(default(network.num_compute_blocks, 1))
         ])
         # map latents to tgt
         self.decoder = torch.nn.ModuleList([
-            TransformerBlock(network.dim_noise + network.dim_coords, dim_kv= network.dim, dim_ctx=network.dim_ctx, num_heads=num_heads)
-            for n in range(default(network.num_write_blocks, 1))
+            TransformerBlock(DN + DC, dim_kv= D, dim_ctx= DI + DC, num_heads=NH)
+            for _ in range(default(network.num_write_blocks, 1))
         ])
         
-    @torch.compile()
     def forward(self, task: torch.Tensor, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         latents = einops.repeat(self.latents.weight, 'n d -> b n d', b = task.size(0))
-        ctx = einops.repeat(self.context.weight, 'n d -> b n d', b = task.size(0))
-        ctx = self.task_encoder(ctx, task)
+        # create latent-specific task representation
+        latent_ctx = self.task_encoder(latents, task)
+        # create tgt-specific task representation
+        tgt_ctx = self.task_decoder(task, latent_ctx)
+        # read src into latents
         for read in self.encoder: 
-            latents = read(latents, kv = src, ctx = ctx)
+            latents = read(latents, kv = src, ctx = latent_ctx)
+        # update latents
         for process in self.processor: 
-            latents = process(latents, ctx = ctx)
+            latents = process(latents, ctx = latent_ctx)
+        # write latents into tgt
         for write in self.decoder:
-            tgt = write(tgt, kv = latents, ctx = ctx)
+            tgt = write(tgt, kv = latents, ctx = tgt_ctx)
         return tgt
 
 class FieldDecoder(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
+        self.world = world
         self.to_fields = EinMix(
             f'b ({world.token_pattern}) do -> b ({world.flat_pattern})',
             weight_shape=f'v {world.patch_pattern} do',
@@ -81,12 +90,13 @@ class FieldDecoder(torch.nn.Module):
 
         self.register_buffer('idx', idx.flatten())
 
-    def forward(self, fields: torch.FloatTensor, tgt: torch.FloatTensor):
+    def forward(self, tgt: torch.FloatTensor):
+        B = tgt.size(0)
         tgt = self.to_fields(tgt)
         predicted_fields = torch.scatter_reduce(
-            fields.flatten(1), 
+            tgt.new_empty((B, self.world.num_elements)), 
             1, 
-            self.idx.expand(fields.size(0), -1), 
+            self.idx.expand(B, -1), 
             tgt, 
             reduce='mean', 
             include_self=False
@@ -130,13 +140,10 @@ class EinMask(torch.nn.Module):
 
         self.to_tokens = EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) di',
                 weight_shape= f'v {world.patch_pattern} di',
-                **world.patch_sizes, **world.token_sizes, di = network.dim_in)
+                **world.patch_sizes, **world.token_sizes, di = network.dim_in
+                )
         
-        #self.to_fields = FieldDecoder(network, world)
-        self.to_fields = EinMix(
-            f'b ({world.token_pattern}) do -> b {world.field_pattern}',
-            weight_shape=f'v {world.patch_pattern} do',
-            **world.token_sizes, **world.kernel_sizes, do=network.dim_noise + network.dim_coords)
+        self.to_fields = FieldDecoder(network, world)
         
         # embeddings
         self.mask_codes = torch.nn.Embedding(2, network.dim_in)
@@ -147,6 +154,14 @@ class EinMask(torch.nn.Module):
 
         # Weight initialization
         self.apply(self.base_init)
+
+        # maybe compile
+        if True:
+             self.transformer.compile()
+             self.to_fields.compile()
+             self.to_tokens.compile()
+             self.to_noise.compile()
+
 
     @staticmethod
     def base_init(m: torch.nn.Module):
@@ -203,7 +218,7 @@ class EinMask(torch.nn.Module):
         tgt = self.transformer(task, src, tgt)
         
         # map all interface back to fields
-        predicted_fields = self.to_fields(fields.to(tokens.dtype), tgt.to(tokens.dtype))
+        predicted_fields = self.to_fields(tgt)
 
         # rearrange to ensemble last
         predicted_fields = einops.rearrange(predicted_fields, "(b e) ... -> b ... e", e = E, b = B)
