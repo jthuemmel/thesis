@@ -86,6 +86,8 @@ class NetworkConfig:
     num_cnn_blocks: Optional[int] = None
     num_cls: Optional[int] = None
     num_tails: Optional[int] = None
+    num_encoder_heads: Optional[int] = None
+    num_decoder_heads: Optional[int] = None
     dim_in: Optional[int] = None
     dim_out: Optional[int] = None
     dim_noise: Optional[int] = None
@@ -101,6 +103,7 @@ class NetworkConfig:
     grf_channels: Optional[int] = None
     grf_horizontal: Optional[List[int]] = None
     grf_temporal: Optional[List[int]] = None
+    kwargs: Optional[dict] = field(default_factory=lambda: {})
 
 @dataclass
 class DatasetConfig:
@@ -116,26 +119,8 @@ class DatasetConfig:
     max_dirs: int = 100
 
 @dataclass
-class OldObjectiveConfig:
-    # event dims for prior
-    event_dims: List[str] = field(default_factory=lambda: ['t'])
-    # concentrations:
-    c0_src: float = 1.
-    c1_src: float = 1.
-    c0_tgt: float = 1.
-    c1_tgt: float = 1.
-    c0_prior: float = 1.
-    c1_prior: float = 1.
-    # multinomial bounds
-    k_min: Optional[int] = None
-    k_max: Optional[int] = None
-    # schedule bounded [eps, 1-eps]
-    epsilon: float = 1e-2
-    # stratification
-    stratify: Optional[bool] = False
-
-@dataclass
 class ObjectiveConfig:
+    kwargs: Optional[dict] = field(default_factory=lambda: {})
     # event dims for prior
     event_dims: dict = field(default_factory=lambda: {})
     # integer multinomial bounds
@@ -163,6 +148,7 @@ class WorldConfig:
     ens_size: int = 1
     tau: int = 2
     offsets: dict = field(default_factory=lambda: {'vv': 1, 'tt': 2, 'hh': 2, 'ww': 2})
+    kwargs: Optional[dict] = field(default_factory=lambda: {})
 
     # derived fields
     layout: tuple = field(init=False)
