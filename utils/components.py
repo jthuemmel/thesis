@@ -16,6 +16,21 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
+class AdaptiveRMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, dim_ctx: int = None):
+        super().__init__()
+        self.norm = torch.nn.RMSNorm(dim, elementwise_affine = False)
+        self.weight = torch.nn.Parameter(torch.zeros(dim, dim_ctx)) if exists(dim_ctx) else None
+        self.bias = torch.nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if exists(ctx) and exists(self.weight):
+            scale = torch.nn.functional.linear(ctx, self.weight, self.bias)
+        else:
+            scale = self.bias
+        x = (1. + scale) * self.norm(x)
+        return x
+
 class GatedFFN(torch.nn.Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
@@ -63,21 +78,12 @@ class EinAttention(torch.nn.Module):
 class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_kv: Optional[int] = None, dim_ctx: Optional[int] = None, num_heads: Optional[int] = None) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(2 * dim, dim_ctx)) if exists(dim_ctx) else None
-        self.bias = torch.nn.Parameter(torch.zeros(2 * dim))
-        self.norm = torch.nn.RMSNorm(dim, elementwise_affine = False)
+        self.attn_norm = AdaptiveRMSNorm(dim, dim_ctx=dim_ctx)
+        self.ffn_norm = AdaptiveRMSNorm(dim, dim_ctx=dim_ctx)
         self.att = EinAttention(dim, num_heads=num_heads, dim_kv= dim_kv)
         self.ffn = GatedFFN(dim=dim)
 
     def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None, ctx: Optional[torch.FloatTensor] = None):
-        if exists(ctx) and exists(self.weight):
-            scale_attn, scale_ffn = torch.nn.functional.linear(ctx, self.weight, self.bias).chunk(2, -1)
-        else:
-            scale_attn, scale_ffn = self.bias.chunk(2, -1)
-        skip = x
-        x = self.norm(x) * (1. + scale_attn)
-        x = skip + self.att(x, kv = kv) 
-        skip = x
-        x = self.norm(x) * (1. + scale_ffn)
-        x = skip + self.ffn(x) 
+        x = x + self.att(self.attn_norm(x, ctx), kv = kv) 
+        x = x + self.ffn(self.ffn_norm(x, ctx)) 
         return x
