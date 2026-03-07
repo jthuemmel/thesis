@@ -47,8 +47,13 @@ class BinaryMasking(torch.nn.Module):
     def k_from_rates_(self, R: torch.FloatTensor):
         return R.mul(self.world.num_tokens).long()
     
-    def uniform_(self, shape: tuple, rng: torch.Generator, eps: float = 1e-6):
-        return torch.rand(*shape, device = self.device, generator=rng).clamp(eps, 1-eps)
+    def uniform_(self, shape: tuple, rng: torch.Generator):
+        return torch.rand(*shape, device = self.device, generator=rng)
+
+    def stratified_uniform_(self, B: int, rng: torch.Generator = None):
+        L = torch.linspace(0, 1, B, device=self.device)
+        U = torch.rand((1,), device = self.device, generator=rng)
+        return (L + U).remainder(1)
 
     def weight_prior(self, B: int, rng: torch.Generator = None):
         # baseline factors are log-uniform -> Kumaraswamy(1, 1)
@@ -68,16 +73,9 @@ class BinaryMasking(torch.nn.Module):
         return F_src, F_tgt
     
     def rate_prior(self, B: int, rng: torch.Generator = None):
-        if self.objective.stratify:
-            # stratification creates a grid of rates across the batch
-            L = torch.linspace(self.epsilon, 1 - self.epsilon, B, device=self.device)
-            # sample a random offset for the whole grid
-            U = self.uniform_((1,), rng)
-            # wrap the grid to stay within (0, 1)
-            U = (L + U) % 1
-        else:
-            # sample a random rate for each batch element
-            U = self.uniform_((B,), rng).clamp(self.epsilon, 1 - self.epsilon)
+        # sample uniform step
+        U = self.stratified_uniform_(B) if self.objective.stratify else self.uniform_((B,), rng)
+        U = U.clamp(self.epsilon, 1 - self.epsilon)
         # broadcast to event size
         U = einops.repeat(U, "b -> b n", n = self.world.num_tokens)
         # schedule 
