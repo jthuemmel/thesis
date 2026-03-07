@@ -9,43 +9,27 @@ from utils.random_fields import SphericalDiffusionNoise
 class LatentModel(torch.nn.Module):
     def __init__(self, network: NetworkConfig):
         super().__init__()
-        DI = network.dim_in
-        DN = network.dim_noise
-        DC = network.dim_coords
+        DI = network.dim_in + network.dim_coords
+        DQ = network.dim_noise + network.dim_coords + network.dim_in
         D = network.dim
-        DH = network.dim_heads
+        NH = network.dim // network.dim_heads
 
         # latent tokens
         self.latents = torch.nn.Embedding(network.num_latents, D)
 
         # map data to latents
-        self.data_encoder = TransformerBlock(
-             D, 
-             dim_kv= DI + DC, 
-             num_heads= default(network.num_encoder_heads, D // DH)
-             )
-        
-        self.query_encoder = TransformerBlock(
-             D, 
-             dim_kv= DI + DN + DC, 
-             num_heads= default(network.num_encoder_heads, D // DH)
-             )
+        self.data_encoder = TransformerBlock(dim=D, dim_kv= DI, num_heads= default(network.num_encoder_heads, NH))
+        self.query_encoder = TransformerBlock(dim=D, dim_kv= DQ, num_heads= default(network.num_encoder_heads, NH))
 
         # process latents
-        self.processor = torch.nn.ModuleList([ 
-            TransformerBlock(D) for _ in range(default(network.num_compute_blocks, 1))
-            ])
+        self.processor = torch.nn.ModuleList([TransformerBlock(dim=D) for _ in range(default(network.num_compute_blocks, 1))])
         
         # map latents to data
-        self.query_decoder = TransformerBlock(
-             DI + DN + DC, 
-             dim_kv= D, 
-             num_heads= default(network.num_decoder_heads, D // DH)
-             )
+        self.query_decoder = TransformerBlock(dim=DQ, dim_kv= D, num_heads= default(network.num_decoder_heads, NH))
 
     def forward(self, data: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
         # expand latents
-        latents = einops.repeat(self.latents.weight, '... -> b ...', b=queries.size(0))
+        latents = einops.repeat(self.latents.weight, '... -> b ...', b=data.size(0))
         
         # extract separate latent representations
         query_latents, data_latents = latents.chunk(2, dim = 1)

@@ -282,14 +282,23 @@ class Experiment(DistributedTrainer):
         prediction = model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
+    
+    @staticmethod
+    def base_alpha(epoch: int, warmup: int = 0, start: float = 1e-3) -> float:
+        return start ** (1 - min(epoch / (1 + warmup), 1.0))
 
     def forward_step(self, batch_idx, batch):
         B = batch.size(0)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
+        # maybe re-adjust prior based on epoch
+        self.masking.event_dims = {"base": self.base_alpha(self.current_epoch + 1, 
+                                                           warmup = self._cfg.objective.kwargs.get('warmup', 0),
+                                                           start = self._cfg.objective.kwargs.get('start', 1))
+                                    }
+
         # sample src and tgt
         visible, mask, mask_weight = self.masking((B, ), rng = self.generator)
-        mask_weight = None
         
         # prepare mask and mask_weight (if md4)
         mask = torch.logical_and(self.mask_to_field(mask), self.land_sea_mask)
