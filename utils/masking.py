@@ -52,9 +52,6 @@ class BinaryMasking(torch.nn.Module):
     @staticmethod
     def kumaraswamy_quantile_dt(U: torch.FloatTensor, alpha: float = 1.):
         return U.log().mul((1 / alpha) - 1).exp().div(alpha)
-            
-    def k_from_rates_(self, R: torch.FloatTensor):
-        return R.mul(self.world.num_tokens).long()
     
     def uniform_(self, shape: tuple, rng: torch.Generator):
         return torch.rand(*shape, device = self.device, generator=rng).clamp(self.epsilon, 1 - self.epsilon)
@@ -83,21 +80,21 @@ class BinaryMasking(torch.nn.Module):
             F += conditional.type_as(F).clamp(min=1e-12).log()
         return F
     
-    def rate_prior(self, B: int, alpha: float, rng: torch.Generator = None):
+    def rate_prior(self, B: int, kind: str, rng: torch.Generator = None):
+        a_min, a_max = self.objective.kwargs.get(f'min_{kind}', 0), self.objective.kwargs.get(f'max_{kind}', 1)
         U = self.stratified_uniform_(B, rng) if self.objective.stratify else self.uniform_((B,), rng)
-        R = self.kumaraswamy_quantile(U, alpha)
-        D = self.kumaraswamy_quantile_dt(U, alpha)
-        return R[..., None], D[..., None]
+        R = U * (a_max - a_min) + a_min
+        return R.mul(self.world.num_tokens).long().unsqueeze(-1)
     
     def forward(self, B: int, rng: torch.Generator = None):
         B = B[0] if isinstance(B, tuple) else B
         # sample rates
-        R_src, _ = self.rate_prior(B, self.objective.src_alpha, rng)
-        R_tgt, _ = self.rate_prior(B, self.objective.tgt_alpha, rng)
+        K_src = self.rate_prior(B, "src", rng)
+        K_tgt = self.rate_prior(B, "tgt", rng)
         # sample src
         P_src = self.weight_prior(B, rng = rng)
-        src = self.binary_topk_(P_src, self.k_from_rates_(R_src))
+        src = self.binary_topk_(P_src, K_src)
         # sample tgt w/o src
         P_tgt = self.weight_prior(B, conditional = src, rng = rng)
-        tgt = self.binary_topk_(P_tgt, self.k_from_rates_(R_tgt))
+        tgt = self.binary_topk_(P_tgt, K_tgt)
         return src, tgt, None
