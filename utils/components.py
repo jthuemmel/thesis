@@ -16,19 +16,19 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
-class AdaptiveRMSNorm(torch.nn.Module):
+class AdaptiveLayerNorm(torch.nn.Module):
     def __init__(self, dim: int, dim_ctx: int = None):
         super().__init__()
-        self.norm = torch.nn.RMSNorm(dim, elementwise_affine = False)
-        self.weight = torch.nn.Parameter(torch.zeros(dim, dim_ctx)) if exists(dim_ctx) else None
-        self.bias = torch.nn.Parameter(torch.zeros(dim))
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
+        self.weight = torch.nn.Parameter(torch.zeros(2 * dim, dim_ctx)) if exists(dim_ctx) else None
+        self.bias = torch.nn.Parameter(torch.zeros(2 * dim))
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if exists(ctx) and exists(self.weight):
-            scale = torch.nn.functional.linear(ctx, self.weight, self.bias)
+            scale, shift = torch.nn.functional.linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
         else:
-            scale = self.bias
-        x = (1. + scale) * self.norm(x)
+            scale, shift = self.bias.chunk(2, dim = -1)
+        x = (1. + scale) * self.norm(x) + shift
         return x
 
 class GatedFFN(torch.nn.Module):
@@ -78,8 +78,8 @@ class EinAttention(torch.nn.Module):
 class TransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_kv: Optional[int] = None, dim_ctx: Optional[int] = None, num_heads: Optional[int] = None) -> None:
         super().__init__()
-        self.attn_norm = AdaptiveRMSNorm(dim, dim_ctx=dim_ctx)
-        self.ffn_norm = AdaptiveRMSNorm(dim, dim_ctx=dim_ctx)
+        self.attn_norm = AdaptiveLayerNorm(dim, dim_ctx=dim_ctx)
+        self.ffn_norm = AdaptiveLayerNorm(dim, dim_ctx=dim_ctx)
         self.att = EinAttention(dim, num_heads=num_heads, dim_kv= dim_kv)
         self.ffn = GatedFFN(dim=dim)
 
