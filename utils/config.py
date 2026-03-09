@@ -120,14 +120,9 @@ class DatasetConfig:
 
 @dataclass
 class ObjectiveConfig:
-    kwargs: Optional[dict] = field(default_factory=lambda: {})
-    # event dims for prior
-    event_dims: dict = field(default_factory=lambda: {})
-    # schedule bounded [eps, 1-eps]
-    epsilon: Optional[float] = 1e-3
-    # stratification
-    stratify: Optional[bool] = False
-
+    rate_cfg: dict = field(default_factory=lambda: {})
+    event_cfg: dict = field(default_factory=lambda: {})
+    
 @dataclass
 class WorldConfig:
     field_sizes: dict

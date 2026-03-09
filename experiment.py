@@ -199,10 +199,17 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             ).to(self.device)
         
-        self.masking = BinaryMasking(
-            world = self.world, 
-            objective=self._cfg.objective
-        ).to(self.device)
+        self.src_prior = BinaryMasking(
+            world = self.world,
+            event_cfg = self._cfg.objective.event_cfg,
+            rate_cfg = self._cfg.objective.rate_cfg.get('src', {})
+            ).to(self.device)
+
+        self.tgt_prior = BinaryMasking(
+            world = self.world,
+            event_cfg = self._cfg.objective.event_cfg,
+            rate_cfg = self._cfg.objective.rate_cfg.get('tgt', {})
+            ).to(self.device)
 
         model = EinMask(network=self.model_cfg, world=self.world)
         return model
@@ -212,7 +219,7 @@ class Experiment(DistributedTrainer):
         def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
             w_spectral = self.cfg.spectral_loss_weight
             if w_spectral > 0:
-                spectral_loss = self.spectral_crps_time(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
+                spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
                 node_loss = self.node_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
                 loss = w_spectral * spectral_loss + node_loss  
             else:
@@ -250,25 +257,14 @@ class Experiment(DistributedTrainer):
         loss = (score * mask_weight * self.per_variable_weights)[mask].mean()
         return loss
 
-    def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-        m = mask.float().mean(dim = (-1, -2))
-        w_v = self.per_variable_weights.mean(dim = (-1, -2))
-        w_m = mask_weight if mask_weight.numel() == 1 else mask_weight.mean(dim = (-1, -2))
-        with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
-            e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3)) #[B, V, T, fh, fw, E]
-            o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2))
-        score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2)) #[B, V, T]
-        correction = w_v * w_m / (1.0 - m.clamp(max = 1 / self.world.num_elements))
-        return (score * correction).mean()
-
-    def spectral_crps_time(self, ens: torch.Tensor, obs: torch.Tensor, **kwargs):
+    def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, **kwargs):
         w_v = self.per_variable_weights.mean(dim = (-1, -2, -3))
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2, -3))
         score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2, -3)) #[B, V]
         return (score * w_v).mean()
-
+    
     #FORWARD
     @property
     def total_epochs(self):
@@ -277,35 +273,26 @@ class Experiment(DistributedTrainer):
     def frcst_step(self, batch_idx, batch):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        visible, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
+        src, tgt = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
 
-        prediction = model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
-    
-    @staticmethod
-    def base_alpha(epoch: int, warmup: int = 0, start: float = 1e-3) -> float:
-        return start ** (1 - min(epoch / (1 + warmup), 1.0))
 
     def forward_step(self, batch_idx, batch):
         B = batch.size(0)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
-        # maybe re-adjust prior based on epoch
-        self.masking.event_dims = {"base": self.base_alpha(self.current_epoch + 1, 
-                                                           warmup = self._cfg.objective.kwargs.get('warmup', 0),
-                                                           start = self._cfg.objective.kwargs.get('start', 1))
-                                    }
-
         # sample src and tgt
-        visible, mask, mask_weight = self.masking((B, ), rng = self.generator)
+        src = self.src_prior((B,), rng = self.generator)
+        tgt = self.tgt_prior((B,), conditional = src, rng = self.generator)
         
         # prepare mask and mask_weight (if md4)
-        mask = torch.logical_and(self.mask_to_field(mask), self.land_sea_mask)
-        mask_weight = self.mask_to_field(mask_weight) if exists(mask_weight) else torch.ones_like(mask, dtype = torch.float32)
+        mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
+        mask_weight = torch.ones_like(mask, dtype = torch.float32)
 
-        # model and loss
-        prediction = model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        # foward model and loss
+        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = mask_weight)
 
