@@ -56,8 +56,8 @@ class BinaryMasking(torch.nn.Module):
         self._rate_cfg.update(update)
 
     @staticmethod
-    def binary_topk_(P: torch.FloatTensor, K: torch.LongTensor) -> torch.BoolTensor:
-        return K > P.argsort(descending=True).argsort()
+    def binary_topk_(P: torch.FloatTensor, K: torch.LongTensor, dim: int = -1) -> torch.BoolTensor:
+        return K > P.argsort(descending=True, dim = dim).argsort(dim = dim)
 
     def uniform_(self, shape: tuple, rng: torch.Generator):
         return torch.rand(*shape, device=self.device, generator=rng).clamp(self.epsilon, 1 - self.epsilon)
@@ -67,17 +67,15 @@ class BinaryMasking(torch.nn.Module):
         U = torch.rand((1,), device=self.device, generator=rng)
         return (L + U).remainder(1).clamp(self.epsilon, 1 - self.epsilon)
 
-    def event_prior(self, B: int, conditional: torch.Tensor = None, rng: torch.Generator = None):
-        F = self.uniform_((B, self.world.num_tokens), rng).log().div(self.event_cfg.get('base', 1.))
+    def event_prior(self, B: int, rng: torch.Generator = None):
+        P = self.uniform_((B, self.world.num_tokens), rng).log().div(self.event_cfg.get('base', 1.))
         for dim, alpha in self.event_cfg.items():
             if dim not in self.world.layout:
                 continue
             U = self.uniform_((B, self.world.token_sizes[dim]), rng)
             U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
-            F += U.log().div(alpha)
-        if exists(conditional):
-            F += conditional.type_as(F).clamp(min=1e-12).log()
-        return F
+            P += U.log().div(alpha)
+        return P
 
     def rate_prior(self, B: int, rng: torch.Generator = None):
         a_min = self.rate_cfg.get('min', 0)
@@ -89,5 +87,7 @@ class BinaryMasking(torch.nn.Module):
     def forward(self, B: int, conditional: torch.Tensor = None, rng: torch.Generator = None) -> torch.BoolTensor:
         B = B[0] if isinstance(B, tuple) else B
         K = self.rate_prior(B, rng)
-        P = self.event_prior(B, conditional=conditional, rng=rng)
+        P = self.event_prior(B, rng)
+        if exists(conditional):
+            P += conditional.type_as(P).clamp(min=1e-12).log()
         return self.binary_topk_(P, K)

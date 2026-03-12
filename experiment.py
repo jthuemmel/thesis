@@ -285,7 +285,7 @@ class Experiment(DistributedTrainer):
         
         # sample src and tgt
         src = self.src_prior((B,), rng = self.generator)
-        tgt = self.tgt_prior((B,), conditional = src, rng = self.generator)
+        tgt = self.tgt_prior((B,), rng = self.generator)
         
         # prepare mask and mask_weight (if md4)
         mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
@@ -332,11 +332,15 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            plt.figure(figsize=(12,4))
-            plt.subplot(121)
+            plt.figure(figsize=(12,8))
+            plt.subplot(221)
             ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(122)
+            plt.subplot(222)
             ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(223)
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(224)
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
             plt.savefig(self.model_dir / "test_sample.png")
             plt.close()
 
