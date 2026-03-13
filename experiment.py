@@ -199,16 +199,10 @@ class Experiment(DistributedTrainer):
             world = self.world, 
             ).to(self.device)
         
-        self.src_prior = BinaryMasking(
-            world = self.world,
+        self.prior = MaskingMixture(
+            world= self.world,
             event_cfg = self._cfg.objective.event_cfg,
-            rate_cfg = self._cfg.objective.rate_cfg.get('src', {})
-            ).to(self.device)
-
-        self.tgt_prior = BinaryMasking(
-            world = self.world,
-            event_cfg = self._cfg.objective.event_cfg,
-            rate_cfg = self._cfg.objective.rate_cfg.get('tgt', {})
+            rate_cfg = self._cfg.objective.rate_cfg,
             ).to(self.device)
 
         model = EinMask(network=self.model_cfg, world=self.world)
@@ -284,8 +278,7 @@ class Experiment(DistributedTrainer):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample src and tgt
-        src = self.src_prior((B,), rng = self.generator)
-        tgt = self.tgt_prior((B,), rng = self.generator)
+        src, tgt = self.prior(B, rng = self.generator)
         
         # prepare mask and mask_weight (if md4)
         mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)

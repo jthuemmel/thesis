@@ -1,5 +1,6 @@
 import torch
 import einops
+from itertools import permutations
 from utils.config import *
 
 # MASKING STRATEGIES
@@ -22,6 +23,52 @@ class ForecastMasking(torch.nn.Module):
         else:
             return mask.expand(*shape, -1).bool(), mask.expand(*shape, -1).bool().logical_not()
 
+class MaskingMixture(torch.nn.Module):
+    def __init__(self, 
+                 world: WorldConfig, 
+                 rate_cfg: dict = None,
+                 event_cfg: dict = None,
+                 ):
+        super().__init__()
+        self.world = world
+
+        rate_cfg = default(rate_cfg, {})
+        self.src = BinaryMasking(world, rate_cfg= rate_cfg.get('src', {}))
+        self.tgt = BinaryMasking(world, rate_cfg= rate_cfg.get('tgt', {}))
+
+        components = event_cfg.get('components', None)
+        alphas = event_cfg.get('alphas', None)
+        mixture_weights = event_cfg.get('weights', None)
+
+        if exists(components):
+            components = torch.as_tensor(components)
+        elif exists(alphas):
+            components = torch.tensor([
+                [alphas[v], alphas[t], alphas[hw], alphas[hw]] 
+                for (v, t, hw) in permutations(range(len(alphas)), len(world.layout) - 1)
+            ])
+        else:
+            components = torch.ones(len(world.layout))
+
+        components = components.view(-1, len(world.layout)) # ensure (Categories, Dims) shape
+
+        if exists(mixture_weights):
+            mixture_weights = torch.as_tensor(mixture_weights)
+        else:
+            mixture_weights = torch.ones(len(components))
+        
+        self.register_buffer('components', components)
+        self.register_buffer('mixture_weights', mixture_weights)
+
+    def forward(self, B: int, rng: torch.Generator = None):
+        idx = torch.multinomial(self.mixture_weights, B, replacement=True, generator = rng)
+        alphas = {dim: self.components[idx][:, i:i+1] for i, dim in enumerate(self.world.layout)}
+
+        self.src.event_cfg = alphas
+        self.tgt.event_cfg = alphas
+
+        return self.src(B, rng=rng), self.tgt(B, rng=rng)
+
 class BinaryMasking(torch.nn.Module):
     def __init__(self, 
                  world: WorldConfig, 
@@ -31,29 +78,13 @@ class BinaryMasking(torch.nn.Module):
         super().__init__()
         self.world = world
         
-        self._event_cfg = default(event_cfg, {})
-        self._rate_cfg = default(rate_cfg, {})
+        self.event_cfg = default(event_cfg, {})
+        self.rate_cfg = default(rate_cfg, {})
 
         self.register_buffer('epsilon', torch.tensor(epsilon))
 
     @property
     def device(self) -> torch.device: return self.epsilon.device
-
-    @property
-    def event_cfg(self) -> dict:
-        return self._event_cfg
-    
-    @event_cfg.setter
-    def event_cfg(self, update: dict):
-        self._event_cfg.update(update)
-
-    @property
-    def rate_cfg(self) -> dict:
-        return self._rate_cfg
-    
-    @rate_cfg.setter
-    def rate_cfg(self, update: dict):
-        self._rate_cfg.update(update)
 
     @staticmethod
     def binary_topk_(P: torch.FloatTensor, K: torch.LongTensor, dim: int = -1) -> torch.BoolTensor:
@@ -68,10 +99,9 @@ class BinaryMasking(torch.nn.Module):
         return (L + U).remainder(1).clamp(self.epsilon, 1 - self.epsilon)
 
     def event_prior(self, B: int, rng: torch.Generator = None):
-        P = self.uniform_((B, self.world.num_tokens), rng).log().div(self.event_cfg.get('base', 1.))
+        P = self.uniform_((B, self.world.num_tokens), rng).log()
         for dim, alpha in self.event_cfg.items():
-            if dim not in self.world.layout:
-                continue
+            if dim not in self.world.layout: continue
             U = self.uniform_((B, self.world.token_sizes[dim]), rng)
             U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
             P += U.log().div(alpha)
@@ -88,6 +118,5 @@ class BinaryMasking(torch.nn.Module):
         B = B[0] if isinstance(B, tuple) else B
         K = self.rate_prior(B, rng)
         P = self.event_prior(B, rng)
-        if exists(conditional):
-            P += conditional.type_as(P).clamp(min=1e-12).log()
+        if exists(conditional): P += conditional.type_as(P).clamp(min=1e-12).log()
         return self.binary_topk_(P, K)
