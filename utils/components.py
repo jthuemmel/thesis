@@ -17,15 +17,21 @@ def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
 class AdaptiveLayerNorm(torch.nn.Module):
-    def __init__(self, dim: int, dim_ctx: int = None):
+    def __init__(self, dim: int, dim_ctx: int = None, spectral_norm: bool = True):
         super().__init__()
         self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
-        self.weight = torch.nn.Parameter(torch.zeros(2 * dim, dim_ctx)) if exists(dim_ctx) else None
-        self.bias = torch.nn.Parameter(torch.zeros(2 * dim))
+        if exists(dim_ctx):
+            self.proj = torch.nn.Linear(dim_ctx, 2 * dim, bias = False)
+            if spectral_norm:
+                self.proj = torch.nn.utils.parametrizations.spectral_norm(self.proj)
+            self.bias = None
+        else:
+            self.proj = None
+            self.bias = torch.nn.Parameter(torch.zeros(2 * dim))
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if exists(ctx) and exists(self.weight):
-            scale, shift = torch.nn.functional.linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
+        if exists(ctx) and exists(self.proj):
+            scale, shift = self.proj(ctx).chunk(2, dim = -1)
         else:
             scale, shift = self.bias.chunk(2, dim = -1)
         x = (1. + scale) * self.norm(x) + shift

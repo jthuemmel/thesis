@@ -132,6 +132,7 @@ class EinMask(torch.nn.Module):
                 num_lat=nlat,
                 num_lon=nlon,
                 num_steps=T,
+                sigma=default(network.grf_sigma, 1.0),
                 horizontal_length= einops.repeat(horizontal, 'h -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
                 temporal_length=einops.repeat(temporal, 't -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
                 lat_slice= slice((nlat - H) // 2, (nlat + H) // 2), # centered on the equator
@@ -139,11 +140,19 @@ class EinMask(torch.nn.Module):
         )
         
         # I/O
-        self.to_noise = EinMix(
-                  pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
-                  weight_shape = 'v f dn',
-                  f = num_fields, dn = network.dim_noise, **world.token_sizes
-                )
+        # self.to_noise = EinMix(
+        #           pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
+        #           weight_shape = 'v f dn',
+        #           f = num_fields, dn = network.dim_noise, **world.token_sizes
+        #         )
+
+        self.to_noise = torch.nn.Sequential(
+             Rearrange('... f t h w -> ... t h w f'),
+             torch.nn.utils.parametrizations.spectral_norm(
+                  torch.nn.Linear(num_fields, network.dim_noise * world.token_sizes['v'], bias = False)
+                  ),
+             Rearrange(f'... t h w (v dn) -> ... ({world.token_pattern}) dn', **world.token_sizes)
+        )
 
         self.to_tokens = EinMix(
                   f'b {world.field_pattern} -> b ({world.token_pattern}) di',
@@ -184,10 +193,10 @@ class EinMask(torch.nn.Module):
         elif isinstance(m, torch.nn.Embedding):
                 torch.nn.init.trunc_normal_(m.weight, std = 0.02)
         # AdaLN
-        elif isinstance(m, AdaptiveLayerNorm):
-                torch.nn.init.zeros_(m.bias)
-                if exists(m.weight):
-                    torch.nn.init.trunc_normal_(m.weight, std = 1e-4)
+        # elif isinstance(m, AdaptiveLayerNorm):
+        #         torch.nn.init.zeros_(m.bias)
+        #         if exists(m.weight):
+        #             torch.nn.init.trunc_normal_(m.weight, std = 1e-4)
         # einmix
         elif isinstance(m, EinMix):
                 torch.nn.init.trunc_normal_(m.weight, std = 0.02)
