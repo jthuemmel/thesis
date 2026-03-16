@@ -19,11 +19,15 @@ class LatentModel(torch.nn.Module):
         self.latents = torch.nn.Embedding(network.num_latents, D)
 
         # map src and tgt to latents
-        self.norm_src = AdaptiveLayerNorm(DI)
-        self.norm_tgt = AdaptiveLayerNorm(DO, dim_ctx= DN)
-        self.src_encoder = TransformerBlock(dim=D, dim_kv= DI, num_heads= default(network.num_encoder_heads, NH))
-        self.tgt_encoder = TransformerBlock(dim=D, dim_kv= DO, num_heads= default(network.num_encoder_heads, NH))
-
+        self.norm_src = torch.nn.ModuleList([
+             AdaptiveLayerNorm(DI, dim_ctx= DN)
+             for _ in range(default(network.num_read_blocks, 1))
+        ])
+        self.encoder = torch.nn.ModuleList([
+              TransformerBlock(dim=D, dim_kv= DI, num_heads= default(network.num_encoder_heads, NH))
+              for _ in range(default(network.num_read_blocks, 1))
+              ])
+        
         # process latents
         self.processor = torch.nn.ModuleList([
              TransformerBlock(dim=D) 
@@ -40,13 +44,11 @@ class LatentModel(torch.nn.Module):
         # expand latents
         latents = einops.repeat(self.latents.weight, '... -> b ...', b=src.size(0))
         
-        # extract separate latent representations
-        tgt_latents, src_latents = latents.chunk(2, dim = 1)
-        tgt_latents = self.tgt_encoder(tgt_latents, kv = self.norm_tgt(tgt, ctx = ctx))
-        src_latents = self.src_encoder(src_latents, kv = self.norm_src(src))
-        latents = torch.cat([tgt_latents, src_latents], dim = 1)
+        # extract latent representations
+        for read, norm in zip(self.encoder, self.norm_src):
+             latents = read(latents, kv = norm(src, ctx = ctx))
 
-        # jointly update latents
+        # update latents
         for compute in self.processor:
              latents = compute(latents)
 
