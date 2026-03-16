@@ -101,6 +101,7 @@ class NetworkConfig:
     backbone: Optional[str] = None
     zero_init: Optional[bool] = False
     grf_channels: Optional[int] = None
+    grf_sigma: Optional[float] = None
     grf_horizontal: Optional[List[int]] = None
     grf_temporal: Optional[List[int]] = None
     kwargs: Optional[dict] = field(default_factory=lambda: {})
