@@ -61,13 +61,14 @@ class MaskingMixture(torch.nn.Module):
         self.register_buffer('mixture_weights', mixture_weights)
 
     def forward(self, B: int, rng: torch.Generator = None):
-        idx = torch.multinomial(self.mixture_weights, B, replacement=True, generator = rng)
-        alphas = {dim: self.components[idx][:, i:i+1] for i, dim in enumerate(self.world.layout)}
+        idx = torch.multinomial(self.mixture_weights, 1, generator = rng)
+        alphas = {dim: self.components[idx, i:i+1] for i, dim in enumerate(self.world.layout)}
 
         self.src.event_cfg = alphas
         self.tgt.event_cfg = alphas
-
-        return self.src(B, rng=rng), self.tgt(B, rng=rng)
+        src = self.src(B, rng=rng)
+        tgt = self.tgt(B, rng=rng)
+        return src, tgt
 
 class BinaryMasking(torch.nn.Module):
     def __init__(self, 
@@ -110,7 +111,12 @@ class BinaryMasking(torch.nn.Module):
     def rate_prior(self, B: int, rng: torch.Generator = None):
         a_min = self.rate_cfg.get('min', 0)
         a_max = self.rate_cfg.get('max', 1)
-        U = self.stratified_uniform_(B, rng) if self.rate_cfg.get('stratify', False) else self.uniform_((B,), rng)
+        if self.rate_cfg.get('stratify', False):
+            U = self.stratified_uniform_(B, rng)
+        elif self.rate_cfg.get('randomize', False):
+            U = self.uniform_((B,), rng)
+        else:
+            U = self.uniform_((1,), rng).expand(B,)
         R = U * (a_max - a_min) + a_min
         return R.mul(self.world.num_tokens).long().unsqueeze(-1)
 
