@@ -21,7 +21,7 @@ class AdaptiveLayerNorm(torch.nn.Module):
         super().__init__()
         self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
         if exists(dim_ctx):
-            self.proj = torch.nn.Linear(dim_ctx, 2 * dim, bias = False)
+            self.proj = torch.nn.Linear(dim_ctx, 2 * dim, bias = True)
             if spectral_norm:
                 self.proj = torch.nn.utils.parametrizations.spectral_norm(self.proj)
             self.bias = None

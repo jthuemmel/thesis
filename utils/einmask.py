@@ -9,52 +9,34 @@ from utils.random_fields import SphericalDiffusionNoise
 class LatentModel(torch.nn.Module):
     def __init__(self, network: NetworkConfig):
         super().__init__()
-        DI = network.dim_in + network.dim_coords
-        DO = network.dim_out + network.dim_coords
-        DN = network.dim_noise
-        D = network.dim
-        NH = network.dim // network.dim_heads
-
         # latent tokens
-        self.latents = torch.nn.Embedding(network.num_latents, D)
+        self.latents = torch.nn.Embedding(network.num_latents, network.dim_in)
 
-        # map src and tgt to latents
-        self.norm_src = torch.nn.ModuleList([
-             AdaptiveLayerNorm(DI, dim_ctx= DN)
-             for _ in range(default(network.num_read_blocks, 1))
-        ])
+        # map src to latents
         self.encoder = torch.nn.ModuleList([
-              TransformerBlock(dim=D, dim_kv= DI, num_heads= default(network.num_encoder_heads, NH))
+              TransformerBlock(dim= network.dim_in, num_heads= network.num_encoder_heads)
               for _ in range(default(network.num_read_blocks, 1))
               ])
         
-        # process latents
-        self.processor = torch.nn.ModuleList([
-             TransformerBlock(dim=D) 
-             for _ in range(default(network.num_compute_blocks, 1))
-             ])
-        
         # map latents to tgt
-        self.tgt_decoder = torch.nn.ModuleList([
-             TransformerBlock(dim=DO, dim_kv= D, dim_ctx= DN, num_heads= default(network.num_decoder_heads, NH))
+        self.to_write = torch.nn.Sequential(torch.nn.Linear(network.dim_in, network.dim_out), AdaptiveLayerNorm(network.dim_out))
+        self.decoder = torch.nn.ModuleList([
+             TransformerBlock(dim=network.dim_out, dim_ctx=  network.dim_noise, num_heads= network.num_decoder_heads)
              for _ in range(default(network.num_write_blocks, 1))
             ])
-
+        
     def forward(self, src: torch.Tensor, tgt: torch.Tensor, ctx: torch.Tensor = None) -> torch.Tensor:
         # expand latents
         latents = einops.repeat(self.latents.weight, '... -> b ...', b=src.size(0))
         
-        # extract latent representations
-        for read, norm in zip(self.encoder, self.norm_src):
-             latents = read(latents, kv = norm(src, ctx = ctx))
+        # read src into latents
+        for read in self.encoder:
+             latents = read(latents, kv = torch.cat([src, latents], dim = 1))
 
-        # update latents
-        for compute in self.processor:
-             latents = compute(latents)
-
-        # update tgt
-        for write in self.tgt_decoder:
-            tgt = write(tgt, kv = latents, ctx = ctx)
+        # write latents to tgt
+        latents = self.to_write(latents)
+        for write in self.decoder:
+            tgt = write(tgt, kv = torch.cat([tgt, latents], dim = 1), ctx = ctx)
 
         return tgt
 
@@ -140,19 +122,11 @@ class EinMask(torch.nn.Module):
         )
         
         # I/O
-        # self.to_noise = EinMix(
-        #           pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
-        #           weight_shape = 'v f dn',
-        #           f = num_fields, dn = network.dim_noise, **world.token_sizes
-        #         )
-
-        self.to_noise = torch.nn.Sequential(
-             Rearrange('... f t h w -> ... t h w f'),
-             torch.nn.utils.parametrizations.spectral_norm(
-                  torch.nn.Linear(num_fields, network.dim_noise * world.token_sizes['v'], bias = False)
-                  ),
-             Rearrange(f'... t h w (v dn) -> ... ({world.token_pattern}) dn', **world.token_sizes)
-        )
+        self.to_noise = EinMix(
+                  pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
+                  weight_shape = 'v f dn',
+                  f = num_fields, dn = network.dim_noise, **world.token_sizes
+                )
 
         self.to_tokens = EinMix(
                   f'b {world.field_pattern} -> b ({world.token_pattern}) di',
@@ -160,87 +134,86 @@ class EinMask(torch.nn.Module):
                   **world.patch_sizes, **world.token_sizes, di = network.dim_in
                   )
                 
-        
         self.to_fields = FieldDecoder(network, world)
         
         # embeddings
         self.src_codes = torch.nn.Embedding(2, network.dim_in)
         self.tgt_codes = torch.nn.Embedding(2, network.dim_out)
-        self.position_codes = torch.nn.Embedding(world.num_tokens, network.dim_coords)
+        self.src_positions = torch.nn.Embedding(world.num_tokens, network.dim_in)
+        self.tgt_positions = torch.nn.Embedding(world.num_tokens, network.dim_out)
         
-        # latent perceiver
-        self.perceiver = LatentModel(network)
+        # transformer
+        self.transformer = LatentModel(network)
 
         # weight initialization
         self.apply(self.base_init)
+        self.apply(self.zero_init)
 
         # maybe compile
         if network.kwargs.get('compile', True):
-             self.perceiver.compile()
+             self.transformer.compile()
              self.to_fields.compile()
              self.to_tokens.compile()
              self.to_noise.compile()
 
+    @staticmethod
+    def zero_init(m: torch.nn.Module):
+        if isinstance(m, AdaptiveLayerNorm):
+            torch.nn.init.trunc_normal_(m.proj.weight, std = 1e-5)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
 
     @staticmethod
     def base_init(m: torch.nn.Module):
         # linear
         if isinstance(m, torch.nn.Linear):
-                torch.nn.init.trunc_normal_(m.weight, std = 0.02)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
         # embedding
         elif isinstance(m, torch.nn.Embedding):
-                torch.nn.init.trunc_normal_(m.weight, std = 0.02)
-        # AdaLN
-        # elif isinstance(m, AdaptiveLayerNorm):
-        #         torch.nn.init.zeros_(m.bias)
-        #         if exists(m.weight):
-        #             torch.nn.init.trunc_normal_(m.weight, std = 1e-4)
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
         # einmix
         elif isinstance(m, EinMix):
-                torch.nn.init.trunc_normal_(m.weight, std = 0.02)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
+            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
 
     def forward(self, 
             fields: torch.FloatTensor, 
-            src_mask: torch.BoolTensor, 
-            tgt_mask: torch.BoolTensor,
+            mask: torch.BoolTensor, 
             members: Optional[int] = None, 
-            rng: Optional[torch.Generator] = None
+            rng: Optional[torch.Generator] = None,
+            **kwargs
             ) -> torch.FloatTensor:
         B = fields.size(0)
         E = default(members, 1)
 
         # expand to parallel ensemble
         fields = einops.repeat(fields, "b ... -> (b e) ...", e = E)
-        src_mask = einops.repeat(src_mask, 'b ... -> (b e) ...', e = E)
-        tgt_mask = einops.repeat(tgt_mask, 'b ... -> (b e) ...', e = E)
-        positions = einops.repeat(self.position_codes.weight, '... -> (b e) ...', e = E, b = B)        
+        mask = einops.repeat(mask, 'b ... -> (b e) ...', e = E)
 
         # embed tokens
         tokens = self.to_tokens(fields)
+
+        # embed mask
+        src = self.src_codes(mask.long()) + self.src_positions.weight
+        tgt = self.tgt_codes(mask.long()) + self.tgt_positions.weight
 
         # create random field
         noise = self.noise_generator((B*E,), rng).to(tokens.dtype)
         noise = self.to_noise(noise)
 
         # mask
-        src_codes = self.src_codes(src_mask.long())
-        src = torch.where(src_mask[..., None], 
-                          tokens + src_codes, 
-                          src_codes
-                          )
-        tgt = self.tgt_codes(tgt_mask.long())
-
-        # latent perceiver
-        predicted_tokens = self.perceiver(
-             src = torch.cat([src, positions], dim = -1), 
-             tgt = torch.cat([tgt, positions], dim = -1), 
-             ctx = noise
-             )
+        src = torch.where(
+            condition = mask[..., None], 
+            input = tokens + src, 
+            other = src
+            )
         
+        # transformer
+        predicted_tokens = self.transformer(src, tgt, ctx = noise)
+
         # map all predicted_tokens back to fields
         predicted_fields = self.to_fields(predicted_tokens)
 
