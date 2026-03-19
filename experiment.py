@@ -269,7 +269,7 @@ class Experiment(DistributedTrainer):
 
         src, tgt = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
 
-        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
+        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
 
@@ -285,7 +285,7 @@ class Experiment(DistributedTrainer):
         mask_weight = torch.ones_like(mask, dtype = torch.float32)
 
         # foward model and loss
-        prediction = model(batch, src, tgt, members = self.world.ens_size, rng = self.generator)
+        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = mask_weight)
 

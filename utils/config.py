@@ -77,7 +77,7 @@ GODAS_STATS = {'temp_ocn_0a': {'mean': -2.2515301306437936e-16, 'std': 0.5806380
 
 @dataclass
 class NetworkConfig:
-    dim: int
+    dim: Optional[int] = None
     num_layers: Optional[int] = None
     num_latents: Optional[int] = None
     num_read_blocks: Optional[int] = None
