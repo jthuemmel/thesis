@@ -224,15 +224,15 @@ class Experiment(DistributedTrainer):
     @property
     def per_variable_weights(self):
         weights = {
-            'temp_ocn_0a': 1.,
-            'temp_ocn_1a': 0.1,
-            'temp_ocn_3a': 0.1,
-            'temp_ocn_5a': 0.1,
-            'temp_ocn_8a': 0.1,
-            'temp_ocn_11a': 0.1,
-            'temp_ocn_14a': 0.1,
-            'tauxa': 0.01,
-            'tauya': 0.01,
+            # 'temp_ocn_0a': 1.,
+            # 'temp_ocn_1a': 0.1,
+            # 'temp_ocn_3a': 0.1,
+            # 'temp_ocn_5a': 0.1,
+            # 'temp_ocn_8a': 0.1,
+            # 'temp_ocn_11a': 0.1,
+            # 'temp_ocn_14a': 0.1,
+            # 'tauxa': 0.01,
+            # 'tauya': 0.01,
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w, 
@@ -257,7 +257,7 @@ class Experiment(DistributedTrainer):
             e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
             o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2, -3))
         score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2, -3)) #[B, V]
-        return (score * w_v).mean()
+        return score.mul(w_v).mean()
     
     #FORWARD
     @property
