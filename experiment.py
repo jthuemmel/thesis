@@ -231,20 +231,20 @@ class Experiment(DistributedTrainer):
             # 'temp_ocn_8a': 0.1,
             # 'temp_ocn_11a': 0.1,
             # 'temp_ocn_14a': 0.1,
-            # 'tauxa': 0.01,
-            # 'tauya': 0.01,
+            'tauxa': 0.1,
+            'tauya': 0.1,
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w, 
-                             f"(v vv) -> b {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
+                             f"(v vv) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
     
     @property
     def land_sea_mask(self):
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
         return einops.repeat(lsm, 
-                             f"1 (h hh) (w ww) -> b {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes, b = self.world.batch_size)
+                             f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
     
     def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
         score = f_kernel_crps(observation=obs, ensemble=ens, fair = self.use_fair_crps)
