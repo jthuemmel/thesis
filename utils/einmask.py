@@ -129,12 +129,14 @@ class EinMask(torch.nn.Module):
                 lon_slice=slice(0, 2 * W, 2) # 2 degree step
         )
         
-        # I/O
-        self.to_context = EinMix(
+        I/O
+        self.from_noise = EinMix(
                   pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
                   weight_shape = 'v f dn',
                   f = num_fields, dn = network.dim_noise, **world.token_sizes
                 )
+
+        # self.from_noise = GatedFFN(network.dim_noise)
 
         self.to_tokens = EinMix(
                   f'b {world.field_pattern} -> b ({world.token_pattern}) di',
@@ -162,7 +164,7 @@ class EinMask(torch.nn.Module):
              self.transformer.compile()
              self.to_fields.compile()
              self.to_tokens.compile()
-             self.to_context.compile()
+             self.from_noise.compile()
 
     @staticmethod
     def zero_init(m: torch.nn.Module):
@@ -171,6 +173,8 @@ class EinMask(torch.nn.Module):
                 torch.nn.init.trunc_normal_(m.proj.weight, std = 1e-5)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
+        if isinstance(m, GatedFFN):
+            torch.nn.init.zeros_(m.to_out.weight)
 
     @staticmethod
     def base_init(m: torch.nn.Module):
@@ -203,7 +207,9 @@ class EinMask(torch.nn.Module):
 
         # create random fields
         noise = self.noise_generator((B*E,), rng).to(tokens.dtype)
-        ctx = self.to_context(noise)
+        ctx = self.from_noise(noise)
+        # noise = torch.randn((B * E, 1, self.network.dim_noise), device = tokens.device, dtype = tokens.dtype)
+        # ctx = self.from_noise(noise) + noise
 
         # mask
         tgt = self.tgt_codes(mask.long()) + self.tgt_positions.weight
