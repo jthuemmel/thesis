@@ -13,36 +13,41 @@ class LatentModel(torch.nn.Module):
         self.latents = torch.nn.Embedding(network.num_latents, network.dim)
 
         # map src to latents
-        self.to_read = torch.nn.Sequential(torch.nn.Linear(network.dim_in, network.dim), AdaptiveLayerNorm(network.dim))
+        self.input_to_src = torch.nn.Sequential(torch.nn.Linear(network.dim_in, network.dim), AdaptiveLayerNorm(network.dim))
+        
         self.encoder = torch.nn.ModuleList([
               TransformerBlock(dim= network.dim, num_heads= network.num_encoder_heads)
               for _ in range(default(network.num_read_blocks, 1))
               ])
         
         # map latents to tgt
-        self.to_write = torch.nn.Sequential(torch.nn.Linear(network.dim, network.dim_out), AdaptiveLayerNorm(network.dim_out))
+        self.input_to_tgt = torch.nn.Sequential(torch.nn.Linear(network.dim_in, network.dim_out), AdaptiveLayerNorm(network.dim_out))
+        self.latents_to_tgt = torch.nn.Sequential(torch.nn.Linear(network.dim, network.dim_out), AdaptiveLayerNorm(network.dim_out))
+        
         self.decoder = torch.nn.ModuleList([
              TransformerBlock(dim=network.dim_out, dim_ctx=  network.dim_noise, num_heads= network.num_decoder_heads)
              for _ in range(default(network.num_write_blocks, 1))
             ])
         
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        B, E = src.size(0), ctx.size(0) // src.size(0)
-
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        B, E = x.size(0), ctx.size(0) // x.size(0)
         # expand latents
         latents = einops.repeat(self.latents.weight, '... -> b ...', b= B)
-        
+
+        # project x
+        tgt = self.input_to_tgt(x)
+        src = self.input_to_src(x)
+
         # read src into latents
-        src = self.to_read(src)
         for read in self.encoder:
              latents = read(latents, kv = torch.cat([src, latents], dim = 1))
+        latents = self.latents_to_tgt(latents)
         
         # expand latents and tgt to match the stochastic context
         tgt = einops.repeat(tgt, 'b ... -> (b e) ...', e = E)
         latents = einops.repeat(latents, 'b ... -> (b e) ...', e = E)
 
-        # write latents to tgt
-        latents = self.to_write(latents)
+        # stochastically generate tgt
         for write in self.decoder:
             tgt = write(tgt, kv = torch.cat([tgt, latents], dim = 1), ctx = ctx)
 
@@ -106,37 +111,37 @@ class EinMask(torch.nn.Module):
         self.network = network
         self.world = world
 
-        # stochasticity
-        T, H, W = tuple(world.token_sizes[ax] for ax in ("t", "h", "w"))
+        # # stochasticity
+        # T, H, W = tuple(world.token_sizes[ax] for ax in ("t", "h", "w"))
 
-        horizontal = torch.tensor(default(network.grf_horizontal, [512]), dtype = torch.float32)
-        temporal = torch.tensor(default(network.grf_temporal, [1]), dtype = torch.float32)
-        channels = int(default(network.grf_channels, 1))
+        # horizontal = torch.tensor(default(network.grf_horizontal, [512]), dtype = torch.float32)
+        # temporal = torch.tensor(default(network.grf_temporal, [1]), dtype = torch.float32)
+        # channels = int(default(network.grf_channels, 1))
         
-        num_fields = channels * len(horizontal) * len(temporal)
-        nlat = 180 // world.patch_sizes['hh']
-        nlon = 360 //  world.patch_sizes['ww']
+        # num_fields = channels * len(horizontal) * len(temporal)
+        # nlat = 180 // world.patch_sizes['hh']
+        # nlon = 360 //  world.patch_sizes['ww']
 
-        self.noise_generator = SphericalDiffusionNoise(
-                num_channels=num_fields,
-                num_lat=nlat,
-                num_lon=nlon,
-                num_steps=T,
-                sigma=default(network.grf_sigma, 1.0),
-                horizontal_length= einops.repeat(horizontal, 'h -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
-                temporal_length=einops.repeat(temporal, 't -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
-                lat_slice= slice((nlat - H) // 2, (nlat + H) // 2), # centered on the equator
-                lon_slice=slice(0, 2 * W, 2) # 2 degree step
-        )
+        # self.noise_generator = SphericalDiffusionNoise(
+        #         num_channels=num_fields,
+        #         num_lat=nlat,
+        #         num_lon=nlon,
+        #         num_steps=T,
+        #         sigma=default(network.grf_sigma, 1.0),
+        #         horizontal_length= einops.repeat(horizontal, 'h -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
+        #         temporal_length=einops.repeat(temporal, 't -> (c h t)', h = len(horizontal), t = len(temporal), c = channels),
+        #         lat_slice= slice((nlat - H) // 2, (nlat + H) // 2), # centered on the equator
+        #         lon_slice=slice(0, 2 * W, 2) # 2 degree step
+        # )
         
-        I/O
-        self.from_noise = EinMix(
-                  pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
-                  weight_shape = 'v f dn',
-                  f = num_fields, dn = network.dim_noise, **world.token_sizes
-                )
+        # #I/O
+        # self.from_noise = EinMix(
+        #           pattern = f'... f t h w -> ... ({world.token_pattern}) dn',
+        #           weight_shape = 'v f dn',
+        #           f = num_fields, dn = network.dim_noise, **world.token_sizes
+        #         )
 
-        # self.from_noise = GatedFFN(network.dim_noise)
+        self.from_noise = GatedFFN(network.dim_noise)
 
         self.to_tokens = EinMix(
                   f'b {world.field_pattern} -> b ({world.token_pattern}) di',
@@ -148,9 +153,9 @@ class EinMask(torch.nn.Module):
         
         # embeddings
         self.src_codes = torch.nn.Embedding(2, network.dim_in)
-        self.tgt_codes = torch.nn.Embedding(2, network.dim_out)
+        #self.tgt_codes = torch.nn.Embedding(2, network.dim_out)
         self.src_positions = torch.nn.Embedding(world.num_tokens, network.dim_in)
-        self.tgt_positions = torch.nn.Embedding(world.num_tokens, network.dim_out)
+        # self.tgt_positions = torch.nn.Embedding(world.num_tokens, network.dim_out)
         
         # transformer
         self.transformer = LatentModel(network)
@@ -173,8 +178,6 @@ class EinMask(torch.nn.Module):
                 torch.nn.init.trunc_normal_(m.proj.weight, std = 1e-5)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
-        if isinstance(m, GatedFFN):
-            torch.nn.init.zeros_(m.to_out.weight)
 
     @staticmethod
     def base_init(m: torch.nn.Module):
@@ -203,25 +206,29 @@ class EinMask(torch.nn.Module):
         E = default(members, 1)
 
         # embed tokens
-        tokens = self.to_tokens(fields)        
+        tokens = self.to_tokens(fields) + self.src_positions.weight
 
         # create random fields
-        noise = self.noise_generator((B*E,), rng).to(tokens.dtype)
+        # noise = self.noise_generator((B*E,), rng).to(tokens.dtype)
+        # ctx = self.from_noise(noise)
+        noise = torch.randn(
+            (B * E, 1, self.network.dim_noise), 
+            device = tokens.device, dtype = tokens.dtype, generator = rng
+            )
         ctx = self.from_noise(noise)
-        # noise = torch.randn((B * E, 1, self.network.dim_noise), device = tokens.device, dtype = tokens.dtype)
-        # ctx = self.from_noise(noise) + noise
 
         # mask
-        tgt = self.tgt_codes(mask.long()) + self.tgt_positions.weight
-        src = self.src_codes(mask.long()) + self.src_positions.weight
-        src = torch.where(
+        #tgt = self.tgt_codes(mask.long()) + self.tgt_positions.weight
+        x = self.src_codes(mask.long()) + self.src_positions.weight
+        x = torch.where(
             condition = mask[..., None], 
-            input = tokens + src, 
-            other = src
+            input = tokens + x, 
+            other = x
             )
         
         # transformer
-        predicted_tokens = self.transformer(src, tgt, ctx = ctx)
+        predicted_tokens = self.transformer(x, ctx = ctx)
+        #predicted_tokens = self.transformer(src, tgt, ctx = ctx)
 
         # map all predicted_tokens back to fields
         predicted_fields = self.to_fields(predicted_tokens)
