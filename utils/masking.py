@@ -1,27 +1,6 @@
 import torch
 import einops
-from itertools import permutations
 from utils.config import *
-
-# MASKING STRATEGIES
-class ForecastMasking(torch.nn.Module):
-    def __init__(self, world: WorldConfig):
-        super().__init__()
-        self.world = world
-        self.event_pattern = 't'
-        self.register_buffer("prefix_frames", torch.tensor(world.tau, dtype = torch.long))
-        self.register_buffer("total_frames", torch.tensor(world.token_sizes["t"], dtype = torch.long))
-    
-    def forward(self, shape: tuple, return_indices: bool = True):
-        mask = torch.zeros((self.total_frames,), device = self.total_frames.device)
-        mask[:self.prefix_frames] = 1
-        mask = einops.repeat(mask, f'{self.event_pattern} -> ({self.world.token_pattern})', **self.world.token_sizes)
-        if return_indices:
-            src = mask.nonzero(as_tuple=True)[0]
-            tgt = mask.bool().logical_not().nonzero(as_tuple=True)[0]
-            return src.expand(*shape,-1), tgt.expand(*shape,-1)
-        else:
-            return mask.expand(*shape, -1).bool(), mask.expand(*shape, -1).bool().logical_not()
 
 class MaskingMixture(torch.nn.Module):
     def __init__(self, 
