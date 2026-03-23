@@ -121,6 +121,21 @@ class Experiment(DistributedTrainer):
     # SETUP
     def setup_misc(self):
         self.step_counter = 0
+        self.create_prior()
+
+    def create_prior(self):
+        tau = self.world.tau / self.world.token_sizes["t"]
+        self.frcst_masking = BinaryMasking(
+            world = self.world,
+            event_cfg = {"prefix": 1e-6},
+            rate_cfg = {'min': tau, "max": tau}
+            ).to(self.device)
+        
+        self.prior = MaskingMixture(
+            world= self.world,
+            event_cfg = self._cfg.objective.event_cfg,
+            rate_cfg = self._cfg.objective.rate_cfg,
+            ).to(self.device)
         
     def create_job_name(self):
         if exists(self.cfg.job_name):
@@ -195,34 +210,12 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self):
-        self.frcst_masking = ForecastMasking(
-            world = self.world, 
-            ).to(self.device)
-        
-        self.prior = MaskingMixture(
-            world= self.world,
-            event_cfg = self._cfg.objective.event_cfg,
-            rate_cfg = self._cfg.objective.rate_cfg,
-            ).to(self.device)
-
         model = EinMask(network=self.model_cfg, world=self.world)
         return model
-    
-    # LOSS
-    def create_loss(self):
-        def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
-            w_spectral = self.cfg.spectral_loss_weight
-            if w_spectral > 0:
-                spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
-                node_loss = self.node_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
-                loss = w_spectral * spectral_loss + node_loss  
-            else:
-                loss = self.node_crps(ens = ens, obs = obs, mask = mask, mask_weight = mask_weight)
-            return loss 
-        return loss_fn
 
+    # LOSS
     @property
-    def per_variable_weights(self):
+    def per_variable_weights(self) -> torch.FloatTensor:
         weights = {
             # 'temp_ocn_0a': 1.,
             # 'temp_ocn_1a': 0.1,
@@ -240,15 +233,15 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, **self.world.patch_sizes)
     
     @property
-    def land_sea_mask(self):
+    def land_sea_mask(self) -> torch.BoolTensor:
         lsm = self._train_lsm if self.mode == "train" else self._val_lsm
         return einops.repeat(lsm, 
                              f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes)
     
-    def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor, mask_weight: torch.Tensor = 1.):
+    def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
         score = f_kernel_crps(observation=obs, ensemble=ens, fair = self.use_fair_crps)
-        loss = (score * mask_weight * self.per_variable_weights)[mask].mean()
+        loss = (score * self.per_variable_weights)[mask].mean()
         return loss
 
     def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, **kwargs):
@@ -259,6 +252,16 @@ class Experiment(DistributedTrainer):
         score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2, -3)) #[B, V]
         return score.mul(w_v).mean()
     
+    def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
+        w_spectral = self.cfg.spectral_loss_weight
+        if w_spectral > 0:
+            spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask)
+            node_loss = self.node_crps(ens = ens, obs = obs, mask = mask)
+            loss = w_spectral * spectral_loss + node_loss  
+        else:
+            loss = self.node_crps(ens = ens, obs = obs, mask = mask)
+        return loss
+    
     #FORWARD
     @property
     def total_epochs(self):
@@ -267,40 +270,37 @@ class Experiment(DistributedTrainer):
     def frcst_step(self, batch_idx, batch):
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        src, tgt = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
+        src, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
 
-        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
+        prediction, _ = model(batch, src, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
-
-    def forward_step(self, batch_idx, batch):
+    
+    def foward_step(self, batch_idx, batch):
         B = batch.size(0)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
-        # sample src and tgt
-        src, tgt = self.prior(B, rng = self.generator)
-        
-        # prepare mask and mask_weight (if md4)
-        mask = torch.logical_and(self.mask_to_field(tgt), self.land_sea_mask)
-        mask_weight = torch.ones_like(mask, dtype = torch.float32)
+        # sample visible and mask
+        visible, masked = self.prior(B, rng = self.generator)
+        masked = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
+                               **self.world.token_sizes, **self.world.patch_sizes)
+        mask = torch.logical_and(masked, self.land_sea_mask)
 
-        # foward model and loss
-        prediction = model(batch, src, members = self.world.ens_size, rng = self.generator)
+        # foward model
+        prediction, _ = model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
-        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask, mask_weight = mask_weight)
+
+        # compute loss
+        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask)
 
         # track metrics
         metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
-        self.step_counter = self.step_counter + 1
-        return loss
-    
-    # Tokenizers
-    def mask_to_field(self, mask):
-        return einops.repeat(mask,
-                             f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
-                                **self.world.token_sizes, **self.world.patch_sizes)
+
+        # update step counter if training
+        self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
+        return loss        
 
     # EVAL
     def evaluate_epoch(self):
