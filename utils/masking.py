@@ -55,7 +55,7 @@ class MaskingMixture(torch.nn.Module):
             prefix = einops.repeat(prefix, f't -> b ({self.world.token_pattern})', **self.world.token_sizes, b = B)
 
         src = self.src(B, conditional = prefix, rng=rng)
-        tgt = self.tgt(B, conditional = src.logical_not() if exists(prefix) else None, rng=rng)
+        tgt = self.tgt(B, conditional = src.logical_not(), rng=rng)
         return src, tgt
 
 class BinaryMasking(torch.nn.Module):

@@ -443,11 +443,11 @@ class Experiment(DistributedTrainer):
 
     @staticmethod
     def get_nino4(da: xr.DataArray):
-        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
     
     @staticmethod
     def get_nino34(da: xr.DataArray):
-        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
 
     @staticmethod
     def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
