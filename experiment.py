@@ -252,7 +252,7 @@ class Experiment(DistributedTrainer):
         score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2, -3)) #[B, V]
         return score.mul(w_v).mean()
     
-    def loss_fn(ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
+    def loss_fn(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
         w_spectral = self.cfg.spectral_loss_weight
         if w_spectral > 0:
             spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask)
@@ -268,39 +268,52 @@ class Experiment(DistributedTrainer):
         return max(1, self.total_steps // len(self.train_dl))
     
     def frcst_step(self, batch_idx, batch):
-        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
+        #model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        src, _ = self.frcst_masking(shape=(batch.size(0),), return_indices = False)
+        visible = self.frcst_masking(batch.size(0), rng = self.generator)
+        masked = visible.logical_not()
 
-        prediction, _ = model(batch, src, members = self.world.ens_size, rng = self.generator)
+        prediction, _ = self.model(batch, visible, masked, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
     
-    def foward_step(self, batch_idx, batch):
+    def forward_step(self, batch_idx, batch):
         B = batch.size(0)
-        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
+        #model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
-        # sample visible and mask
+        # sample visible and masked
         visible, masked = self.prior(B, rng = self.generator)
-        masked = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
+
+        # loss is evaluated on masked tokens and sea
+        masked_field = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
                                **self.world.token_sizes, **self.world.patch_sizes)
-        mask = torch.logical_and(masked, self.land_sea_mask)
+        mask = torch.logical_and(masked_field, self.land_sea_mask)
 
         # foward model
-        prediction, _ = model(batch, visible, members = self.world.ens_size, rng = self.generator)
-        prediction = prediction * self.land_sea_mask[..., None]
+        ens, z_hat = self.model(batch, visible, masked, members = self.world.ens_size, rng = self.generator)
+        ens = ens * self.land_sea_mask[..., None]
+
+        # JEPA?
+        with torch.no_grad():
+            z_target = self.ema_model.module.encoder(batch, masked)
+        l1 = (z_hat - z_target).abs().mean()
+        w_jepa = default(self.cfg.jepa_loss_weight, 0.)
 
         # compute loss
-        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask)
+        crps = self.loss_fn(ens = ens, obs = batch, mask = mask)
 
+        loss = (1 - w_jepa) * crps + w_jepa * l1 if w_jepa > 0 else crps
+        
         # track metrics
-        metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask= mask)
+        metrics = self.compute_metrics(ens = ens.detach(), obs = batch, mask= mask)
         metrics['loss'] = loss.item()
+        metrics['l_jepa'] = l1.item()
+
         self.log_metrics(metrics)
 
         # update step counter if training
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
-        return loss        
+        return loss
 
     # EVAL
     def evaluate_epoch(self):

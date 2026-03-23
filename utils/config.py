@@ -206,7 +206,7 @@ class TrainerConfig:
     
     use_ema: bool = False
     ema_decay: float = 0.9999
-    
+    jepa_loss_weight: float = 0.
     spectral_loss_weight: float = 0.
     mixed_precision: bool = True
     clip_gradients: bool = True
