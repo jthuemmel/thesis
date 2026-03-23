@@ -16,27 +16,6 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
-class AdaptiveLayerNorm(torch.nn.Module):
-    def __init__(self, dim: int, dim_ctx: int = None, spectral_norm: bool = True):
-        super().__init__()
-        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
-        if exists(dim_ctx):
-            self.proj = torch.nn.Linear(dim_ctx, 2 * dim, bias = True)
-            if spectral_norm:
-                self.proj = torch.nn.utils.parametrizations.spectral_norm(self.proj)
-            self.bias = None
-        else:
-            self.proj = None
-            self.bias = torch.nn.Parameter(torch.zeros(2 * dim))
-
-    def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if exists(ctx) and exists(self.proj):
-            scale, shift = self.proj(ctx).chunk(2, dim = -1)
-        else:
-            scale, shift = self.bias.chunk(2, dim = -1)
-        x = (1. + scale) * self.norm(x) + shift
-        return x
-
 class GatedFFN(torch.nn.Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
@@ -82,14 +61,66 @@ class EinAttention(torch.nn.Module):
         return self.to_out(A)
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_kv: Optional[int] = None, dim_ctx: Optional[int] = None, num_heads: Optional[int] = None) -> None:
+    def __init__(self, dim: int, dim_kv: Optional[int] = None, num_heads: Optional[int] = None) -> None:
         super().__init__()
-        self.attn_norm = AdaptiveLayerNorm(dim, dim_ctx=dim_ctx)
-        self.ffn_norm = AdaptiveLayerNorm(dim, dim_ctx=dim_ctx)
+        self.attn_norm = torch.nn.RMSNorm(dim)
+        self.ffn_norm = torch.nn.RMSNorm(dim)
         self.att = EinAttention(dim, num_heads=num_heads, dim_kv= dim_kv)
         self.ffn = GatedFFN(dim=dim)
 
-    def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None, ctx: Optional[torch.FloatTensor] = None):
-        x = x + self.att(self.attn_norm(x, ctx), kv = kv) 
-        x = x + self.ffn(self.ffn_norm(x, ctx)) 
+    def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None):
+        x = x + self.att(self.attn_norm(x), kv = kv) 
+        x = x + self.ffn(self.ffn_norm(x)) 
         return x
+
+class FieldDecoder(torch.nn.Module):
+    def __init__(self, network: NetworkConfig, world: WorldConfig):
+        super().__init__()
+        self.world = world
+        self.to_fields = EinMix(
+            f'b ({world.token_pattern}) do -> (b k) ({world.flat_pattern})',
+            weight_shape=f'k v {world.patch_pattern} do',
+            **world.token_sizes, **world.kernel_sizes, 
+            do= network.dim_out, k = default(network.num_tails, 1)
+            )
+
+        self.unflatten_fields = Rearrange(
+            f'b ({world.flat_pattern}) -> b {world.field_pattern}',
+            **world.token_sizes, **world.patch_sizes
+            )
+
+        self._build_fold_index(world)
+
+    def _build_fold_index(self, world: WorldConfig):
+        ts = world.token_sizes
+        ks = world.kernel_sizes
+        
+        grid_strides = {}
+        acc = 1
+        for ax in reversed(world.layout):
+            grid_strides[ax] = acc
+            acc *= world.field_sizes[ax]
+
+        idx = torch.zeros([*ts.values(), *ks.values()], dtype=torch.long)
+
+        for ax in world.layout:
+            n0 = torch.arange(ts[ax]) * world.patch_sizes[2*ax]
+            dp = torch.arange(ks[2*ax])
+            n0 = einops.repeat(n0, f'{ax} -> {world.token_pattern} {world.patch_pattern}', **ts, **ks)
+            dp = einops.repeat(dp, f'{2*ax} -> {world.token_pattern} {world.patch_pattern}', **ts, **ks)
+            idx += (n0 + dp).clamp(0, world.field_sizes[ax] - 1) * grid_strides[ax]
+
+        self.register_buffer('idx', idx.flatten())
+
+    def forward(self, tgt: torch.FloatTensor):
+        B = tgt.size(0)
+        tgt = self.to_fields(tgt)
+        predicted_fields = torch.scatter_reduce(
+            tgt.new_empty((B, self.world.num_elements)), 
+            1, 
+            self.idx.expand(B, -1), 
+            tgt, 
+            reduce='mean', 
+            include_self=False
+            )
+        return self.unflatten_fields(predicted_fields)
