@@ -263,17 +263,7 @@ class Experiment(DistributedTrainer):
     @property
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
-    
-    def frcst_step(self, batch_idx, batch):
-        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        visible = self.frcst_prefix.expand(batch.size(0), -1)
-        #masked = visible.logical_not()
-
-        prediction, _ = model(batch, visible, members = self.world.ens_size, rng = self.generator)
-        prediction = prediction * self.land_sea_mask[..., None]
-        return prediction
-    
     def forward_step(self, batch_idx, batch):
         B = batch.size(0)
         model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
@@ -282,78 +272,122 @@ class Experiment(DistributedTrainer):
         all_visible = torch.ones((B, self.world.num_tokens), dtype = torch.bool, device = self.device)
         visible, masked = self.prior(B, rng = self.generator)
 
-        # loss is evaluated on masked tokens and sea
-        masked_field = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
-                               **self.world.token_sizes, **self.world.patch_sizes)
-        mask = torch.logical_and(masked_field, self.land_sea_mask)
-
         # foward model
-        ens, z_hat = model(batch, visible, members = self.world.ens_size, rng = self.generator)
-        ens = ens * self.land_sea_mask[..., None]
+        z_hat = model(batch, visible)
 
-        # JEPA?
+        # ema model
         with torch.no_grad():
             z_target = self.ema_model.module.encode(batch, all_visible)
-        l1 = (z_hat - z_target).abs()[masked].mean()
-        w_jepa = default(self.cfg.jepa_loss_weight, 0.)
 
-        # compute loss
-        crps = self.loss_fn(ens = ens, obs = batch, mask = mask)
+        # masked L1 loss
+        loss = (z_hat - z_target).abs()[masked].mean()
 
-        loss = crps + l1 if w_jepa > 0 else crps
-        
         # track metrics
-        metrics = self.compute_metrics(ens = ens.detach(), obs = batch, mask= mask)
+        metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked)
         metrics['loss'] = loss.item()
-        metrics['l_jepa'] = l1.item()
-
+        
         self.log_metrics(metrics)
 
         # update step counter if training
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
         return loss
+    
+    def frcst_step(self, batch_idx, batch):
+        B = batch.size(0)
+        
+        # frcst visible and masked
+        all_visible = torch.ones((B, self.world.num_tokens), dtype = torch.bool, device = self.device)
+        visible = self.frcst_prefix.expand(B, -1)
+        masked = self.frcst_prefix.logical_not().expand(B, -1)
 
-    # EVAL
+        # foward model
+        z_hat = self.ema_model(batch, visible)
+        z_target = self.ema_model.module.encode(batch, all_visible)
+
+        # loss
+        loss = (z_hat - z_target).abs()[masked].mean()
+
+        # track metrics
+        metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked)
+        metrics['frcst_loss'] = loss.item()
+        
+        self.log_metrics(metrics)
+        return loss
+    
+    # JEPA eval
+
+    def jepa_metrics(self, z_hat: torch.FloatTensor, z_target: torch.FloatTensor, mask: torch.BoolTensor):
+        D = z_hat.size(-1)
+        hat, tgt = z_hat[mask], z_target[mask]
+        combined = einops.rearrange([hat, tgt], 'two ... d -> (two d) (...)')
+        cov = torch.cov(combined)
+        metrics = {
+            'pr_hat':     self.participation_ratio(cov[:D, :D]).item(),
+            'pr_tgt':     self.participation_ratio(cov[D:, D:]).item(),
+            'pr_x':       self.participation_ratio(cov[:D, D:]).item(),
+            'cos_sim':    torch.nn.functional.cosine_similarity(hat, tgt, dim=-1).mean().item(),
+            'norm_ratio': hat.norm(dim=-1).mean().div(tgt.norm(dim=-1).mean()).item(),
+            'dead_hat':   (cov[:D, :D].diagonal() < 1e-3).float().mean().item(),
+            'dead_tgt':   (cov[D:, D:].diagonal() < 1e-3).float().mean().item(),
+        }
+        return metrics
+
+    @staticmethod
+    def participation_ratio(cov: torch.FloatTensor):
+        return cov.trace().pow(2).div(cov.pow(2).sum() + 1e-9)
+
+    
     def evaluate_epoch(self):
-        super().evaluate_epoch()
-        self.evaluate_frcst()
-
-    def evaluate_frcst(self):
         self.switch_mode(train=False)
         if not exists(self.val_dl):
             return
-        samples = []
         for batch_idx, batch in enumerate(self.val_dl):
             batch = batch.to(self.device)
             with torch.no_grad():
-                with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                    prediction = self.frcst_step(batch_idx, batch)
-                    samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
+                with torch.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+                    _ = self.forward_step(batch_idx, batch)
+                    _ = self.frcst_step(batch_idx, batch)
+    # EVAL
+    # def evaluate_epoch(self):
+    #     super().evaluate_epoch()
+    #     self.evaluate_frcst()
 
-        ds = xr.concat(samples, dim = "time")
-        ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
-        self.get_nino_metrics(ds)
-        self.get_field_metrics(ds)
+    # def evaluate_frcst(self):
+    #     self.switch_mode(train=False)
+    #     if not exists(self.val_dl):
+    #         return
+    #     samples = []
+    #     for batch_idx, batch in enumerate(self.val_dl):
+    #         batch = batch.to(self.device)
+    #         with torch.no_grad():
+    #             with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+    #                 prediction = self.frcst_step(batch_idx, batch)
+    #                 samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
 
-        if self.is_root:
-            plt.figure(figsize=(12,8))
-            plt.subplot(221)
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(222)
-            ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(223)
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(224)
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.savefig(self.model_dir / "test_sample.png")
-            plt.close()
+    #     ds = xr.concat(samples, dim = "time")
+    #     ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
+    #     self.get_nino_metrics(ds)
+    #     self.get_field_metrics(ds)
 
-        if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
-            self.write_to_disk(ds)
+    #     if self.is_root:
+    #         plt.figure(figsize=(12,8))
+    #         plt.subplot(221)
+    #         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
+    #         plt.subplot(222)
+    #         ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+    #         plt.subplot(223)
+    #         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+    #         plt.subplot(224)
+    #         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+    #         plt.savefig(self.model_dir / "test_sample.png")
+    #         plt.close()
 
-    def write_to_disk(self, data: xr.Dataset):
-        path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
-        data.to_zarr(path, mode = "w")
+    #     if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
+    #         self.write_to_disk(ds)
+
+    # def write_to_disk(self, data: xr.Dataset):
+    #     path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
+    #     data.to_zarr(path, mode = "w")
 
     def get_xarray_dataset(self, batch_idx, pred, obs):
         #meta data

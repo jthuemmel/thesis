@@ -9,39 +9,35 @@ from torch.nn.functional import softplus
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
+        self.network = network
+        self.world = world
 
-        # I/O
-        self.to_tokens =  EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) di', 
-                    weight_shape= f'v {world.patch_pattern} di',
-                    **world.patch_sizes, **world.token_sizes, di = network.dim_in
-                    )
+        # Encoder
+        self.tokenizer =  EinMix(
+            f'b {world.field_pattern} -> b ({world.token_pattern}) di', 
+            weight_shape= f'v {world.patch_pattern} di', 
+            **world.patch_sizes, **world.token_sizes, di = network.dim_in
+            )
         
-        self.to_fields = FieldDecoder(network, world)
-
-        # linear projections
-        self.to_bottleneck = torch.nn.Linear(network.dim, network.dim_out * 2, bias = False)
-        self.to_predictor = torch.nn.Linear(network.dim_in, network.dim, bias = False)
-
-        # embeddings
-        self.positions = torch.nn.Embedding(world.num_tokens, network.dim_in)
-        self.queries = torch.nn.Embedding(world.num_tokens, network.dim)
-
-        # Transformer components
+        self.positions = torch.nn.Parameter(torch.zeros(1, world.num_tokens, network.dim_in))
+        self.mask_token = torch.nn.Parameter(torch.zeros(1, 1, network.dim_in))
+    
         self.encoder = torch.nn.ModuleList([
               TransformerBlock(dim= network.dim_in) for _ in range(default(network.num_read_blocks, 1))
               ])
         
-        self.predictor = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim) for _ in range(default(network.num_compute_blocks, 1))
-              ])
-        
-        self.bottleneck = TransformerBlock(dim = network.dim_out * 2, num_heads=network.num_decoder_heads)
-        self.decoder = torch.nn.ModuleList([
-            TransformerBlock(dim=network.dim_out) for _ in range(default(network.num_write_blocks, 1))
-            ])
+        # Predictor
+        self.predictor = torch.nn.Sequential(
+            torch.nn.Linear(network.dim_in, network.dim, bias = False),
+            *[TransformerBlock(dim= network.dim) for _ in range(default(network.num_compute_blocks, 1))],
+            torch.nn.Linear(network.dim, network.dim_in, bias = False)
+        )
 
         # weight initialization
         self.apply(self.base_init)
+
+        # maybe compile
+        self.predictor.compile()
 
     @staticmethod
     def base_init(m: torch.nn.Module):
@@ -58,51 +54,46 @@ class EinMask(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
+        # explicit parameters
+        elif isinstance(m, EinMask):
+            torch.nn.init.trunc_normal_(m.mask_token, std = 0.02)
+            torch.nn.init.trunc_normal_(m.positions, std = 0.02)
     
     def forward(self, 
                 fields: torch.FloatTensor, 
                 visible: torch.BoolTensor, 
-                members: Optional[int] = None, 
-                rng: Optional[torch.Generator] = None,
-                ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        latents = self.encode(fields, visible)
-        latents = self.predict(latents, visible)
-        ensemble = self.decode(latents, members, rng)
-        return ensemble, latents
-    
-    def encode(self,
-               fields: torch.FloatTensor, 
-               visible: torch.BoolTensor, 
-               ) -> torch.FloatTensor:
-        tokens = self.to_tokens(fields) + self.positions.weight
-        x = einops.rearrange(tokens[visible], '(b n) d -> b n d', b = tokens.size(0))
+                ) -> torch.FloatTensor:
+        src = self.encode(fields, visible)
+        tgt = self.predict(src, visible)
+        return tgt
+
+    def encode(self, 
+                fields: torch.FloatTensor, 
+                visible: torch.BoolTensor, 
+                ) -> torch.FloatTensor:
+        # map fields to tokens and add position codes
+        tokens = self.tokenizer(fields) + self.positions
+
+        # encode visible tokens only
+        src = einops.rearrange(tokens[visible], '(b n) d -> b n d', b = tokens.size(0), d = tokens.size(-1))
         for read in self.encoder:
-            x = read(x)
-        x = self.to_predictor(x)
-        return x
+            src = read(src)
+
+        return src
+
+    def predict(self, 
+                src: torch.FloatTensor, 
+                visible: torch.BoolTensor, 
+                ) -> torch.FloatTensor:
+        # pad with mask tokens
+        tgt = torch.masked_scatter(
+            input = (self.mask_token + self.positions).type_as(src), # for all positions
+            mask = visible[..., None], # if visible is True
+            source = src # copy src elements over
+            ) # else keep mask token + position code
+        
+        # predict masked locations
+        tgt = self.predictor(tgt)
+
+        return tgt
     
-    def predict(self,
-               latents: torch.FloatTensor, 
-               visible: torch.BoolTensor, 
-               ) -> torch.FloatTensor:
-        queries = self.queries.weight.type_as(latents)
-        x = queries.masked_scatter(visible[..., None], latents)
-        for compute in self.predictor:
-            x = compute(x)
-        return x
-    
-    def decode(self, 
-               latents: torch.FloatTensor,
-               members: Optional[int] = None, 
-               rng: Optional[torch.Generator] = None
-               ) -> torch.FloatTensor:
-        latents = latents.clone().detach()
-        x = self.to_bottleneck(latents)
-        latents = self.bottleneck(latents)
-        mu, sigma = einops.repeat(latents, 'b n (two d) -> two (b e) n d', e = default(members, 1), two = 2)
-        x = mu + torch.randn_like(sigma, generator = rng) * softplus(sigma)
-        for write in self.decoder:
-            x = write(x)
-        fields = self.to_fields(x)
-        fields = einops.rearrange(fields, "(b e) ... -> b ... e", e = default(members, 1))
-        return fields
