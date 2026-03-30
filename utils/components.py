@@ -113,12 +113,11 @@ class FieldDecoder(torch.nn.Module):
         self.register_buffer('idx', idx.flatten())
 
     def forward(self, tgt: torch.FloatTensor):
-        B = tgt.size(0)
         tgt = self.to_fields(tgt)
         predicted_fields = torch.scatter_reduce(
-            tgt.new_empty((B, self.world.num_elements)), 
+            tgt.new_empty((tgt.size(0), self.world.num_elements)), 
             1, 
-            self.idx.expand(B, -1), 
+            self.idx.expand(tgt.size(0), -1), 
             tgt, 
             reduce='mean', 
             include_self=False
