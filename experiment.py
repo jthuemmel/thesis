@@ -124,12 +124,9 @@ class Experiment(DistributedTrainer):
         self.create_prior()
 
     def create_prior(self):
-        tau = self.world.tau / self.world.token_sizes["t"]
-        self.frcst_masking = BinaryMasking(
-            world = self.world,
-            event_cfg = {"prefix": 1e-6},
-            rate_cfg = {'min': tau, "max": tau}
-            ).to(self.device)
+        prefix = torch.zeros((self.world.token_sizes["t"],), device = self.device, dtype = torch.bool)
+        prefix[:self.world.tau] = True
+        self.frcst_prefix = einops.repeat(prefix, f't -> ({self.world.token_pattern})', **self.world.token_sizes)
         
         self.prior = MaskingMixture(
             world= self.world,
@@ -268,20 +265,21 @@ class Experiment(DistributedTrainer):
         return max(1, self.total_steps // len(self.train_dl))
     
     def frcst_step(self, batch_idx, batch):
-        #model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
+        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
 
-        visible = self.frcst_masking(batch.size(0), rng = self.generator)
-        masked = visible.logical_not()
+        visible = self.frcst_prefix.expand(batch.size(0), -1)
+        #masked = visible.logical_not()
 
-        prediction, _ = self.model(batch, visible, masked, members = self.world.ens_size, rng = self.generator)
+        prediction, _ = model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
     
     def forward_step(self, batch_idx, batch):
         B = batch.size(0)
-        #model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
+        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
         
         # sample visible and masked
+        all_visible = torch.ones((B, self.world.num_tokens), dtype = torch.bool, device = self.device)
         visible, masked = self.prior(B, rng = self.generator)
 
         # loss is evaluated on masked tokens and sea
@@ -290,19 +288,19 @@ class Experiment(DistributedTrainer):
         mask = torch.logical_and(masked_field, self.land_sea_mask)
 
         # foward model
-        ens, z_hat = self.model(batch, visible, masked, members = self.world.ens_size, rng = self.generator)
+        ens, z_hat = model(batch, visible, members = self.world.ens_size, rng = self.generator)
         ens = ens * self.land_sea_mask[..., None]
 
         # JEPA?
         with torch.no_grad():
-            z_target = self.ema_model.module.encoder(batch, masked)
-        l1 = (z_hat - z_target).abs().mean()
+            z_target = self.ema_model.module.encode(batch, all_visible)
+        l1 = (z_hat - z_target).abs()[masked].mean()
         w_jepa = default(self.cfg.jepa_loss_weight, 0.)
 
         # compute loss
         crps = self.loss_fn(ens = ens, obs = batch, mask = mask)
 
-        loss = (1 - w_jepa) * crps + w_jepa * l1 if w_jepa > 0 else crps
+        loss = crps + l1 if w_jepa > 0 else crps
         
         # track metrics
         metrics = self.compute_metrics(ens = ens.detach(), obs = batch, mask= mask)
