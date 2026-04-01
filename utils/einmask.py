@@ -21,6 +21,8 @@ class EinMask(torch.nn.Module):
         
         self.positions = torch.nn.Parameter(torch.zeros(1, world.num_tokens, network.dim_in))
         self.mask_token = torch.nn.Parameter(torch.zeros(1, 1, network.dim_in))
+
+        self.noise_encoder = GatedFFN(network.dim_ctx)
     
         self.encoder = torch.nn.ModuleList([
               TransformerBlock(dim= network.dim_in, dim_ctx= network.dim_ctx) for _ in range(default(network.num_read_blocks, 1))
@@ -44,7 +46,7 @@ class EinMask(torch.nn.Module):
         # linear
         if isinstance(m, torch.nn.Linear):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
-            if m.bias is not None:
+            if exists(m.bias):
                 torch.nn.init.zeros_(m.bias)
         # embedding
         elif isinstance(m, torch.nn.Embedding):
@@ -52,13 +54,13 @@ class EinMask(torch.nn.Module):
         # einmix
         elif isinstance(m, EinMix):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
-            if m.bias is not None:
+            if exists(m.bias):
                 torch.nn.init.zeros_(m.bias)
+        # adaLN
         elif isinstance(m, AdaptiveLayerNorm):
-            if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
-            if m.weight is not None:
-                torch.nn.init.trunc_normal_(m.weight, std = 1e-6)
+            torch.nn.init.zeros_(m.bias)
+            if exists(m.weight):
+                torch.nn.init.trunc_normal_(m.weight, std = 1e-5)
         # explicit parameters
         elif isinstance(m, EinMask):
             torch.nn.init.trunc_normal_(m.mask_token, std = 0.02)
@@ -81,7 +83,8 @@ class EinMask(torch.nn.Module):
         visible = einops.repeat(visible, 'b n -> (b e) n ()', e = default(members, 1))
 
         # functional noise
-        noise = torch.randn([src.size(0), 1, src.size(-1)], device = src.device, dtype = src.dtype, generator = rng)
+        noise = torch.randn([src.size(0), 1, self.network.dim_ctx], device = src.device, dtype = src.dtype, generator = rng)
+        noise = self.noise_encoder(noise)
 
         # stochastic encoder
         for read in self.encoder:
@@ -96,4 +99,5 @@ class EinMask(torch.nn.Module):
         
         # predict masked locations
         tgt = self.predictor(tgt)
+        
         return tgt
