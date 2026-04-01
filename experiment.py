@@ -291,7 +291,7 @@ class Experiment(DistributedTrainer):
     
     def frcst_step(self, batch_idx, batch):
         visible = self.frcst_prefix.expand(batch.size(0), -1)
-        prediction = model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        prediction = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
         return prediction
 
@@ -318,20 +318,61 @@ class Experiment(DistributedTrainer):
         self.get_field_metrics(ds)
 
         if self.is_root:
-            plt.figure(figsize=(12,8))
-            plt.subplot(221)
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(222)
-            ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(223)
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(224)
-            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.savefig(self.model_dir / "test_sample.png")
-            plt.close()
+            self.make_eval_plots(ds)
 
         if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
             self.write_to_disk(ds)
+
+    def make_eval_plots(self, ds: xr.Dataset):
+        # SAMPLES
+        plt.figure(figsize=(12,12))
+        plt.subplot(321)
+        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        plt.subplot(322)
+        ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        plt.subplot(323)
+        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 0).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        plt.subplot(324)
+        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        plt.subplot(325)
+        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        plt.subplot(326)
+        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 3).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        plt.savefig(self.model_dir / "test_sample.png")
+        plt.close()
+
+        # RANK HIST
+        plt.figure(figsize=(12,4))
+        E = self.world.ens_size
+        ens = ds[f"temp_ocn_0a_pred"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, E)
+        obs = ds[f"temp_ocn_0a_tgt"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, 1)
+        rank_counts = np.bincount(np.sum(ens < obs, axis= -1), minlength= E + 1) / ens.shape[0]
+        plt.bar(np.arange(E + 1), rank_counts, alpha = 0.5)
+        plt.hlines(1 / (E + 1), 0, E, color="red", linestyle="dashed", linewidth=1)
+        plt.ylabel('Frequency')
+        plt.xlabel("Rank")
+        plt.savefig(self.model_dir / "rank_hist.png")
+        plt.close()
+
+        # ACC vs LAG
+        plt.figure(figsize=(12,4))
+        nino34_tgt, nino34_pred = self.get_nino34(ds["temp_ocn_0a_tgt"]), self.get_nino34(ds["temp_ocn_0a_pred"]).mean("ens")
+        nino4_tgt, nino4_pred = self.get_nino4(ds["temp_ocn_0a_tgt"]), self.get_nino4(ds["temp_ocn_0a_pred"]).mean("ens")
+        nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
+        nino4_pcc = self.xr_pcc(nino4_pred, nino4_tgt, ("time",))
+        pcc = self.xr_pcc(ds["temp_ocn_0a_pred"].mean('ens'), ds["temp_ocn_0a_tgt"], ('lat', 'lon')).mean(('time'))
+        plt.plot(ds.lag, nino34_pcc, label = 'nino3.4')
+        plt.plot(ds.lag, nino4_pcc, label = 'nino4')
+        plt.plot(ds.lag, pcc, label = 'SSTa')
+        plt.ylim(-1, 1)
+        plt.hlines(0.5, ds.lag[0], ds.lag[-1], colors='r', linestyles='dashed')
+        plt.legend()
+        plt.xlabel("Lag")
+        plt.ylabel("Correlation")
+        plt.tight_layout()
+        plt.savefig(self.model_dir / "skill.png")
+        plt.close()
+
 
     def write_to_disk(self, data: xr.Dataset):
         path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
@@ -434,13 +475,14 @@ class Experiment(DistributedTrainer):
         }
         return metrics
 
+
     @staticmethod
     def get_nino4(da: xr.DataArray):
-        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
     
     @staticmethod
     def get_nino34(da: xr.DataArray):
-        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat']).rolling(time = 3).mean()
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
 
     @staticmethod
     def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
