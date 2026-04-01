@@ -61,17 +61,31 @@ class EinAttention(torch.nn.Module):
         return self.to_out(A)
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_kv: Optional[int] = None, num_heads: Optional[int] = None) -> None:
+    def __init__(self, dim: int, dim_kv: Optional[int] = None, dim_ctx: Optional[int] = None, num_heads: Optional[int] = None) -> None:
         super().__init__()
-        self.attn_norm = torch.nn.RMSNorm(dim)
-        self.ffn_norm = torch.nn.RMSNorm(dim)
-        self.att = EinAttention(dim, num_heads=num_heads, dim_kv= dim_kv)
-        self.ffn = GatedFFN(dim=dim)
+        self.attn_norm = AdaptiveLayerNorm(dim, dim_ctx = dim_ctx)
+        self.ffn_norm = AdaptiveLayerNorm(dim, dim_ctx = dim_ctx)
+        self.att = EinAttention(dim, num_heads = num_heads, dim_kv = dim_kv)
+        self.ffn = GatedFFN(dim = dim)
 
-    def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None):
-        x = x + self.att(self.attn_norm(x), kv = kv) 
-        x = x + self.ffn(self.ffn_norm(x)) 
+    def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None, ctx: Optional[torch.FloatTensor] = None):
+        x = x + self.att(self.attn_norm(x, ctx = ctx), kv = kv) 
+        x = x + self.ffn(self.ffn_norm(x, ctx = ctx)) 
         return x
+    
+class AdaptiveLayerNorm(torch.nn.Module):
+    def __init__(self, dim: int, dim_ctx: int = None):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
+        self.weight = torch.nn.Parameter(torch.zeros((dim * 2, dim_ctx))) if exists(dim_ctx) else None
+        self.bias = torch.nn.Parameter(torch.zeros(dim * 2))
+
+    def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if exists(ctx):
+            scale, shift = torch.nn.functional.linear(ctx, self.weight, self.bias)
+        else:
+            scale, shift = self.bias.chunk(2, dim = -1)
+        return (1. + scale) * self.norm(x) + shift
 
 class FieldDecoder(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
