@@ -82,7 +82,7 @@ class AdaptiveLayerNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
         if exists(ctx):
-            scale, shift = torch.nn.functional.linear(ctx, self.weight, self.bias)
+            scale, shift = torch.nn.functional.linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
         else:
             scale, shift = self.bias.chunk(2, dim = -1)
         return (1. + scale) * self.norm(x) + shift

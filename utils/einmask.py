@@ -4,7 +4,6 @@ import torch
 from einops.layers.torch import *
 from utils.config import *
 from utils.components import *
-from torch.nn.functional import softplus
 
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
@@ -69,18 +68,18 @@ class EinMask(torch.nn.Module):
     def forward(self, 
                 fields: torch.FloatTensor, 
                 visible: torch.BoolTensor, 
-                members: Optional[int] = None,
+                members: int = 1,
                 rng: Optional[torch.Generator] = None,
                 ) -> torch.FloatTensor:
         # tokenize
         tokens = self.tokenizer(fields) + self.positions
 
         # encode visible tokens only
-        src = einops.rearrange(tokens[visible], '(b n) d -> b n d', b = tokens.size(0), d = tokens.size(-1))
+        src = einops.rearrange(tokens[visible], '(b n) d -> b n d', b = tokens.size(0))
 
         # ensemble expansion
-        src = einops.repeat(src, 'b n d -> (b e) n d', e = default(members, 1))
-        visible = einops.repeat(visible, 'b n -> (b e) n ()', e = default(members, 1))
+        src = einops.repeat(src, 'b n d -> (b e) n d', e = members)
+        visible = einops.repeat(visible, 'b n -> (b e) n ()', e = members)
 
         # functional noise
         noise = torch.randn([src.size(0), 1, self.network.dim_ctx], device = src.device, dtype = src.dtype, generator = rng)
@@ -92,12 +91,13 @@ class EinMask(torch.nn.Module):
 
         # pad with mask tokens
         tgt = torch.masked_scatter(
-            input = (self.mask_token + self.positions).type_as(src),
+            input = self.mask_token.type_as(src),
             mask = visible, # where visible is True
             source = src # copy src elements over
             )
-        
+        tgt = tgt + self.positions
+
         # predict masked locations
         tgt = self.predictor(tgt)
-        
-        return tgt
+
+        return einops.rearrange(tgt, '(b e) ... -> b ... e', e = members)

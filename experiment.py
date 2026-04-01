@@ -264,27 +264,24 @@ class Experiment(DistributedTrainer):
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
 
-    def forward_step(self, batch_idx, batch):
-        B = batch.size(0)
-        model = self.model if (self.mode == 'train' or not self.cfg.use_ema) else self.ema_model
-        
+    def forward_step(self, batch_idx, batch):        
         # sample visible and masked
-        all_visible = torch.ones((B, self.world.num_tokens), dtype = torch.bool, device = self.device)
-        visible, masked = self.prior(B, rng = self.generator)
+        visible, masked = self.prior(batch.size(0), rng = self.generator)
 
-        # foward model
-        z_hat = model(batch, visible)
+        # foward model and zero out land
+        prediction = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        prediction = prediction * self.land_sea_mask[..., None]
 
-        # ema model
-        with torch.no_grad():
-            z_target = self.ema_model.module.encode(batch, all_visible)
-
-        # masked L1 loss
-        loss = (z_hat - z_target).abs()[masked].mean()
+        # loss only on masked & sea
+        mask = einops.repeat(masked, 
+                             f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes
+                             )
+        mask = torch.logical_and(mask, self.land_sea_mask)
+        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask)
 
         # track metrics
-        with torch.autocast(device_type=self.device.type, enabled=False):
-            metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked)
+        metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask = mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
 
@@ -293,102 +290,52 @@ class Experiment(DistributedTrainer):
         return loss
     
     def frcst_step(self, batch_idx, batch):
-        B = batch.size(0)
-        
-        # frcst visible and masked
-        all_visible = torch.ones((B, self.world.num_tokens), dtype = torch.bool, device = self.device)
-        visible = self.frcst_prefix.expand(B, -1)
-        masked = self.frcst_prefix.logical_not().expand(B, -1)
+        visible = self.frcst_prefix.expand(batch.size(0), -1)
+        prediction = model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        prediction = prediction * self.land_sea_mask[..., None]
+        return prediction
 
-        # foward model
-        z_hat = self.ema_model(batch, visible)
-        z_target = self.ema_model.module.encode(batch, all_visible)
-
-        # loss
-        loss = (z_hat - z_target).abs()[masked].mean()
-
-        # track metrics
-        with torch.autocast(device_type=self.device.type, enabled=False):
-            metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked, mode = "frcst")
-        
-        self.log_metrics(metrics)
-        return loss
-    
-    # JEPA eval
-
-    def jepa_metrics(self, z_hat: torch.FloatTensor, z_target: torch.FloatTensor, mask: torch.BoolTensor, mode: str = ''):
-        D = z_hat.size(-1)
-        hat, tgt = z_hat[mask], z_target[mask]
-
-        cov = einops.rearrange([hat, tgt], 'two ... d -> (two d) (...)').cov()
-
-        metrics = {
-            f'pr_hat_{mode}': self.participation_ratio(cov[:D, :D]).item(),
-            f'pr_tgt_{mode}': self.participation_ratio(cov[D:, D:]).item(),
-            f'pr_x_{mode}': self.participation_ratio(cov[:D, D:]).item(),
-            f'cos_sim_{mode}': torch.nn.functional.cosine_similarity(hat, tgt, dim=-1).mean().item(),
-            f'norm_ratio_{mode}': hat.norm(dim=-1).mean().div(tgt.norm(dim=-1).mean()).item(),
-            f'dead_hat_{mode}': (cov[:D, :D].diagonal() < 1e-3).float().mean().item(),
-            f'dead_tgt_{mode}': (cov[D:, D:].diagonal() < 1e-3).float().mean().item(),
-        }
-        return metrics
-
-    @staticmethod
-    def participation_ratio(cov: torch.FloatTensor):
-        return cov.trace().pow(2).div(cov.pow(2).trace() + 1e-5)
-
-    
+    #EVAL
     def evaluate_epoch(self):
+        super().evaluate_epoch()
+        self.evaluate_frcst()
+
+    def evaluate_frcst(self):
         self.switch_mode(train=False)
         if not exists(self.val_dl):
             return
+        samples = []
         for batch_idx, batch in enumerate(self.val_dl):
             batch = batch.to(self.device)
             with torch.no_grad():
-                with torch.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                    _ = self.forward_step(batch_idx, batch)
-                    _ = self.frcst_step(batch_idx, batch)
-    # EVAL
-    # def evaluate_epoch(self):
-    #     super().evaluate_epoch()
-    #     self.evaluate_frcst()
+                with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+                    prediction = self.frcst_step(batch_idx, batch)
+                    samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
 
-    # def evaluate_frcst(self):
-    #     self.switch_mode(train=False)
-    #     if not exists(self.val_dl):
-    #         return
-    #     samples = []
-    #     for batch_idx, batch in enumerate(self.val_dl):
-    #         batch = batch.to(self.device)
-    #         with torch.no_grad():
-    #             with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-    #                 prediction = self.frcst_step(batch_idx, batch)
-    #                 samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
+        ds = xr.concat(samples, dim = "time")
+        ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
+        self.get_nino_metrics(ds)
+        self.get_field_metrics(ds)
 
-    #     ds = xr.concat(samples, dim = "time")
-    #     ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
-    #     self.get_nino_metrics(ds)
-    #     self.get_field_metrics(ds)
+        if self.is_root:
+            plt.figure(figsize=(12,8))
+            plt.subplot(221)
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(222)
+            ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(223)
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(224)
+            ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.savefig(self.model_dir / "test_sample.png")
+            plt.close()
 
-    #     if self.is_root:
-    #         plt.figure(figsize=(12,8))
-    #         plt.subplot(221)
-    #         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
-    #         plt.subplot(222)
-    #         ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-    #         plt.subplot(223)
-    #         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-    #         plt.subplot(224)
-    #         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-    #         plt.savefig(self.model_dir / "test_sample.png")
-    #         plt.close()
+        if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
+            self.write_to_disk(ds)
 
-    #     if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
-    #         self.write_to_disk(ds)
-
-    # def write_to_disk(self, data: xr.Dataset):
-    #     path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
-    #     data.to_zarr(path, mode = "w")
+    def write_to_disk(self, data: xr.Dataset):
+        path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
+        data.to_zarr(path, mode = "w")
 
     def get_xarray_dataset(self, batch_idx, pred, obs):
         #meta data
