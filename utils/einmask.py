@@ -30,6 +30,7 @@ class EinMask(torch.nn.Module):
         self.predictor = torch.nn.Sequential(
             torch.nn.Linear(network.dim_in, network.dim, bias = False),
             *[TransformerBlock(dim= network.dim) for _ in range(default(network.num_compute_blocks, 1))],
+            torch.nn.RMSNorm(network.dim),
             torch.nn.Linear(network.dim, network.dim_in, bias = False)
         )
 
@@ -62,6 +63,7 @@ class EinMask(torch.nn.Module):
     def forward(self, 
                 fields: torch.FloatTensor, 
                 visible: torch.BoolTensor, 
+                **kwargs: dict
                 ) -> torch.FloatTensor:
         src = self.encode(fields, visible)
         tgt = self.predict(src, visible)
@@ -85,12 +87,13 @@ class EinMask(torch.nn.Module):
                 src: torch.FloatTensor, 
                 visible: torch.BoolTensor, 
                 ) -> torch.FloatTensor:
-        # pad with mask tokens
         tgt = torch.masked_scatter(
-            input = (self.mask_token + self.positions).type_as(src), # for all positions
+            input = self.mask_token.type_as(src), # pad with mask tokens
             mask = visible[..., None], # if visible is True
             source = src # copy src elements over
-            ) # else keep mask token + position code
+            )
+        # add position codes
+        tgt = tgt + self.positions
         
         # predict masked locations
         tgt = self.predictor(tgt)

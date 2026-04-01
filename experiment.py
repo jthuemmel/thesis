@@ -283,9 +283,9 @@ class Experiment(DistributedTrainer):
         loss = (z_hat - z_target).abs()[masked].mean()
 
         # track metrics
-        metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked)
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked)
         metrics['loss'] = loss.item()
-        
         self.log_metrics(metrics)
 
         # update step counter if training
@@ -308,33 +308,34 @@ class Experiment(DistributedTrainer):
         loss = (z_hat - z_target).abs()[masked].mean()
 
         # track metrics
-        metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked)
-        metrics['frcst_loss'] = loss.item()
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            metrics = self.jepa_metrics(z_hat.detach(), z_target.detach(), masked, mode = "frcst")
         
         self.log_metrics(metrics)
         return loss
     
     # JEPA eval
 
-    def jepa_metrics(self, z_hat: torch.FloatTensor, z_target: torch.FloatTensor, mask: torch.BoolTensor):
+    def jepa_metrics(self, z_hat: torch.FloatTensor, z_target: torch.FloatTensor, mask: torch.BoolTensor, mode: str = ''):
         D = z_hat.size(-1)
         hat, tgt = z_hat[mask], z_target[mask]
-        combined = einops.rearrange([hat, tgt], 'two ... d -> (two d) (...)')
-        cov = torch.cov(combined)
+
+        cov = einops.rearrange([hat, tgt], 'two ... d -> (two d) (...)').cov()
+
         metrics = {
-            'pr_hat':     self.participation_ratio(cov[:D, :D]).item(),
-            'pr_tgt':     self.participation_ratio(cov[D:, D:]).item(),
-            'pr_x':       self.participation_ratio(cov[:D, D:]).item(),
-            'cos_sim':    torch.nn.functional.cosine_similarity(hat, tgt, dim=-1).mean().item(),
-            'norm_ratio': hat.norm(dim=-1).mean().div(tgt.norm(dim=-1).mean()).item(),
-            'dead_hat':   (cov[:D, :D].diagonal() < 1e-3).float().mean().item(),
-            'dead_tgt':   (cov[D:, D:].diagonal() < 1e-3).float().mean().item(),
+            f'pr_hat_{mode}': self.participation_ratio(cov[:D, :D]).item(),
+            f'pr_tgt_{mode}': self.participation_ratio(cov[D:, D:]).item(),
+            f'pr_x_{mode}': self.participation_ratio(cov[:D, D:]).item(),
+            f'cos_sim_{mode}': torch.nn.functional.cosine_similarity(hat, tgt, dim=-1).mean().item(),
+            f'norm_ratio_{mode}': hat.norm(dim=-1).mean().div(tgt.norm(dim=-1).mean()).item(),
+            f'dead_hat_{mode}': (cov[:D, :D].diagonal() < 1e-3).float().mean().item(),
+            f'dead_tgt_{mode}': (cov[D:, D:].diagonal() < 1e-3).float().mean().item(),
         }
         return metrics
 
     @staticmethod
     def participation_ratio(cov: torch.FloatTensor):
-        return cov.trace().pow(2).div(cov.pow(2).sum() + 1e-9)
+        return cov.trace().pow(2).div(cov.pow(2).trace() + 1e-5)
 
     
     def evaluate_epoch(self):
