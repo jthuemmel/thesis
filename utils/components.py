@@ -60,32 +60,36 @@ class EinAttention(torch.nn.Module):
         A = torch.nn.functional.scaled_dot_product_attention(self.norm_qk(Q), self.norm_qk(K), V)
         return self.to_out(A)
 
-class TransformerBlock(torch.nn.Module):
+class AdaTransformerBlock(torch.nn.Module):
     def __init__(self, dim: int, dim_kv: Optional[int] = None, dim_ctx: Optional[int] = None, num_heads: Optional[int] = None) -> None:
         super().__init__()
-        self.attn_norm = AdaptiveLayerNorm(dim, dim_ctx = dim_ctx)
-        self.ffn_norm = AdaptiveLayerNorm(dim, dim_ctx = dim_ctx)
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
+        self.weight = torch.nn.Parameter(torch.zeros((dim * 6, dim_ctx))) if exists(dim_ctx) else None
+        self.bias = torch.nn.Parameter(torch.zeros(dim * 6))
         self.att = EinAttention(dim, num_heads = num_heads, dim_kv = dim_kv)
         self.ffn = GatedFFN(dim = dim)
 
+    def modulate(self, x: torch.FloatTensor, a: torch.FloatTensor, b: torch.FloatTensor):
+        return (1. + a) * self.norm(x) + b
+
     def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None, ctx: Optional[torch.FloatTensor] = None):
-        x = x + self.att(self.attn_norm(x, ctx = ctx), kv = kv) 
-        x = x + self.ffn(self.ffn_norm(x, ctx = ctx)) 
+        affine = (torch.nn.functional.linear(ctx, self.weight, self.bias) if exists(self.weight) else self.bias).chunk(6, dim = -1)
+        x = x + self.att(self.modulate(x, affine[0], affine[1]), kv = kv) * affine[2]
+        x = x + self.ffn(self.modulate(x, affine[3], affine[4])) * affine[5]
         return x
     
-class AdaptiveLayerNorm(torch.nn.Module):
-    def __init__(self, dim: int, dim_ctx: int = None):
+class TransformerBlock(torch.nn.Module):
+    def __init__(self, dim: int, dim_kv: Optional[int] = None, num_heads: Optional[int] = None) -> None:
         super().__init__()
-        self.norm = torch.nn.LayerNorm(dim, elementwise_affine = False)
-        self.weight = torch.nn.Parameter(torch.zeros((dim * 2, dim_ctx))) if exists(dim_ctx) else None
-        self.bias = torch.nn.Parameter(torch.zeros(dim * 2))
+        self.attn_norm = torch.nn.RMSNorm(dim)
+        self.ffn_norm = torch.nn.RMSNorm(dim)
+        self.att = EinAttention(dim, num_heads = num_heads, dim_kv = dim_kv)
+        self.ffn = GatedFFN(dim = dim)
 
-    def forward(self, x: torch.Tensor, ctx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if exists(self.weight):
-            scale, shift = torch.nn.functional.linear(ctx, self.weight, self.bias).chunk(2, dim = -1)
-        else:
-            scale, shift = self.bias.chunk(2, dim = -1)
-        return (1. + scale) * self.norm(x) + shift
+    def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None):
+        x = x + self.att(self.attn_norm(x), kv = kv) 
+        x = x + self.ffn(self.ffn_norm(x)) 
+        return x
 
 class FieldDecoder(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
