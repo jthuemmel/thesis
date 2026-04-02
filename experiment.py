@@ -281,7 +281,7 @@ class Experiment(DistributedTrainer):
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask)
 
         # track metrics
-        metrics = self.compute_metrics(ens = prediction.detach(), obs = batch, mask = mask)
+        metrics = self.compute_metrics(ens = prediction.float().detach(), obs = batch.float().detach(), mask = mask)
         metrics['loss'] = loss.item()
         self.log_metrics(metrics)
 
@@ -364,7 +364,7 @@ class Experiment(DistributedTrainer):
         plt.plot(ds.lag, nino34_pcc, label = 'nino3.4')
         plt.plot(ds.lag, nino4_pcc, label = 'nino4')
         plt.plot(ds.lag, pcc, label = 'SSTa')
-        plt.ylim(-1, 1)
+        plt.ylim(0, 1)
         plt.hlines(0.5, ds.lag[0], ds.lag[-1], colors='r', linestyles='dashed')
         plt.legend()
         plt.xlabel("Lag")
