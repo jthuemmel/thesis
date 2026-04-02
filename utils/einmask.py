@@ -12,7 +12,6 @@ class EinMask(torch.nn.Module):
         self.world = world
 
         # learnable parameters
-        self.global_tokens = torch.nn.Parameter(torch.zeros((default(network.num_latents, 1), network.dim_in)))
         self.mask_token = torch.nn.Parameter(torch.zeros((network.dim_in,)))
         self.position_codes = torch.nn.Parameter(self.init_sincos_positions(network.dim_in))
 
@@ -27,14 +26,14 @@ class EinMask(torch.nn.Module):
         # Encoder
         self.noise_encoder = GatedFFN(network.dim_ctx)
         self.encoder = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim_in, dim_ctx= network.dim_ctx, num_heads= network.num_encoder_heads) 
+              TransformerBlock(dim= network.dim_in, num_heads= network.num_encoder_heads) 
               for _ in range(default(network.num_read_blocks, 1))
               ])
         
         # Mask decoder
         self.to_decoder = torch.nn.Linear(network.dim_in, network.dim_out, bias = False)
         self.decoder = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim_out, dim_ctx= None, num_heads= network.num_decoder_heads) 
+              TransformerBlock(dim= network.dim_out, dim_ctx = network.dim_ctx, num_heads= network.num_decoder_heads) 
               for _ in range(default(network.num_write_blocks, 1))
               ])
 
@@ -81,7 +80,6 @@ class EinMask(torch.nn.Module):
             if exists(m.weight):
                 torch.nn.init.trunc_normal_(m.weight, std = 1e-5)
         elif isinstance(m, EinMask):
-            torch.nn.init.trunc_normal_(m.global_tokens, std = 0.02)
             torch.nn.init.trunc_normal_(m.mask_token, std = 0.02)
     
     def forward(self, 
@@ -90,47 +88,34 @@ class EinMask(torch.nn.Module):
                 members: int = 1,
                 rng: Optional[torch.Generator] = None,
                 ) -> torch.FloatTensor:
+        B = visible.size(0)
         # tokenize
         tokens = self.field_encoder(fields) + self.position_codes
 
-        # select visible and expand to ensemble size
-        src = einops.repeat(tokens[visible], '(b n) d -> (b e) n d', e = members, b = tokens.size(0))
-        visible = einops.repeat(visible, 'b n -> (b e) n ()', e = members)
-        latents = einops.repeat(self.global_tokens, 'm d -> b m d', b = src.size(0))
-
-        # stochastic conditioning
-        noise = torch.randn([src.size(0), 1, self.network.dim_ctx], device = src.device, dtype = src.dtype, generator = rng)
-        noise = self.noise_encoder(noise)
-
-        # add global latent tokens
-        src, ps = einops.pack([src, latents], 'b * d')
-
-        # encode(visible tokens | noise)
+        # encode visible
+        src = einops.rearrange(tokens[visible], '(b n) d -> b n d', b = B)
         for read in self.encoder:
-            src = read(src, ctx = noise)
-        
-        # unpack latents before scatter
-        src, latents = einops.unpack(src, ps, 'b * d')
+            src = read(src)
 
         # pad with mask tokens
+        tgt = (self.mask_token + self.position_codes).type_as(src)
         tgt = torch.masked_scatter(
-            input = self.mask_token.type_as(src),
-            mask = visible, # where visible is True
+            input = tgt, # for all masked locations
+            mask = visible[..., None], # where visible is True
             source = src # copy src elements over
             )
-        
-        # pack latents again
-        tgt, ps = einops.pack([tgt + self.position_codes, latents], 'b * d')
+    
+        # stochastic conditioning
+        tgt = einops.repeat(tgt, 'b n d -> (b e) n d', e = members)
+        noise = torch.randn([B * members, 1, self.network.dim_ctx], device = tgt.device, dtype = tgt.dtype, generator = rng)
+        noise = self.noise_encoder(noise)
 
-        # decode all tokens
+        # decode (all tokens | noise)
         tgt = self.to_decoder(tgt)
         for write in self.decoder:
-            tgt = write(tgt)
-
-        # unpack latents again
-        tgt, _ = einops.unpack(tgt, ps, 'b * d')
+            tgt = write(tgt, ctx = noise)
 
         # tokens -> field and ensemble -> last
         tgt = self.field_decoder(tgt)
-        tgt = einops.rearrange(tgt, '(b e) ... -> b ... e', e = members)
+        tgt = einops.rearrange(tgt, '(b e) ... -> b ... e', b = B)
         return tgt
