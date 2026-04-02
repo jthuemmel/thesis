@@ -343,7 +343,7 @@ class Experiment(DistributedTrainer):
 
         # RANK HIST
         plt.figure(figsize=(12,4))
-        E = self.world.ens_size
+        E = len(ds.ens)
         ens = ds[f"temp_ocn_0a_pred"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, E)
         obs = ds[f"temp_ocn_0a_tgt"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, 1)
         rank_counts = np.bincount(np.sum(ens < obs, axis= -1), minlength= E + 1) / ens.shape[0]
