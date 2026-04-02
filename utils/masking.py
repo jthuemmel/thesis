@@ -75,21 +75,25 @@ class BinaryMasking(torch.nn.Module):
             P += U.log().div(alpha)
         return P
 
-    def rate_prior(self, B: int, rng: torch.Generator = None):
-        a_min = self.rate_cfg.get('min', 0)
-        a_max = self.rate_cfg.get('max', 1)
-        if self.rate_cfg.get('stratify', False):
-            U = self.stratified_uniform_(B, rng)
-        elif self.rate_cfg.get('randomize', False):
-            U = self.uniform_((B,), rng)
-        else:
-            U = self.uniform_((1,), rng).expand(B,)
-        R = U * (a_max - a_min) + a_min
-        return R.mul(self.world.num_tokens).long().unsqueeze(-1)
+    def rate_prior(self, rng: torch.Generator = None):
+        R = torch.empty((1,), device = self.device)
+        torch.nn.init.trunc_normal_(
+            R, 
+            self.rate_cfg.get("mean", 0.5), 
+            self.rate_cfg.get("std", 1.),
+            self.rate_cfg.get("a", 0.),
+            self.rate_cfg.get("b", 1.),
+            generator = rng
+            )
+            # a_min = self.rate_cfg.get('a', 0)
+            # a_max = self.rate_cfg.get('b', 1)
+            # U = self.uniform_((1,), rng)
+            # R = U * (a_max - a_min) + a_min
+        return R.mul(self.world.num_tokens).long()
 
     def forward(self, B: int, conditional: torch.Tensor = None, rng: torch.Generator = None) -> torch.BoolTensor:
         B = B[0] if isinstance(B, tuple) else B
-        K = self.rate_prior(B, rng)
+        K = self.rate_prior(rng)
         P = self.event_prior(B, rng)
         if exists(conditional): P += conditional.type_as(P).clamp(min=1e-9).log()
         return self.binary_topk_(P, K)
