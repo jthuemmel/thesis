@@ -36,7 +36,8 @@ class EinAttention(torch.nn.Module):
         num_heads = default(num_heads, max(dim_q // dim_heads, 1))
         dim_kv = default(dim_kv, dim_q)
 
-        self.norm_qk = torch.nn.RMSNorm(dim_heads)
+        self.norm_q = torch.nn.RMSNorm(dim_heads)
+        self.norm_k = torch.nn.RMSNorm(dim_heads)
         self.to_q = EinMix(
             '... nq dq -> ... nh nq dh',
             weight_shape='dq nh dh',
@@ -55,9 +56,9 @@ class EinAttention(torch.nn.Module):
 
     def forward(self, q: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None):
         kv = default(kv, q)
-        K, V = self.to_kv(kv)
+        KV = self.to_kv(kv)
         Q = self.to_q(q)
-        A = torch.nn.functional.scaled_dot_product_attention(self.norm_qk(Q), self.norm_qk(K), V)
+        A = torch.nn.functional.scaled_dot_product_attention(self.norm_q(Q), self.norm_k(KV[0]), KV[1])
         return self.to_out(A)
 
 class AdaTransformerBlock(torch.nn.Module):
@@ -92,14 +93,14 @@ class TransformerBlock(torch.nn.Module):
         return x
 
 class FieldDecoder(torch.nn.Module):
-    def __init__(self, network: NetworkConfig, world: WorldConfig):
+    def __init__(self, dim: int, world: WorldConfig):
         super().__init__()
         self.world = world
         self.to_fields = EinMix(
-            f'b ({world.token_pattern}) do -> (b k) ({world.flat_pattern})',
-            weight_shape=f'k v {world.patch_pattern} do',
+            f'b ({world.token_pattern}) d -> b ({world.flat_pattern})',
+            weight_shape=f'v {world.patch_pattern} d',
             **world.token_sizes, **world.kernel_sizes, 
-            do= network.dim_out, k = default(network.num_tails, 1)
+            d= dim
             )
 
         self.unflatten_fields = Rearrange(
@@ -107,9 +108,6 @@ class FieldDecoder(torch.nn.Module):
             **world.token_sizes, **world.patch_sizes
             )
 
-        self._build_fold_index(world)
-
-    def _build_fold_index(self, world: WorldConfig):
         ts = world.token_sizes
         ks = world.kernel_sizes
         
