@@ -1,7 +1,7 @@
 import einops
 import torch
 
-from einops.layers.torch import EinMix
+from einops.layers.torch import EinMix, Rearrange
 from utils.config import *
 from utils.components import *
 
@@ -12,29 +12,31 @@ class EinMask(torch.nn.Module):
         self.world = world
 
         # learnable parameters
-        self.latent_tokens = torch.nn.Embedding(network.num_latents, network.dim_in)
-        self.mask_token = torch.nn.Embedding(2, network.dim_out)
+        self.latent_tokens = torch.nn.Parameter(torch.zeros((network.num_latents, network.dim)))
         self.tgt_positions = torch.nn.Parameter(self.init_sincos_positions(network.dim_out))
         self.src_positions = torch.nn.Parameter(self.init_sincos_positions(network.dim_in))
 
-        # I/O
-        self.field_encoder = EinMix(
-            pattern = f'b {world.field_pattern} -> b ({world.token_pattern}) di', 
-            weight_shape= f'v {world.patch_pattern} di',
-            **world.patch_sizes, **world.token_sizes, di = network.dim_in
-            )
-        self.field_decoder = FieldDecoder(network, world)
+        # I/O        
+        self.src_encoder = EinMix(pattern = f'b {world.field_pattern} -> b ({world.token_pattern}) d', 
+                   weight_shape= f'v {world.patch_pattern} d',
+                   **world.patch_sizes, **world.token_sizes, d = network.dim_in
+                )
+        self.tgt_decoder = FieldDecoder(network.dim_out, world = world, num_tails= network.num_tails)
+
         
-        # Encoder
+        # Transformer
         self.encoder = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim_in, num_heads= network.num_encoder_heads) 
+              TransformerBlock(dim= network.dim, dim_kv = network.dim_in, num_heads= network.num_encoder_heads) 
               for _ in range(default(network.num_read_blocks, 1))
               ])
         
-        # Mask decoder
-        self.to_decoder = torch.nn.Sequential(torch.nn.Linear(network.dim_in, network.dim_out, bias = False), torch.nn.RMSNorm(network.dim_out))
+        self.processor = torch.nn.ModuleList([
+              TransformerBlock(dim= network.dim) 
+              for _ in range(default(network.num_compute_blocks, 1))
+              ])
+        
         self.decoder = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim_out, num_heads= network.num_decoder_heads) 
+              TransformerBlock(dim= network.dim_out, dim_kv = network.dim, num_heads= network.num_decoder_heads) 
               for _ in range(default(network.num_write_blocks, 1))
               ])
 
@@ -75,25 +77,38 @@ class EinMask(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
             if exists(m.bias):
                 torch.nn.init.zeros_(m.bias)
-    
+        # einmask
+        elif isinstance(m, EinMask):
+            torch.nn.init.trunc_normal_(m.latent_tokens, std = 0.02)
+   
     def forward(self, 
                 fields: torch.FloatTensor, 
-                visible: torch.BoolTensor, 
+                visible: torch.BoolTensor,
                 **kwargs
                 ) -> torch.FloatTensor:
+        latents = self.encode(fields, visible) # variable-size cannot run compiled
+        tgt = self.predict(latents) # fixed-size can
+        return tgt
+    
+    def encode(self, fields: torch.FloatTensor, visible: torch.BoolTensor,):
         B = visible.size(0)
-        tokens = self.field_encoder(fields) + self.src_positions
-
-        src = einops.rearrange(tokens[visible], '(b n) d -> b n d', b = B)
-        latents = einops.repeat(self.latent_tokens.weight, 'z d -> b z d', b = B)
+        tokens = self.src_encoder(fields) + self.src_positions
+        src = einops.rearrange(tokens[visible], '(b m) d -> b m d', b = B) # select visible tokens
+        latents = einops.repeat(self.latent_tokens, 'z d -> b z d', b = B)
         for read in self.encoder:
-            latents = read(latents, kv = torch.cat([latents, src], dim = 1))
-            
-        latents = self.to_decoder(latents)
-        tgt = self.mask_token(visible.long()) + self.tgt_positions
-        for write in self.decoder:
-            tgt = write(tgt, kv = torch.cat([latents, tgt], dim = 1))
+            latents = read(latents, kv = src)
+        return latents
 
-        tgt = self.field_decoder(tgt)
+    @torch.compile()
+    def predict(self, latents: torch.FloatTensor):
+        B = latents.size(0)
+        # latent processor
+        for compute in self.processor:
+            latents = compute(latents)
+        # Decoder
+        tgt = einops.repeat(self.tgt_positions, 'n d -> b n d', b= B)
+        for write in self.decoder:
+            tgt = write(tgt, kv = latents)
+        tgt = self.tgt_decoder(tgt)
         tgt = einops.rearrange(tgt, '(b e) ... -> b ... e', b = B)
         return tgt

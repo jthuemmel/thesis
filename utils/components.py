@@ -33,8 +33,9 @@ class GatedFFN(torch.nn.Module):
 class EinAttention(torch.nn.Module):
     def __init__(self, dim_q: int, dim_kv: Optional[int] = None, num_heads: Optional[int] = None, dim_heads: int = 64) -> None:
         super().__init__()
-        num_heads = default(num_heads, max(dim_q // dim_heads, 1))
         dim_kv = default(dim_kv, dim_q)
+        num_heads = default(num_heads, max(dim_q // dim_heads, dim_kv // dim_heads, 1))
+        
 
         self.norm_q = torch.nn.RMSNorm(dim_heads)
         self.norm_k = torch.nn.RMSNorm(dim_heads)
@@ -93,24 +94,24 @@ class TransformerBlock(torch.nn.Module):
         return x
 
 class FieldDecoder(torch.nn.Module):
-    def __init__(self, dim: int, world: WorldConfig):
+    def __init__(self, dim: int, world: WorldConfig, num_tails: Optional[int] = 1):
         super().__init__()
         self.world = world
+        ts = world.token_sizes
+        ks = world.kernel_sizes
+        ps = world.patch_sizes
+
         self.to_fields = EinMix(
-            f'b ({world.token_pattern}) d -> b ({world.flat_pattern})',
-            weight_shape=f'v {world.patch_pattern} d',
-            **world.token_sizes, **world.kernel_sizes, 
-            d= dim
+            f'b ({world.token_pattern}) d -> (b k) ({world.flat_pattern})',
+            weight_shape=f'k v {world.patch_pattern} d',
+            **ts, **ks, d= dim, k = num_tails
             )
 
         self.unflatten_fields = Rearrange(
             f'b ({world.flat_pattern}) -> b {world.field_pattern}',
-            **world.token_sizes, **world.patch_sizes
+            **ts, **ps
             )
-
-        ts = world.token_sizes
-        ks = world.kernel_sizes
-        
+      
         grid_strides = {}
         acc = 1
         for ax in reversed(world.layout):
@@ -120,7 +121,7 @@ class FieldDecoder(torch.nn.Module):
         idx = torch.zeros([*ts.values(), *ks.values()], dtype=torch.long)
 
         for ax in world.layout:
-            n0 = torch.arange(ts[ax]) * world.patch_sizes[2*ax]
+            n0 = torch.arange(ts[ax]) * ps[2*ax]
             dp = torch.arange(ks[2*ax])
             n0 = einops.repeat(n0, f'{ax} -> {world.token_pattern} {world.patch_pattern}', **ts, **ks)
             dp = einops.repeat(dp, f'{2*ax} -> {world.token_pattern} {world.patch_pattern}', **ts, **ks)
@@ -128,6 +129,7 @@ class FieldDecoder(torch.nn.Module):
 
         self.register_buffer('idx', idx.flatten())
 
+    @torch.compile()
     def forward(self, tgt: torch.FloatTensor):
         tgt = self.to_fields(tgt)
         predicted_fields = torch.scatter_reduce(

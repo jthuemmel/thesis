@@ -16,6 +16,7 @@ import utils.config as cfg
 from utils.dataset import NinoData, MultifileNinoDataset
 from utils.trainer import DistributedTrainer
 from utils.einmask import EinMask
+from utils.einvae import EinVAE
 from utils.masking import *
 from utils.loss_fn import *
 
@@ -207,7 +208,8 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self):
-        model = EinMask(network=self.model_cfg, world=self.world)
+        #model = EinMask(network=self.model_cfg, world=self.world)
+        model = EinVAE(self.model_cfg.dim_in, self.world)
         return model
 
     # LOSS
@@ -264,14 +266,36 @@ class Experiment(DistributedTrainer):
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
 
-    def forward_step(self, batch_idx, batch):        
+    def forward_step(self, batch_idx, batch):
+        x_hat, kl = self.model(batch, members = self.world.ens_size, rng = self.generator)
+
+        with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
+            e_fft = torch.fft.rfftn(x_hat.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
+            o_fft = torch.fft.rfftn(batch.float(), dim = (-1, -2, -3))
+        spectral = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = x_hat.size(-1) > 1).mean()
+        crps = f_kernel_crps(observation = batch, ensemble = x_hat, fair = x_hat.size(-1) > 1)[:, self.land_sea_mask].mean()
+        loss = crps + self.model_cfg.kwargs.get('beta', 1.) * kl + spectral * self.cfg.spectral_loss_weight
+
+        metrics = {}
+        metrics['spectral_crps'] = spectral.item()
+        metrics['rmse'] = self.compute_rmse(x_hat.detach().mean(-1)[:, self.land_sea_mask], batch[:, self.land_sea_mask]).item()
+        metrics['acc'] = self.compute_acc(x_hat.detach().mean(-1)[:, self.land_sea_mask], batch[:, self.land_sea_mask]).item()
+        metrics['loss'] = loss.item()
+        metrics['crps'] = crps.item()
+        metrics['kl'] = kl.item()
+        self.log_metrics(metrics)
+        # update step counter if training
+        self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
+        return loss
+
+    def mtm_step(self, batch_idx, batch):        
         # sample visible and masked
         visible, masked = self.prior(batch.size(0), rng = self.generator)
 
         # foward model and zero out land
         prediction = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
-
+        
         # loss only on masked & sea
         mask = einops.repeat(masked, 
                              f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
@@ -298,7 +322,33 @@ class Experiment(DistributedTrainer):
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        self.evaluate_frcst()
+        self.evaluate_vae()
+        #self.evaluate_frcst()
+
+    def evaluate_vae(self):
+        self.switch_mode(train=False)
+        if not exists(self.val_dl):
+            return
+        batch = next(iter(self.val_dl)).to(self.device)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
+                x_hat, _ = self.model(batch, members=self.world.ens_size, rng = self.generator)
+        sample = x_hat.mean(-1).mul(self.land_sea_mask).cpu().float().numpy()
+        batch = batch.cpu().float().numpy()
+        
+        if self.is_root:
+            plt.figure(figsize=(12,6))
+            plt.subplot(221)
+            plt.pcolormesh(batch[0, 0, 5, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(222)
+            plt.pcolormesh(batch[0, 0, 6, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(223)
+            plt.pcolormesh(sample[0, 0, 5, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.subplot(224)
+            plt.pcolormesh(sample[0, 0, 6, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
+            plt.tight_layout()
+            plt.savefig(self.model_dir / 'reconstruction.png')
+            plt.close()
 
     def evaluate_frcst(self):
         self.switch_mode(train=False)
@@ -309,7 +359,7 @@ class Experiment(DistributedTrainer):
             batch = batch.to(self.device)
             with torch.no_grad():
                 with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                    prediction = self.frcst_step(batch_idx, batch)
+                    prediction = self.frcst_step(batch_idx, batch).cpu()
                     samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
 
         ds = xr.concat(samples, dim = "time")
@@ -341,7 +391,7 @@ class Experiment(DistributedTrainer):
         plt.savefig(self.model_dir / "test_sample.png")
         plt.close()
 
-        # RANK HIST
+        #RANK HIST
         plt.figure(figsize=(12,4))
         E = len(ds.ens)
         ens = ds[f"temp_ocn_0a_pred"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, E)
@@ -356,8 +406,8 @@ class Experiment(DistributedTrainer):
 
         # ACC vs LAG
         plt.figure(figsize=(12,4))
-        nino34_tgt, nino34_pred = self.get_nino34(ds["temp_ocn_0a_tgt"]), self.get_nino34(ds["temp_ocn_0a_pred"]).mean("ens")
-        nino4_tgt, nino4_pred = self.get_nino4(ds["temp_ocn_0a_tgt"]), self.get_nino4(ds["temp_ocn_0a_pred"]).mean("ens")
+        nino34_tgt, nino34_pred = self.get_nino34(ds["temp_ocn_0a_tgt"]), self.get_nino34(ds["temp_ocn_0a_pred"].mean('ens'))
+        nino4_tgt, nino4_pred = self.get_nino4(ds["temp_ocn_0a_tgt"]), self.get_nino4(ds["temp_ocn_0a_pred"].mean('ens'))
         nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
         nino4_pcc = self.xr_pcc(nino4_pred, nino4_tgt, ("time",))
         pcc = self.xr_pcc(ds["temp_ocn_0a_pred"].mean('ens'), ds["temp_ocn_0a_tgt"], ('lat', 'lon')).mean(('time'))
