@@ -42,7 +42,7 @@ class EinVAE(torch.nn.Module):
     def forward(self, fields: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
         x = self.src_encoder(fields)
         mu, sigma = self.bottleneck(x)
-        sigma = torch.nn.functional.softplus(sigma).clamp(1e-5)
+        sigma = torch.nn.functional.softplus(sigma)
         kl = -0.5 * (1 + 2 * sigma.log() - mu.pow(2) - sigma.pow(2)).sum(dim=-1).mean()
         mu = einops.repeat(mu, 'b ... -> (b e) ...', e = members)
         sigma = einops.repeat(sigma, 'b ... -> (b e) ...', e = members)

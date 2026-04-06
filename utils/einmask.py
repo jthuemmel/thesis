@@ -17,29 +17,46 @@ class EinMask(torch.nn.Module):
         self.src_positions = torch.nn.Parameter(self.init_sincos_positions(network.dim_in))
 
         # I/O        
-        self.src_encoder = EinMix(pattern = f'b {world.field_pattern} -> b ({world.token_pattern}) d', 
-                   weight_shape= f'v {world.patch_pattern} d',
-                   **world.patch_sizes, **world.token_sizes, d = network.dim_in
-                )
-        self.tgt_decoder = FieldDecoder(network.dim_out, world = world, num_tails= network.num_tails)
-
+        self.src_encoder = torch.nn.Sequential(
+                EinMix(pattern = f'b {world.field_pattern} -> b ({world.token_pattern}) dp', 
+                    weight_shape= f'v {world.patch_pattern} dp',
+                    **world.patch_sizes, **world.token_sizes, dp = world.dim_tokens),
+                torch.nn.SiLU(),
+                EinMix(f'b ({world.token_pattern}) dp -> b ({world.token_pattern}) d', 
+                        weight_shape = f'v d dp',
+                        **world.token_sizes, dp = world.dim_tokens, d = network.dim_in),
+            )
+        
+        self.tgt_decoder = torch.nn.Sequential(
+                EinMix(f'b ({world.token_pattern}) d -> b ({world.token_pattern}) dp', 
+                        weight_shape = f'v dp d',
+                        **world.token_sizes, d = network.dim_in, dp = world.dim_tokens),
+                torch.nn.SiLU(),
+                EinMix(f'b ({world.token_pattern}) dp -> b {world.field_pattern}', 
+                        weight_shape = f'v {world.patch_pattern} dp',
+                        **world.token_sizes, **world.patch_sizes, dp = world.dim_tokens),
+            )
+        
+        self.src_encoder.compile()
         
         # Transformer
         self.encoder = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim, dim_kv = network.dim_in, num_heads= network.num_encoder_heads) 
-              for _ in range(default(network.num_read_blocks, 1))
-              ])
+                TransformerBlock(dim= network.dim, dim_kv = network.dim_in, num_heads= network.num_encoder_heads) 
+                for _ in range(default(network.num_read_blocks, 1))
+                ])
         
         self.processor = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim) 
-              for _ in range(default(network.num_compute_blocks, 1))
-              ])
+                TransformerBlock(dim= network.dim) 
+                for _ in range(default(network.num_compute_blocks, 1))
+                ])
         
         self.decoder = torch.nn.ModuleList([
-              TransformerBlock(dim= network.dim_out, dim_kv = network.dim, num_heads= network.num_decoder_heads) 
-              for _ in range(default(network.num_write_blocks, 1))
-              ])
+                TransformerBlock(dim= network.dim_out, dim_kv = network.dim, num_heads= network.num_decoder_heads) 
+                for _ in range(default(network.num_write_blocks, 1))
+                ])
 
+        self.predictor = EinMix('b n d -> (b k) n c', "k c d", k = network.num_tails, c = network.dim_in, d = network.dim_out)
+        
         # weight initialization
         self.apply(self.base_init)
 
@@ -86,8 +103,8 @@ class EinMask(torch.nn.Module):
                 visible: torch.BoolTensor,
                 **kwargs
                 ) -> torch.FloatTensor:
-        latents = self.encode(fields, visible) # variable-size cannot run compiled
-        tgt = self.predict(latents) # fixed-size can
+        latents = self.encode(fields, visible) # encode visible tokens into latent space
+        tgt = self.predict(latents) # predict full set of tokens from latents
         return tgt
     
     def encode(self, fields: torch.FloatTensor, visible: torch.BoolTensor,):
@@ -109,6 +126,8 @@ class EinMask(torch.nn.Module):
         tgt = einops.repeat(self.tgt_positions, 'n d -> b n d', b= B)
         for write in self.decoder:
             tgt = write(tgt, kv = latents)
+        tgt = self.predictor(tgt)
         tgt = self.tgt_decoder(tgt)
         tgt = einops.rearrange(tgt, '(b e) ... -> b ... e', b = B)
         return tgt
+    

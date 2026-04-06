@@ -18,8 +18,8 @@ class MaskingMixture(torch.nn.Module):
         self.tgt = BinaryMasking(world, rate_cfg= rate_cfg.get('tgt', {}))
 
         self.components = event_cfg.get('components', [{}])
-        mixture_weights = event_cfg.get('weights', torch.ones(len(self.components)))
-        self.register_buffer('mixture_weights', torch.as_tensor(mixture_weights))
+        mixture_weights = event_cfg.get('weights', None)
+        self.register_buffer('mixture_weights', torch.as_tensor(default(mixture_weights, torch.ones(len(self.components)))))
 
     def forward(self, B: int, rng: torch.Generator = None):
         idx = torch.multinomial(self.mixture_weights, 1, generator = rng).item()
@@ -85,10 +85,6 @@ class BinaryMasking(torch.nn.Module):
             self.rate_cfg.get("b", 1.),
             generator = rng
             )
-            # a_min = self.rate_cfg.get('a', 0)
-            # a_max = self.rate_cfg.get('b', 1)
-            # U = self.uniform_((1,), rng)
-            # R = U * (a_max - a_min) + a_min
         return R.mul(self.world.num_tokens).long()
 
     def forward(self, B: int, conditional: torch.Tensor = None, rng: torch.Generator = None) -> torch.BoolTensor:

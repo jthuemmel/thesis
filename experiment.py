@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import xarray as xr
 import numpy as np
 
+from pathlib import Path
 from dataclasses import replace
 from omegaconf import OmegaConf
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -208,8 +209,17 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self):
-        #model = EinMask(network=self.model_cfg, world=self.world)
-        model = EinVAE(self.model_cfg.dim_in, self.world)
+        model = EinMask(network=self.model_cfg, world=self.world)
+
+        if exists(self.cfg.stage1_id):
+            vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
+            vae = EinVAE(self.model_cfg.dim_in, self.world)
+            vae.load_state_dict(torch.load(vae_path)['model_state'])
+            model.src_encoder.load_state_dict(vae.src_encoder.state_dict())
+            model.tgt_decoder.load_state_dict(vae.tgt_decoder.state_dict())
+            model.src_encoder.requires_grad_(False)
+            model.tgt_decoder.requires_grad_(False)
+            print("Loaded VAE")
         return model
 
     # LOSS
@@ -266,9 +276,9 @@ class Experiment(DistributedTrainer):
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
 
-    def forward_step(self, batch_idx, batch):
+    def vae_step(self, batch_idx, batch):
         x_hat, kl = self.model(batch, members = self.world.ens_size, rng = self.generator)
-
+        x_hat = x_hat * self.land_sea_mask[..., None]
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
             e_fft = torch.fft.rfftn(x_hat.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
             o_fft = torch.fft.rfftn(batch.float(), dim = (-1, -2, -3))
@@ -288,12 +298,13 @@ class Experiment(DistributedTrainer):
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
         return loss
 
-    def mtm_step(self, batch_idx, batch):        
+    def forward_step(self, batch_idx, batch):        
         # sample visible and masked
         visible, masked = self.prior(batch.size(0), rng = self.generator)
 
         # foward model and zero out land
-        prediction = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        prediction = self.model(batch, visible)
+        
         prediction = prediction * self.land_sea_mask[..., None]
         
         # loss only on masked & sea
@@ -304,9 +315,10 @@ class Experiment(DistributedTrainer):
         mask = torch.logical_and(mask, self.land_sea_mask)
         loss = self.loss_fn(ens = prediction, obs = batch, mask = mask)
 
-        # track metrics
+        #track metrics
         metrics = self.compute_metrics(ens = prediction.float().detach(), obs = batch.float().detach(), mask = mask)
         metrics['loss'] = loss.item()
+        #metrics = {'loss': loss.item()}
         self.log_metrics(metrics)
 
         # update step counter if training
@@ -322,8 +334,8 @@ class Experiment(DistributedTrainer):
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        self.evaluate_vae()
-        #self.evaluate_frcst()
+        #self.evaluate_vae()
+        self.evaluate_frcst()
 
     def evaluate_vae(self):
         self.switch_mode(train=False)
