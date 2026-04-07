@@ -1,45 +1,99 @@
 import einops
 import torch
 
-from einops.layers.torch import EinMix, Rearrange
+from einops.layers.torch import EinMix
 from utils.config import *
 from utils.components import *
 
+def init_sincos_positions(dim: int, world: WorldConfig):
+    # integer indices
+    coordinates = torch.stack(torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape), dim = -1)
+    # log wavelengths
+    log_wavelengths = torch.as_tensor(world.token_shape).log()
+    # only encode shape dimensions with actual size
+    valid = log_wavelengths > 0
+    log_wavelengths = log_wavelengths[valid]
+    coordinates = coordinates[:, valid]
+    # space the frequencies according to the required number of bands
+    negative_spacing = torch.linspace(0, -1, dim // (coordinates.size(-1) * 2))
+    # calculate the sin/cos embeddings:
+    frequencies = torch.exp(negative_spacing * log_wavelengths[..., None])
+    angles = torch.einsum("n i, i d -> n i d", coordinates, frequencies) # overflows fp16, be careful
+    positions = einops.rearrange([angles.sin(), angles.cos()], 'two n i d -> n (two i d)')
+    # avoid uneven dimensions by zero-padding
+    positions = torch.nn.functional.pad(positions, (0, dim - positions.size(-1))) 
+    return positions
+
+def reparameterize(mu: torch.FloatTensor, sigma: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
+    sigma = torch.nn.functional.softplus(sigma)
+    kl = -0.5 * (1 + 2 * sigma.log() - mu.pow(2) - sigma.pow(2)).sum(dim=-1).mean()
+    mu = einops.repeat(mu, 'b ... -> (b e) ...', e = members)
+    sigma = einops.repeat(sigma, 'b ... -> (b e) ...', e = members)
+    x_hat = mu + torch.randn_like(sigma, generator = rng) * sigma
+    return x_hat, kl
+
+class EinVAE(torch.nn.Module):
+    def __init__(self, latent_dim: int, world: WorldConfig):
+        super().__init__()
+        self.world = world
+        self.src_encoder = torch.nn.Sequential(
+                EinMix(pattern = f'b {world.field_pattern} -> b ({world.token_pattern}) do', 
+                    weight_shape= f'v {world.patch_pattern} do',
+                    **world.patch_sizes, **world.token_sizes, do = world.dim_tokens),
+                torch.nn.SiLU(),
+                EinMix(f'b ({world.token_pattern}) di -> two b ({world.token_pattern}) do', 
+                        weight_shape = f'two v do di',
+                        **world.token_sizes, di = world.dim_tokens, do = latent_dim, two = 2),
+            )
+
+        self.tgt_decoder = torch.nn.Sequential(
+            EinMix(f'b ({world.token_pattern}) di -> b ({world.token_pattern}) do',
+                    weight_shape= 'v di do', #bias_shape = f'{world.token_pattern} do',
+                    di= latent_dim, do= world.dim_tokens, **world.token_sizes),
+            torch.nn.SiLU(),
+            EinMix(f'b ({world.token_pattern}) di -> b {world.field_pattern}',
+                    weight_shape = f'v {world.patch_pattern} di',
+                    **world.token_sizes, **world.patch_sizes, di = world.dim_tokens),
+            GaussianSmoothing3D(world.field_shape[0], sigma = 1.)
+        )
+        
+        # weight initialization
+        self.apply(self.base_init)
+    
+    def base_init(self, m: torch.nn.Module):
+        # linear
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.trunc_normal_(m.weight, std = m.weight.size(-1) ** -0.5)
+            if exists(m.bias):
+                torch.nn.init.zeros_(m.bias)
+        # einmix (care with the weight shapes)
+        elif isinstance(m, EinMix):
+            torch.nn.init.trunc_normal_(m.weight, std = m.weight.size(-1) ** -0.5)
+            if exists(m.bias) and m.bias.ndim == 1: # initialized as a linear bias
+                torch.nn.init.zeros_(m.bias)
+            elif exists(m.bias) and m.bias.ndim > 1: # initialized as a positional bias
+                m.bias = torch.nn.Parameter(init_sincos_positions(m.bias.size(-1), world= self.world).reshape_as(m.bias).contiguous())
+    
+    @torch.compile()
+    def forward(self, fields: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
+        mu, sigma = self.src_encoder(fields)
+        x_hat, kl = reparameterize(mu, sigma, members, rng)
+        x_hat = self.tgt_decoder(x_hat)
+        x_hat = einops.rearrange(x_hat, '(b e) ... -> b ... e', e = members)
+        return x_hat, kl
+    
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
-        self.network = network
-        self.world = world
-
         # learnable parameters
         self.latent_tokens = torch.nn.Parameter(torch.zeros((network.num_latents, network.dim)))
-        self.tgt_positions = torch.nn.Parameter(self.init_sincos_positions(network.dim_out))
-        self.src_positions = torch.nn.Parameter(self.init_sincos_positions(network.dim_in))
+        self.tgt_positions = torch.nn.Parameter(init_sincos_positions(network.dim_out, world= world))
+        self.src_positions = torch.nn.Parameter(init_sincos_positions(network.dim_in, world= world))
 
         # I/O        
-        self.src_encoder = torch.nn.Sequential(
-                EinMix(pattern = f'b {world.field_pattern} -> b ({world.token_pattern}) dp', 
-                    weight_shape= f'v {world.patch_pattern} dp',
-                    **world.patch_sizes, **world.token_sizes, dp = world.dim_tokens),
-                torch.nn.SiLU(),
-                EinMix(f'b ({world.token_pattern}) dp -> b ({world.token_pattern}) d', 
-                        weight_shape = f'v d dp',
-                        **world.token_sizes, dp = world.dim_tokens, d = network.dim_in),
-            )
+        self.tokenizer = EinVAE(network.dim_in, world)
         
-        self.tgt_decoder = torch.nn.Sequential(
-                EinMix(f'b ({world.token_pattern}) d -> b ({world.token_pattern}) dp', 
-                        weight_shape = f'v dp d',
-                        **world.token_sizes, d = network.dim_in, dp = world.dim_tokens),
-                torch.nn.SiLU(),
-                EinMix(f'b ({world.token_pattern}) dp -> b {world.field_pattern}', 
-                        weight_shape = f'v {world.patch_pattern} dp',
-                        **world.token_sizes, **world.patch_sizes, dp = world.dim_tokens),
-            )
-        
-        self.src_encoder.compile()
-        
-        # Transformer
+        # Perceiver
         self.encoder = torch.nn.ModuleList([
                 TransformerBlock(dim= network.dim, dim_kv = network.dim_in, num_heads= network.num_encoder_heads) 
                 for _ in range(default(network.num_read_blocks, 1))
@@ -54,41 +108,19 @@ class EinMask(torch.nn.Module):
                 TransformerBlock(dim= network.dim_out, dim_kv = network.dim, num_heads= network.num_decoder_heads) 
                 for _ in range(default(network.num_write_blocks, 1))
                 ])
-
-        self.predictor = EinMix('b n d -> (b k) n c', "k c d", k = network.num_tails, c = network.dim_in, d = network.dim_out)
         
         # weight initialization
-        self.apply(self.base_init)
-
-    def init_sincos_positions(self, dim: int):
-        # integer indices
-        coordinates = torch.stack(torch.unravel_index(indices = torch.arange(self.world.num_tokens), shape = self.world.token_shape), dim = -1)
-        # log wavelengths
-        log_wavelengths = torch.as_tensor(self.world.token_shape).log()
-        # only encode shape dimensions with actual size
-        valid = log_wavelengths > 0
-        log_wavelengths = log_wavelengths[valid]
-        coordinates = coordinates[:, valid]
-        # space the frequencies according to the required number of bands
-        negative_spacing = torch.linspace(0, -1, dim // (coordinates.size(-1) * 2))
-        # calculate the sin/cos embeddings:
-        frequencies = torch.exp(negative_spacing * log_wavelengths[..., None])
-        angles = torch.einsum("n i, i d -> n i d", coordinates, frequencies) # overflows fp16, be careful
-        positions = einops.rearrange([angles.sin(), angles.cos()], 'two n i d -> n (two i d)')
-        # avoid uneven dimensions by zero-padding
-        positions = torch.nn.functional.pad(positions, (0, dim - positions.size(-1))) 
-        return positions
+        self.apply(self.base_init)    
         
-    @staticmethod
-    def base_init(m: torch.nn.Module):
+    def base_init(self, m: torch.nn.Module):
         # linear
         if isinstance(m, torch.nn.Linear):
-            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            torch.nn.init.trunc_normal_(m.weight, std = m.weight.size(-1) ** -0.5)
             if exists(m.bias):
                 torch.nn.init.zeros_(m.bias)
         # embedding
         elif isinstance(m, torch.nn.Embedding):
-            torch.nn.init.trunc_normal_(m.weight, std = 0.02)
+            torch.nn.init.trunc_normal_(m.weight, std = m.weight.size(-1) ** -0.5)
         # einmix
         elif isinstance(m, EinMix):
             torch.nn.init.trunc_normal_(m.weight, std = 0.02)
@@ -96,38 +128,44 @@ class EinMask(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
         # einmask
         elif isinstance(m, EinMask):
-            torch.nn.init.trunc_normal_(m.latent_tokens, std = 0.02)
+            torch.nn.init.trunc_normal_(m.latent_tokens, std = m.latent_tokens.size(-1) ** -0.5)
+            #torch.nn.init.trunc_normal_(m.mask_tokens, std = m.mask_tokens.size(-1) ** -0.5)
    
+    @torch.compile()
+    def to_tokens(self, fields: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
+        mu, sigma = self.tokenizer.src_encoder(fields) 
+        x_hat = reparameterize(mu, sigma, members, rng)
+        return x_hat + self.src_positions
+
+    def read(self, tokens: torch.FloatTensor, visible: torch.BoolTensor,):
+        B = visible.size(0)
+        src = einops.rearrange(tokens[visible], '(b m) d -> b m d', b = B) # select visible tokens
+        z = einops.repeat(self.latent_tokens, 'n d -> b n d', b = B) # expand latents
+        for block in self.encoder:
+            z = block(z, kv = src) # cross-attend tokens into latents
+        return z
+    
+    @torch.compile()
+    def process(self, latents: torch.FloatTensor):
+        B = latents.size(0)
+        for block in self.processor:
+            latents = block(latents) # latent self-attention
+        queries = einops.repeat(self.tgt_positions, 'n d -> b n d', b = B) # expand all tgt positions
+        for block in self.decoder:
+            queries = block(queries, kv = latents) # cross-attend latents into queries
+        return queries
+
     def forward(self, 
                 fields: torch.FloatTensor, 
                 visible: torch.BoolTensor,
-                **kwargs
+                members: Optional[int] = 1, 
+                rng: Optional[torch.Generator] = None
                 ) -> torch.FloatTensor:
-        latents = self.encode(fields, visible) # encode visible tokens into latent space
-        tgt = self.predict(latents) # predict full set of tokens from latents
+       
+        tokens = self.to_tokens(fields, members, rng)# fields -> tokens 
+        latents = self.read(tokens, visible) # visible tokens -> latents
+        queries = self.process(latents) # latents -> queries
+        tgt = self.tokenizer.tgt_decoder(queries)
         return tgt
-    
-    def encode(self, fields: torch.FloatTensor, visible: torch.BoolTensor,):
-        B = visible.size(0)
-        tokens = self.src_encoder(fields) + self.src_positions
-        src = einops.rearrange(tokens[visible], '(b m) d -> b m d', b = B) # select visible tokens
-        latents = einops.repeat(self.latent_tokens, 'z d -> b z d', b = B)
-        for read in self.encoder:
-            latents = read(latents, kv = src)
-        return latents
 
-    @torch.compile()
-    def predict(self, latents: torch.FloatTensor):
-        B = latents.size(0)
-        # latent processor
-        for compute in self.processor:
-            latents = compute(latents)
-        # Decoder
-        tgt = einops.repeat(self.tgt_positions, 'n d -> b n d', b= B)
-        for write in self.decoder:
-            tgt = write(tgt, kv = latents)
-        tgt = self.predictor(tgt)
-        tgt = self.tgt_decoder(tgt)
-        tgt = einops.rearrange(tgt, '(b e) ... -> b ... e', b = B)
-        return tgt
     
