@@ -13,11 +13,10 @@ from dataclasses import replace
 from omegaconf import OmegaConf
 from torch.distributed.optim import ZeroRedundancyOptimizer
 
-import utils.config as cfg
-from utils.dataset import NinoData, MultifileNinoDataset
-from utils.trainer import DistributedTrainer
-from utils.einmask import EinMask
-from utils.einvae import EinVAE
+from utils.config import *
+from utils.dataset import *
+from utils.trainer import *
+from utils.einmask import *
 from utils.masking import *
 from utils.loss_fn import *
 
@@ -60,7 +59,7 @@ class Experiment(DistributedTrainer):
             lens_config = self.data_cfg
             lens_config = replace(lens_config, 
                                   time_slice = {"start": "1850", "stop": "2000", "step": None},
-                                  stats = default(self.data_cfg.stats, cfg.LENS_STATS)
+                                  stats = default(self.data_cfg.stats, LENS_STATS)
                                   )
             self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
         return self._lens_data       
@@ -70,7 +69,7 @@ class Experiment(DistributedTrainer):
             godas_config = self.data_cfg
             godas_config = replace(godas_config, 
                                    time_slice = {"start": "1980", "stop": "2020", "step": None},
-                                   stats = default(self.data_cfg.stats, cfg.GODAS_STATS)
+                                   stats = default(self.data_cfg.stats, GODAS_STATS)
                                    )
             self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
@@ -80,7 +79,7 @@ class Experiment(DistributedTrainer):
             picontrol_config = self.data_cfg
             picontrol_config = replace(picontrol_config, 
                                        time_slice = {"start": "1900", "stop": "2000", "step": None},
-                                       stats = default(self.data_cfg.stats, cfg.PICONTROL_STATS))
+                                       stats = default(self.data_cfg.stats, PICONTROL_STATS))
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
@@ -209,17 +208,16 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self):
-        model = EinMask(network=self.model_cfg, world=self.world)
+        # model = EinMask(network=self.model_cfg, world=self.world)
 
-        if exists(self.cfg.stage1_id):
-            vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
-            vae = EinVAE(self.model_cfg.dim_in, self.world)
-            vae.load_state_dict(torch.load(vae_path)['model_state'])
-            model.src_encoder.load_state_dict(vae.src_encoder.state_dict())
-            model.tgt_decoder.load_state_dict(vae.tgt_decoder.state_dict())
-            model.src_encoder.requires_grad_(False)
-            model.tgt_decoder.requires_grad_(False)
-            print("Loaded VAE")
+        # if exists(self.cfg.stage1_id):
+        #     vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
+        #     vae = EinVAE(self.model_cfg.dim_in, self.world)
+        #     vae.load_state_dict(torch.load(vae_path)['model_state'])
+        #     model.tokenizer.load_state_dict(vae.state_dict())
+        #     model.tokenizer.requires_grad_(False)
+        #     print("Loaded VAE")
+        model = EinVAE(self.model_cfg.dim_in, self.world)
         return model
 
     # LOSS
@@ -276,7 +274,7 @@ class Experiment(DistributedTrainer):
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
 
-    def vae_step(self, batch_idx, batch):
+    def forward_step(self, batch_idx, batch):
         x_hat, kl = self.model(batch, members = self.world.ens_size, rng = self.generator)
         x_hat = x_hat * self.land_sea_mask[..., None]
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
@@ -298,7 +296,7 @@ class Experiment(DistributedTrainer):
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
         return loss
 
-    def forward_step(self, batch_idx, batch):        
+    def mtm_step(self, batch_idx, batch):        
         # sample visible and masked
         visible, masked = self.prior(batch.size(0), rng = self.generator)
 
@@ -334,8 +332,8 @@ class Experiment(DistributedTrainer):
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        #self.evaluate_vae()
-        self.evaluate_frcst()
+        self.evaluate_vae()
+        #self.evaluate_frcst()
 
     def evaluate_vae(self):
         self.switch_mode(train=False)
@@ -607,7 +605,7 @@ def main():
     # Create a config object
     cfg_file = OmegaConf.load(args.config)
     merged_cfg = OmegaConf.merge(cfg_file.get("defaults", {}), cfg_file.get(task_id, {})) # order matters here!
-    config = cfg.MTMConfig.from_omegaconf(merged_cfg)
+    config = MTMConfig.from_omegaconf(merged_cfg)
 
     #Run the trainer
     trainer = Experiment(config)
