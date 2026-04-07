@@ -141,3 +141,28 @@ class FieldDecoder(torch.nn.Module):
             include_self=False
             )
         return self.unflatten_fields(predicted_fields)
+    
+class GaussianSmoothing3D(torch.nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 5,
+        sigma: float = 1.,
+    ):
+        super().__init__()
+        # gaussian kernel
+        coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        g = torch.exp(-0.5 * (coords / sigma) ** 2)
+        g = g / g.sum()
+        w = torch.einsum('i,j,k->ijk', g, g, g,)
+
+        # dw conv3d
+        self.conv = torch.nn.Conv3d(channels, channels, kernel_size=kernel_size, padding= 'same', groups= channels, bias = False)
+        self.conv.weight = torch.nn.Parameter(w.expand_as(self.conv.weight), requires_grad = False)
+
+        # convex
+        self.scale = torch.nn.Parameter(torch.ones(1, channels, 1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = self.scale.sigmoid()
+        return self.conv(x) * a + (1 - a) * x
