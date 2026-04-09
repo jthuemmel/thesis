@@ -93,71 +93,27 @@ class TransformerBlock(torch.nn.Module):
         x = x + self.ffn(self.ffn_norm(x)) 
         return x
 
-class FieldDecoder(torch.nn.Module):
-    def __init__(self, dim: int, world: WorldConfig, num_tails: Optional[int] = 1):
-        super().__init__()
-        self.world = world
-        ts = world.token_sizes
-        ks = world.kernel_sizes
-        ps = world.patch_sizes
-
-        self.to_fields = EinMix(
-            f'b ({world.token_pattern}) d -> (b k) ({world.flat_pattern})',
-            weight_shape=f'k v {world.patch_pattern} d',
-            **ts, **ks, d= dim, k = num_tails
-            )
-
-        self.unflatten_fields = Rearrange(
-            f'b ({world.flat_pattern}) -> b {world.field_pattern}',
-            **ts, **ps
-            )
-      
-        grid_strides = {}
-        acc = 1
-        for ax in reversed(world.layout):
-            grid_strides[ax] = acc
-            acc *= world.field_sizes[ax]
-
-        idx = torch.zeros([*ts.values(), *ks.values()], dtype=torch.long)
-
-        for ax in world.layout:
-            n0 = torch.arange(ts[ax]) * ps[2*ax]
-            dp = torch.arange(ks[2*ax])
-            n0 = einops.repeat(n0, f'{ax} -> {world.token_pattern} {world.patch_pattern}', **ts, **ks)
-            dp = einops.repeat(dp, f'{2*ax} -> {world.token_pattern} {world.patch_pattern}', **ts, **ks)
-            idx += (n0 + dp).clamp(0, world.field_sizes[ax] - 1) * grid_strides[ax]
-
-        self.register_buffer('idx', idx.flatten())
-
-    @torch.compile()
-    def forward(self, tgt: torch.FloatTensor):
-        tgt = self.to_fields(tgt)
-        predicted_fields = torch.scatter_reduce(
-            tgt.new_empty((tgt.size(0), self.world.num_elements)), 
-            1, 
-            self.idx.expand(tgt.size(0), -1), 
-            tgt, 
-            reduce='mean', 
-            include_self=False
-            )
-        return self.unflatten_fields(predicted_fields)
-    
 class GaussianSmoothing3D(torch.nn.Module):
     def __init__(
         self,
         channels: int,
-        kernel_size: int = 5,
-        sigma: float = 1.,
+        kernel_size: int = 3,
+        sigma: float = 0.7,
     ):
         super().__init__()
-        # gaussian kernel
-        coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
-        g = torch.exp(-0.5 * (coords / sigma) ** 2)
-        g = g / g.sum()
-        w = torch.einsum('i,j,k->ijk', g, g, g,)
+        # gaussian kernels
+        kernel_size = 3 * [kernel_size] if isinstance(kernel_size, int) else kernel_size
+        gs = []
+        for k in kernel_size:
+            coords = torch.arange(k, dtype=torch.float32) - k // 2
+            g = torch.exp(-0.5 * (coords / sigma) ** 2)
+            gs.append(g / g.sum())
+
+        w = torch.einsum('i,j,k->ijk', *gs)
 
         # dw conv3d
-        self.conv = torch.nn.Conv3d(channels, channels, kernel_size=kernel_size, padding= 'same', groups= channels, bias = False)
+        self.conv = torch.nn.Conv3d(channels, channels, kernel_size=kernel_size, 
+                                    padding= 'same', groups= channels, bias = False, padding_mode = 'replicate')
         self.conv.weight = torch.nn.Parameter(w.expand_as(self.conv.weight).clone(), requires_grad = False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

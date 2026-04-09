@@ -225,14 +225,14 @@ class Experiment(DistributedTrainer):
     def per_variable_weights(self) -> torch.FloatTensor:
         weights = {
             # 'temp_ocn_0a': 1.,
-            # 'temp_ocn_1a': 0.1,
-            # 'temp_ocn_3a': 0.1,
-            # 'temp_ocn_5a': 0.1,
-            # 'temp_ocn_8a': 0.1,
-            # 'temp_ocn_11a': 0.1,
-            # 'temp_ocn_14a': 0.1,
-            'tauxa': 0.1,
-            'tauya': 0.1,
+            'temp_ocn_1a': 0.1,
+            'temp_ocn_3a': 0.1,
+            'temp_ocn_5a': 0.1,
+            'temp_ocn_8a': 0.1,
+            'temp_ocn_11a': 0.1,
+            'temp_ocn_14a': 0.1,
+            'tauxa': 0.01,
+            'tauya': 0.01,
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w, 
@@ -274,51 +274,43 @@ class Experiment(DistributedTrainer):
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
 
-    def vae_step(self, batch_idx, batch):
-        x_hat, kl = self.model(batch, members = self.world.ens_size, rng = self.generator)
-        x_hat = x_hat * self.land_sea_mask[..., None]
-        with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
-            e_fft = torch.fft.rfftn(x_hat.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
-            o_fft = torch.fft.rfftn(batch.float(), dim = (-1, -2, -3))
-        spectral = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = x_hat.size(-1) > 1).mean()
-        crps = f_kernel_crps(observation = batch, ensemble = x_hat, fair = x_hat.size(-1) > 1)[:, self.land_sea_mask].mean()
-        loss = crps + self.model_cfg.kwargs.get('beta', 1.) * kl + spectral * self.cfg.spectral_loss_weight
+    def sample_masks(self, B: int):
+        # time-weighted reservoir sampler
+        base_factor = torch.rand((B, self.world.num_tokens), generator = self.generator, device = self.device).clamp(1e-5)
+        time_factor = torch.rand((B, self.world.token_sizes['t']), generator = self.generator, device = self.device).clamp(1e-5)
+        time_factor = einops.repeat(time_factor, f'b t -> b ({self.world.token_pattern})', **self.world.token_sizes)
 
-        metrics = {}
-        metrics['spectral_crps'] = spectral.item()
-        metrics['rmse'] = self.compute_rmse(x_hat.detach().mean(-1)[:, self.land_sea_mask], batch[:, self.land_sea_mask]).item()
-        metrics['acc'] = self.compute_acc(x_hat.detach().mean(-1)[:, self.land_sea_mask], batch[:, self.land_sea_mask]).item()
-        metrics['loss'] = loss.item()
-        metrics['crps'] = crps.item()
-        metrics['kl'] = kl.item()
-        self.log_metrics(metrics)
-        # update step counter if training
-        self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
-        return loss
+        weights = base_factor.log() + time_factor.log().div(self.world.kwargs.get('alpha', 1.))
+        reservoir = weights.argsort(descending=True, dim = -1)
+        
+        # choose K elements
+        rs = torch.nn.init.trunc_normal_(torch.empty((1,), device = self.device), mean= 0.25, std= 0.15, a= 0.1, b= 0.4)
+        K = rs.mul(self.world.num_tokens).long()
+        visible = reservoir.argsort().lt(K)
+        masked = visible.logical_not()
+        return visible, masked
 
     def forward_step(self, batch_idx, batch):        
-        # sample visible and masked
-        visible, masked = self.prior(batch.size(0), rng = self.generator)
-
-        # foward model and zero out land
-        prediction, latent_loss = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        # sample masks
+        visible, masked = self.sample_masks(batch.size(0))
         
-        prediction = prediction * self.land_sea_mask[..., None]
-        
-        # loss only on masked & sea
-        mask = einops.repeat(masked, 
-                             f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes
-                             )
+        # foward model
+        mu, sigma = self.model(batch, visible)
+                
+        # sea-only mask
+        mask = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
         mask = torch.logical_and(mask, self.land_sea_mask)
-        alpha = self.model_cfg.kwargs.get('alpha', 0.5)
-        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask) * (1-alpha) + latent_loss * alpha
+
+        # loss
+        loss = f_gaussian_crps(batch, mu, sigma).mul(self.per_variable_weights)[mask].mean()
 
         #track metrics
-        metrics = self.compute_metrics(ens = prediction.float().detach(), obs = batch.float().detach(), mask = mask)
-        metrics['loss'] = loss.item()
-        metrics['latent'] = latent_loss.item()
-        #metrics = {'loss': loss.item()}
+        metrics = {'loss' : loss.item(),
+                   'acc': self.compute_acc(mu[mask], batch[mask]).item(),
+                   'rmse': self.compute_rmse(mu[mask], batch[mask]).item(),
+                   'ssr': (sigma[mask].mean() / self.compute_rmse(mu[mask], batch[mask])).item(),
+                   }
         self.log_metrics(metrics)
 
         # update step counter if training
@@ -327,41 +319,29 @@ class Experiment(DistributedTrainer):
     
     def frcst_step(self, batch_idx, batch):
         visible = self.frcst_prefix.expand(batch.size(0), -1)
-        prediction, latent_loss = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
-        prediction = prediction * self.land_sea_mask[..., None]
-        self.log_metrics({'frcst_latent': latent_loss.item()})
-        return prediction
+        mu, sigma = self.model(batch, visible)
+
+        # sea-only mask
+        mask = einops.repeat(visible.logical_not(), f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
+        mask = torch.logical_and(mask, self.land_sea_mask)
+        loss = f_gaussian_crps(batch, mu, sigma)[mask].mean()
+
+        metrics = {'frcst_loss' : loss.item(),
+                   'frcst_acc': self.compute_acc(mu[mask], batch[mask]).item(),
+                   'frcst_rmse': self.compute_rmse(mu[mask], batch[mask]).item(),
+                   'frcst_ssr': (sigma[mask].mean() / self.compute_rmse(mu[mask], batch[mask])).item(),
+                   }
+        self.log_metrics(metrics)
+
+        mu = mu * self.land_sea_mask
+
+        return mu, sigma
 
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        #self.evaluate_vae()
         self.evaluate_frcst()
-
-    def evaluate_vae(self):
-        self.switch_mode(train=False)
-        if not exists(self.val_dl):
-            return
-        batch = next(iter(self.val_dl)).to(self.device)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                x_hat, _ = self.model(batch, members=self.world.ens_size, rng = self.generator)
-        sample = x_hat.mean(-1).mul(self.land_sea_mask).cpu().float().numpy()
-        batch = batch.cpu().float().numpy()
-        
-        if self.is_root:
-            plt.figure(figsize=(12,6))
-            plt.subplot(221)
-            plt.pcolormesh(batch[0, 0, 5, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(222)
-            plt.pcolormesh(batch[0, 0, 6, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(223)
-            plt.pcolormesh(sample[0, 0, 5, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.subplot(224)
-            plt.pcolormesh(sample[0, 0, 6, :, :], vmin=-2, vmax = 2, cmap= 'bwr')
-            plt.tight_layout()
-            plt.savefig(self.model_dir / 'reconstruction.png')
-            plt.close()
 
     def evaluate_frcst(self):
         self.switch_mode(train=False)
@@ -372,8 +352,8 @@ class Experiment(DistributedTrainer):
             batch = batch.to(self.device)
             with torch.no_grad():
                 with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                    prediction = self.frcst_step(batch_idx, batch).cpu()
-                    samples.append(self.get_xarray_dataset(batch_idx, obs = batch, pred = prediction))
+                    mu, sigma = self.frcst_step(batch_idx, batch)
+                    samples.append(self.get_xarray_dataset(batch_idx, obs = batch.cpu(), pred = mu[..., None].cpu()))
 
         ds = xr.concat(samples, dim = "time")
         ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
@@ -393,14 +373,14 @@ class Experiment(DistributedTrainer):
         ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
         plt.subplot(322)
         ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        plt.subplot(323)
-        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 0).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        plt.subplot(324)
-        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        plt.subplot(325)
-        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        plt.subplot(326)
-        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 3).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        # plt.subplot(323)
+        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 0).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        # plt.subplot(324)
+        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        # plt.subplot(325)
+        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+        # plt.subplot(326)
+        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 3).plot(vmin=-2, vmax = 2, cmap= 'bwr')
         plt.savefig(self.model_dir / "test_sample.png")
         plt.close()
 
