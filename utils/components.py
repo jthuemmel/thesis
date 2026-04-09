@@ -158,11 +158,7 @@ class GaussianSmoothing3D(torch.nn.Module):
 
         # dw conv3d
         self.conv = torch.nn.Conv3d(channels, channels, kernel_size=kernel_size, padding= 'same', groups= channels, bias = False)
-        self.conv.weight = torch.nn.Parameter(w.expand_as(self.conv.weight), requires_grad = False)
-
-        # convex
-        self.scale = torch.nn.Parameter(torch.ones(1, channels, 1, 1, 1))
+        self.conv.weight = torch.nn.Parameter(w.expand_as(self.conv.weight).clone(), requires_grad = False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.scale.sigmoid()
-        return self.conv(x) * a + (1 - a) * x
+        return self.conv(x)

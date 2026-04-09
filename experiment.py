@@ -208,16 +208,16 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self):
-        # model = EinMask(network=self.model_cfg, world=self.world)
+        model = EinMask(network=self.model_cfg, world=self.world)
 
-        # if exists(self.cfg.stage1_id):
-        #     vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
-        #     vae = EinVAE(self.model_cfg.dim_in, self.world)
-        #     vae.load_state_dict(torch.load(vae_path)['model_state'])
-        #     model.tokenizer.load_state_dict(vae.state_dict())
-        #     model.tokenizer.requires_grad_(False)
-        #     print("Loaded VAE")
-        model = EinVAE(self.model_cfg.dim_in, self.world)
+        if exists(self.cfg.stage1_id):
+            vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
+            vae = EinVAE(self.model_cfg.dim_in, self.world)
+            vae.load_state_dict(torch.load(vae_path)['model_state'])
+            model.tokenizer.load_state_dict(vae.state_dict())
+            model.tokenizer.requires_grad_(False)
+            print("Loaded VAE")
+        #model = EinVAE(self.model_cfg.dim_in, self.world)
         return model
 
     # LOSS
@@ -274,7 +274,7 @@ class Experiment(DistributedTrainer):
     def total_epochs(self):
         return max(1, self.total_steps // len(self.train_dl))
 
-    def forward_step(self, batch_idx, batch):
+    def vae_step(self, batch_idx, batch):
         x_hat, kl = self.model(batch, members = self.world.ens_size, rng = self.generator)
         x_hat = x_hat * self.land_sea_mask[..., None]
         with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
@@ -296,12 +296,12 @@ class Experiment(DistributedTrainer):
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
         return loss
 
-    def mtm_step(self, batch_idx, batch):        
+    def forward_step(self, batch_idx, batch):        
         # sample visible and masked
         visible, masked = self.prior(batch.size(0), rng = self.generator)
 
         # foward model and zero out land
-        prediction = self.model(batch, visible)
+        prediction, latent_loss = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
         
         prediction = prediction * self.land_sea_mask[..., None]
         
@@ -311,11 +311,13 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, **self.world.patch_sizes
                              )
         mask = torch.logical_and(mask, self.land_sea_mask)
-        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask)
+        alpha = self.model_cfg.kwargs.get('alpha', 0.5)
+        loss = self.loss_fn(ens = prediction, obs = batch, mask = mask) * (1-alpha) + latent_loss * alpha
 
         #track metrics
         metrics = self.compute_metrics(ens = prediction.float().detach(), obs = batch.float().detach(), mask = mask)
         metrics['loss'] = loss.item()
+        metrics['latent'] = latent_loss.item()
         #metrics = {'loss': loss.item()}
         self.log_metrics(metrics)
 
@@ -325,15 +327,16 @@ class Experiment(DistributedTrainer):
     
     def frcst_step(self, batch_idx, batch):
         visible = self.frcst_prefix.expand(batch.size(0), -1)
-        prediction = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
+        prediction, latent_loss = self.model(batch, visible, members = self.world.ens_size, rng = self.generator)
         prediction = prediction * self.land_sea_mask[..., None]
+        self.log_metrics({'frcst_latent': latent_loss.item()})
         return prediction
 
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        self.evaluate_vae()
-        #self.evaluate_frcst()
+        #self.evaluate_vae()
+        self.evaluate_frcst()
 
     def evaluate_vae(self):
         self.switch_mode(train=False)
@@ -526,7 +529,7 @@ class Experiment(DistributedTrainer):
         ens = ens[mask]
         obs = obs[mask]
         metrics = {
-            "crps": self.compute_crps(pred=ens, obs=obs).item(),
+            "crps": self.compute_crps(pred=ens, obs=obs, fair =  self.use_fair_crps).item(),
             "ssr": self.compute_spread_skill(pred=ens, obs=obs).item(),
             "ign": self.compute_ign(pred=ens, obs=obs).item(),
             "spread": self.compute_spread(pred=ens).item(),
@@ -572,8 +575,8 @@ class Experiment(DistributedTrainer):
         return (pred - obs).pow(2).nanmean().sqrt()
     
     @staticmethod
-    def compute_crps(pred, obs):
-        crps = f_kernel_crps(observation=obs, ensemble=pred, fair = True)
+    def compute_crps(pred, obs, fair: bool = True):
+        crps = f_kernel_crps(observation=obs, ensemble=pred, fair = fair)
         return crps.nanmean()
     
     @staticmethod

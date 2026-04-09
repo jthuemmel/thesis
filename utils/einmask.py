@@ -4,6 +4,7 @@ import torch
 from einops.layers.torch import EinMix
 from utils.config import *
 from utils.components import *
+from utils.loss_fn import *
 
 def init_sincos_positions(dim: int, world: WorldConfig):
     # integer indices
@@ -24,11 +25,9 @@ def init_sincos_positions(dim: int, world: WorldConfig):
     positions = torch.nn.functional.pad(positions, (0, dim - positions.size(-1))) 
     return positions
 
-def reparameterize(mu: torch.FloatTensor, sigma: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
+def reparameterize(mu: torch.FloatTensor, sigma: torch.FloatTensor, rng: Optional[torch.Generator] = None):
     sigma = torch.nn.functional.softplus(sigma)
     kl = -0.5 * (1 + 2 * sigma.log() - mu.pow(2) - sigma.pow(2)).sum(dim=-1).mean()
-    mu = einops.repeat(mu, 'b ... -> (b e) ...', e = members)
-    sigma = einops.repeat(sigma, 'b ... -> (b e) ...', e = members)
     x_hat = mu + torch.randn_like(sigma, generator = rng) * sigma
     return x_hat, kl
 
@@ -48,9 +47,10 @@ class EinVAE(torch.nn.Module):
 
         self.tgt_decoder = torch.nn.Sequential(
             EinMix(f'b ({world.token_pattern}) di -> b ({world.token_pattern}) do',
-                    weight_shape= 'v di do', #bias_shape = f'{world.token_pattern} do',
+                    weight_shape= 'v do di', 
+                    bias_shape = f'{world.token_pattern} do',
                     di= latent_dim, do= world.dim_tokens, **world.token_sizes),
-            torch.nn.SiLU(),
+            TransformerBlock(world.dim_tokens, num_heads= 8),
             EinMix(f'b ({world.token_pattern}) di -> b {world.field_pattern}',
                     weight_shape = f'v {world.patch_pattern} di',
                     **world.token_sizes, **world.patch_sizes, di = world.dim_tokens),
@@ -77,7 +77,9 @@ class EinVAE(torch.nn.Module):
     @torch.compile()
     def forward(self, fields: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
         mu, sigma = self.src_encoder(fields)
-        x_hat, kl = reparameterize(mu, sigma, members, rng)
+        mu = einops.repeat(mu, 'b ... -> (b e) ...', e = members)
+        sigma = einops.repeat(sigma, 'b ... -> (b e) ...', e = members)
+        x_hat, kl = reparameterize(mu, sigma, rng)
         x_hat = self.tgt_decoder(x_hat)
         x_hat = einops.rearrange(x_hat, '(b e) ... -> b ... e', e = members)
         return x_hat, kl
@@ -92,6 +94,10 @@ class EinMask(torch.nn.Module):
 
         # I/O        
         self.tokenizer = EinVAE(network.dim_in, world)
+        self.predictor = torch.nn.Sequential(
+            torch.nn.RMSNorm(network.dim_out),
+            EinMix('b n d -> two b n c', 'two c d', two = 2, c = network.dim_in, d = network.dim_out)
+            )
         
         # Perceiver
         self.encoder = torch.nn.ModuleList([
@@ -132,13 +138,14 @@ class EinMask(torch.nn.Module):
             #torch.nn.init.trunc_normal_(m.mask_tokens, std = m.mask_tokens.size(-1) ** -0.5)
    
     @torch.compile()
-    def to_tokens(self, fields: torch.FloatTensor, members: Optional[int] = 1, rng: Optional[torch.Generator] = None):
-        mu, sigma = self.tokenizer.src_encoder(fields) 
-        x_hat = reparameterize(mu, sigma, members, rng)
-        return x_hat + self.src_positions
+    def to_tokens(self, fields: torch.FloatTensor, rng: Optional[torch.Generator] = None):
+        z = self.tokenizer.src_encoder(fields) 
+        x_hat, _ = reparameterize(z[0], z[1], rng)
+        return x_hat 
 
     def read(self, tokens: torch.FloatTensor, visible: torch.BoolTensor,):
         B = visible.size(0)
+        tokens = tokens + self.src_positions # add position codes
         src = einops.rearrange(tokens[visible], '(b m) d -> b m d', b = B) # select visible tokens
         z = einops.repeat(self.latent_tokens, 'n d -> b n d', b = B) # expand latents
         for block in self.encoder:
@@ -153,7 +160,14 @@ class EinMask(torch.nn.Module):
         queries = einops.repeat(self.tgt_positions, 'n d -> b n d', b = B) # expand all tgt positions
         for block in self.decoder:
             queries = block(queries, kv = latents) # cross-attend latents into queries
-        return queries
+        mu, sigma = self.predictor(queries)
+        return mu, sigma
+    
+    @torch.compile()
+    def to_fields(self, mu: torch.FloatTensor, sigma: torch.FloatTensor, rng: Optional[torch.Generator] = None):
+        tgt, _ = reparameterize(mu, sigma, rng)
+        tgt = self.tokenizer.tgt_decoder(tgt)
+        return tgt
 
     def forward(self, 
                 fields: torch.FloatTensor, 
@@ -161,11 +175,12 @@ class EinMask(torch.nn.Module):
                 members: Optional[int] = 1, 
                 rng: Optional[torch.Generator] = None
                 ) -> torch.FloatTensor:
-       
-        tokens = self.to_tokens(fields, members, rng)# fields -> tokens 
+        fields = einops.repeat(fields, 'b ... -> (b e) ...', e = members)
+        visible = einops.repeat(visible, 'b ... -> (b e) ...', e = members)
+        tokens = self.to_tokens(fields, rng)# fields -> tokens 
         latents = self.read(tokens, visible) # visible tokens -> latents
-        queries = self.process(latents) # latents -> queries
-        tgt = self.tokenizer.tgt_decoder(queries)
-        return tgt
-
-    
+        mu, sigma = self.process(latents) # latents -> predicted distribution
+        x_hat = self.to_fields(mu, sigma, rng)
+        x_hat = einops.rearrange(x_hat, '(b e) ... -> b ... e', e = members)
+        latent_loss = f_gaussian_crps(tokens, mu, torch.nn.functional.softplus(sigma))[visible.logical_not()].mean()
+        return x_hat, latent_loss
