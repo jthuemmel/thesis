@@ -16,6 +16,19 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
+class DropPath(torch.nn.Module):
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor):
+        if not self.training or self.drop_prob == 0.:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x * random_tensor.div(keep_prob)
+
 class GatedFFN(torch.nn.Module):
     def __init__(self, dim: int, expansion_factor: int = 2, bias: bool = False):
         super().__init__()
@@ -81,16 +94,17 @@ class AdaTransformerBlock(torch.nn.Module):
         return x
     
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, dim: int, dim_kv: Optional[int] = None, num_heads: Optional[int] = None) -> None:
+    def __init__(self, dim: int, dim_kv: Optional[int] = None, num_heads: Optional[int] = None, drop_path: float = 0.) -> None:
         super().__init__()
         self.attn_norm = torch.nn.RMSNorm(dim)
         self.ffn_norm = torch.nn.RMSNorm(dim)
         self.att = EinAttention(dim, num_heads = num_heads, dim_kv = dim_kv)
         self.ffn = GatedFFN(dim = dim)
+        self.drop_path = DropPath(drop_path)
 
     def forward(self, x: torch.FloatTensor, kv: Optional[torch.FloatTensor] = None):
-        x = x + self.att(self.attn_norm(x), kv = kv) 
-        x = x + self.ffn(self.ffn_norm(x)) 
+        x = x + self.drop_path(self.att(self.attn_norm(x), kv = kv))
+        x = x + self.drop_path(self.ffn(self.ffn_norm(x)))
         return x
 
 class GaussianSmoothing3D(torch.nn.Module):
