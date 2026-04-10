@@ -85,7 +85,7 @@ class NetworkConfig:
     num_write_blocks: Optional[int] = None
     num_cnn_blocks: Optional[int] = None
     num_cls: Optional[int] = None
-    num_tails: Optional[int] = None
+    num_tails: Optional[int] = 1
     num_encoder_heads: Optional[int] = None
     num_decoder_heads: Optional[int] = None
     dim_in: Optional[int] = None

@@ -50,11 +50,11 @@ class EinMask(torch.nn.Module):
         )
 
         self.to_output = torch.nn.Sequential(
-            EinMix(f'b ({world.token_pattern}) d -> (two b) {world.field_pattern}',
-                   weight_shape = f'two v {world.patch_pattern} d',
-                   d = network.dim_out, two = 2, **world.patch_sizes, **world.token_sizes),
+            EinMix(f'b ({world.token_pattern}) d -> (k b) {world.field_pattern}',
+                   weight_shape = f'k v {world.patch_pattern} d',
+                   d = network.dim_out, k = network.num_tails, **world.patch_sizes, **world.token_sizes),
             GaussianSmoothing3D(world.field_shape[0]),
-            Rearrange('(two b) ... -> two b ...', two = 2)
+            Rearrange('(k b) ... -> k b ...', k = network.num_tails)
         )
         
         # Encoder / Decoder
@@ -80,7 +80,6 @@ class EinMask(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.mask_token, std = m.mask_token.size(-1) ** -0.5)
    
     def forward(self, fields: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
-
         # tokenize and add position codes
         tokens = self.to_tokens(fields) + self.src_positions
 
@@ -105,7 +104,6 @@ class EinMask(torch.nn.Module):
         for write in self.decoder:
             tgt = write(tgt)
 
-        # mean/variance prediction
-        mu, sigma = self.to_output(tgt)
-        sigma = torch.nn.functional.softplus(sigma)
-        return mu, sigma
+        # prediction head
+        pred = self.to_output(tgt)
+        return pred
