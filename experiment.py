@@ -296,7 +296,8 @@ class Experiment(DistributedTrainer):
         
         # foward model
         mu, sigma = self.model(batch, visible)
-                
+        sigma = torch.nn.functional.softplus(sigma)
+        
         # sea-only mask
         mask = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes)
@@ -320,7 +321,8 @@ class Experiment(DistributedTrainer):
     def frcst_step(self, batch_idx, batch):
         visible = self.frcst_prefix.expand(batch.size(0), -1)
         mu, sigma = self.model(batch, visible)
-
+        sigma = torch.nn.functional.softplus(sigma)
+        
         # sea-only mask
         mask = einops.repeat(visible.logical_not(), f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes)
