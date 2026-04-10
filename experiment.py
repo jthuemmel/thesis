@@ -210,13 +210,13 @@ class Experiment(DistributedTrainer):
     def create_model(self):
         model = EinMask(network=self.model_cfg, world=self.world)
 
-        if exists(self.cfg.stage1_id):
-            vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
-            vae = EinVAE(self.model_cfg.dim_in, self.world)
-            vae.load_state_dict(torch.load(vae_path)['model_state'])
-            model.tokenizer.load_state_dict(vae.state_dict())
-            model.tokenizer.requires_grad_(False)
-            print("Loaded VAE")
+        # if exists(self.cfg.stage1_id):
+        #     vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
+        #     vae = EinVAE(self.model_cfg.dim_in, self.world)
+        #     vae.load_state_dict(torch.load(vae_path)['model_state'])
+        #     model.tokenizer.load_state_dict(vae.state_dict())
+        #     model.tokenizer.requires_grad_(False)
+        #     print("Loaded VAE")
         #model = EinVAE(self.model_cfg.dim_in, self.world)
         return model
 
@@ -225,14 +225,14 @@ class Experiment(DistributedTrainer):
     def per_variable_weights(self) -> torch.FloatTensor:
         weights = {
             # 'temp_ocn_0a': 1.,
-            'temp_ocn_1a': 0.1,
-            'temp_ocn_3a': 0.1,
-            'temp_ocn_5a': 0.1,
-            'temp_ocn_8a': 0.1,
-            'temp_ocn_11a': 0.1,
-            'temp_ocn_14a': 0.1,
-            'tauxa': 0.01,
-            'tauya': 0.01,
+            # 'temp_ocn_1a': 0.1,
+            # 'temp_ocn_3a': 0.1,
+            # 'temp_ocn_5a': 0.1,
+            # 'temp_ocn_8a': 0.1,
+            # 'temp_ocn_11a': 0.1,
+            # 'temp_ocn_14a': 0.1,
+            # 'tauxa': 0.01,
+            # 'tauya': 0.01,
         }
         w = torch.as_tensor([weights.get(var, 1.) for var in self.data_cfg.variables], device = self.device)
         return einops.repeat(w, 
@@ -309,7 +309,7 @@ class Experiment(DistributedTrainer):
         metrics = {'loss' : loss.item(),
                    'acc': self.compute_acc(mu[mask], batch[mask]).item(),
                    'rmse': self.compute_rmse(mu[mask], batch[mask]).item(),
-                   'ssr': (sigma[mask].mean() / self.compute_rmse(mu[mask], batch[mask])).item(),
+                   'ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
                    }
         self.log_metrics(metrics)
 
@@ -330,7 +330,7 @@ class Experiment(DistributedTrainer):
         metrics = {'frcst_loss' : loss.item(),
                    'frcst_acc': self.compute_acc(mu[mask], batch[mask]).item(),
                    'frcst_rmse': self.compute_rmse(mu[mask], batch[mask]).item(),
-                   'frcst_ssr': (sigma[mask].mean() / self.compute_rmse(mu[mask], batch[mask])).item(),
+                   'frcst_ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
                    }
         self.log_metrics(metrics)
 

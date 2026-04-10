@@ -29,6 +29,7 @@ class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
         # learnable parameters
+        self.latent_tokens = torch.nn.Parameter(torch.zeros(network.num_latents, network.dim))
         self.mask_token = torch.nn.Parameter(torch.zeros(network.dim_out))
         self.src_positions = torch.nn.Parameter(init_sincos_positions(network.dim, world= world))
         self.tgt_positions = torch.nn.Parameter(init_sincos_positions(network.dim_out, world= world))
@@ -53,7 +54,7 @@ class EinMask(torch.nn.Module):
             EinMix(f'b ({world.token_pattern}) d -> (k b) {world.field_pattern}',
                    weight_shape = f'k v {world.patch_pattern} d',
                    d = network.dim_out, k = network.num_tails, **world.patch_sizes, **world.token_sizes),
-            GaussianSmoothing3D(world.field_shape[0]),
+            GaussianSmoothing3D(world.field_shape[0], kernel_size= 5, sigma= 1.),
             Rearrange('(k b) ... -> k b ...', k = network.num_tails)
         )
         
@@ -78,32 +79,37 @@ class EinMask(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
         if isinstance(m, EinMask):
             torch.nn.init.trunc_normal_(m.mask_token, std = m.mask_token.size(-1) ** -0.5)
+            torch.nn.init.trunc_normal_(m.latent_tokens, std = m.latent_tokens.size(-1) ** -0.5)
    
     def forward(self, fields: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
+        B = fields.size(0)
         # tokenize and add position codes
         tokens = self.to_tokens(fields) + self.src_positions
 
         # select visible
-        src = einops.rearrange(tokens[visible], '(b m) ... -> b m ...', b = tokens.size(0))
-
-        # encoder
+        src = einops.rearrange(tokens[visible], '(b m) ... -> b m ...', b = B)
+        
+        # latent encoder
+        latents = einops.repeat(self.latent_tokens, 'z d -> b z d', b = B)
+        latents, shape = einops.pack([src, latents], 'b * d')
         for read in self.encoder:
-            src = read(src)
-        src = self.to_decoder(src)
+            latents = read(latents)
+
+        # project latents to decoder
+        _, latents = einops.unpack(latents, shape, 'b * d')
+        latents = self.to_decoder(latents)
 
         # create queries from mask tokens and scatter src tokens
-        tgt = einops.repeat(self.mask_token.type_as(src), 'd -> b n d', b = tokens.size(0), n = tokens.size(1))
-        mask = einops.repeat(visible, 'b m -> b m d', d = tgt.size(-1))
-        tgt = tgt.masked_scatter(
-            mask = mask,
-            source = src
-        )
+        tgt = einops.repeat(self.mask_token, 'd -> b n d', b = B, n = tokens.size(1))
         tgt = tgt + self.tgt_positions
 
         # decoder
+        tgt, shape = einops.pack([tgt, latents], 'b * d')
         for write in self.decoder:
             tgt = write(tgt)
 
         # prediction head
+        tgt, _ = einops.unpack(latents, shape, 'b * d')
         pred = self.to_output(tgt)
         return pred
+    
