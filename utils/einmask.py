@@ -28,6 +28,10 @@ def init_sincos_positions(dim: int, world: WorldConfig):
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
+        # config attributes
+        self.network = network
+        self.world = world
+
         # learnable parameters
         self.latent_tokens = torch.nn.Parameter(torch.zeros(network.num_latents, network.dim))
         self.mask_token = torch.nn.Parameter(torch.zeros(network.dim_out))
@@ -60,7 +64,7 @@ class EinMask(torch.nn.Module):
         
         # Encoder / Decoder
         self.encoder = torch.nn.ModuleList([
-                TransformerBlock(dim= network.dim, num_heads= network.num_encoder_heads) 
+                TransformerBlock(dim= network.dim, num_heads= network.num_encoder_heads, drop_path= network.drop_path) 
                 for _ in range(default(network.num_read_blocks, 1))
                 ])
         
@@ -88,28 +92,28 @@ class EinMask(torch.nn.Module):
 
         # select visible
         src = einops.rearrange(tokens[visible], '(b m) ... -> b m ...', b = B)
-        
-        # latent encoder
+
+        # pack latents
         latents = einops.repeat(self.latent_tokens, 'z d -> b z d', b = B)
         latents, shape = einops.pack([src, latents], 'b * d')
+
+        # jointly encode latents and visible
         for read in self.encoder:
             latents = read(latents)
 
-        # project latents to decoder
-        _, latents = einops.unpack(latents, shape, 'b * d')
+        # project to decoder dim with optional bottleneck
+        if self.network.kwargs.get('bottleneck', False):
+            _, latents = einops.unpack(latents, shape, 'b * d')
         latents = self.to_decoder(latents)
 
-        # create queries from mask tokens and scatter src tokens
+        # create queries from mask tokens
         tgt = einops.repeat(self.mask_token, 'd -> b n d', b = B, n = tokens.size(1))
         tgt = tgt + self.tgt_positions
 
-        # decoder
-        tgt, shape = einops.pack([tgt, latents], 'b * d')
+        # cross-attention decoder
         for write in self.decoder:
-            tgt = write(tgt)
+            tgt = write(tgt, latents)
 
         # prediction head
-        tgt, _ = einops.unpack(latents, shape, 'b * d')
         pred = self.to_output(tgt)
         return pred
-    
