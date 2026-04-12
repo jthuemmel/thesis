@@ -38,17 +38,27 @@ class EinMask(torch.nn.Module):
         self.src_positions = torch.nn.Parameter(init_sincos_positions(network.dim, world= world))
         self.tgt_positions = torch.nn.Parameter(init_sincos_positions(network.dim_out, world= world))
 
-        # I/O 
-        self.to_tokens = torch.nn.Sequential(
-            EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) d',
-                   weight_shape = f'v {world.patch_pattern} d',
-                   d = network.dim_in, **world.token_sizes, **world.patch_sizes),
-            EinMix(f'b ({world.token_pattern}) c -> b ({world.token_pattern}) d',
-                   weight_shape = f'v d c',
-                   d = network.dim, c = network.dim_in, **world.token_sizes),
-            torch.nn.RMSNorm(network.dim)
-        )
-
+        # I/O
+        if self.network.kwargs.get('per_var_pca', False):
+            self.to_tokens = torch.nn.Sequential(
+                EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) vv c',
+                    weight_shape = f'v {world.patch_pattern} c',
+                    c = network.dim_in, **world.token_sizes, **world.patch_sizes),
+                EinMix(f'b ({world.token_pattern}) vv c -> b ({world.token_pattern}) d',
+                    weight_shape = f'v vv d c',
+                    d = network.dim, c = network.dim_in, vv = world.patch_sizes['vv'], **world.token_sizes),
+                torch.nn.RMSNorm(network.dim)
+            )
+        else:
+            self.to_tokens = torch.nn.Sequential(
+                EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) c',
+                    weight_shape = f'v {world.patch_pattern} c',
+                    c = network.dim_in, **world.token_sizes, **world.patch_sizes),
+                EinMix(f'b ({world.token_pattern}) c -> b ({world.token_pattern}) d',
+                    weight_shape = f'v d c',
+                    d = network.dim, c = network.dim_in, **world.token_sizes),
+                torch.nn.RMSNorm(network.dim)
+            )
         self.to_decoder = torch.nn.Sequential(
             torch.nn.RMSNorm(network.dim),
             torch.nn.Linear(network.dim, network.dim_out, bias = False),

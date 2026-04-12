@@ -284,7 +284,7 @@ class Experiment(DistributedTrainer):
         reservoir = weights.argsort(descending=True, dim = -1)
         
         # choose K elements
-        rs = torch.nn.init.trunc_normal_(torch.empty((1,), device = self.device), mean= 0.25, std= 0.15, a= 0.1, b= 0.4)
+        rs = torch.nn.init.trunc_normal_(torch.empty((1,), device = self.device), **self._cfg.objective.rate_cfg)
         K = rs.mul(self.world.num_tokens).long()
         visible = reservoir.argsort().lt(K)
         masked = visible.logical_not()
@@ -387,17 +387,17 @@ class Experiment(DistributedTrainer):
         plt.close()
 
         #RANK HIST
-        plt.figure(figsize=(12,4))
-        E = len(ds.ens)
-        ens = ds[f"temp_ocn_0a_pred"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, E)
-        obs = ds[f"temp_ocn_0a_tgt"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, 1)
-        rank_counts = np.bincount(np.sum(ens < obs, axis= -1), minlength= E + 1) / ens.shape[0]
-        plt.bar(np.arange(E + 1), rank_counts, alpha = 0.5)
-        plt.hlines(1 / (E + 1), 0, E, color="red", linestyle="dashed", linewidth=1)
-        plt.ylabel('Frequency')
-        plt.xlabel("Rank")
-        plt.savefig(self.model_dir / "rank_hist.png")
-        plt.close()
+        # plt.figure(figsize=(12,4))
+        # E = len(ds.ens)
+        # ens = ds[f"temp_ocn_0a_pred"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, E)
+        # obs = ds[f"temp_ocn_0a_tgt"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, 1)
+        # rank_counts = np.bincount(np.sum(ens < obs, axis= -1), minlength= E + 1) / ens.shape[0]
+        # plt.bar(np.arange(E + 1), rank_counts, alpha = 0.5)
+        # plt.hlines(1 / (E + 1), 0, E, color="red", linestyle="dashed", linewidth=1)
+        # plt.ylabel('Frequency')
+        # plt.xlabel("Rank")
+        # plt.savefig(self.model_dir / "rank_hist.png")
+        # plt.close()
 
         # ACC vs LAG
         plt.figure(figsize=(12,4))
