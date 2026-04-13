@@ -39,26 +39,16 @@ class EinMask(torch.nn.Module):
         self.tgt_positions = torch.nn.Parameter(init_sincos_positions(network.dim_out, world= world))
 
         # I/O
-        if self.network.kwargs.get('per_var_pca', False):
-            self.to_tokens = torch.nn.Sequential(
-                EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) vv c',
-                    weight_shape = f'v {world.patch_pattern} c',
-                    c = network.dim_in, **world.token_sizes, **world.patch_sizes),
-                EinMix(f'b ({world.token_pattern}) vv c -> b ({world.token_pattern}) d',
-                    weight_shape = f'v vv d c',
-                    d = network.dim, c = network.dim_in, vv = world.patch_sizes['vv'], **world.token_sizes),
-                torch.nn.RMSNorm(network.dim)
-            )
-        else:
-            self.to_tokens = torch.nn.Sequential(
-                EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) c',
-                    weight_shape = f'v {world.patch_pattern} c',
-                    c = network.dim_in, **world.token_sizes, **world.patch_sizes),
-                EinMix(f'b ({world.token_pattern}) c -> b ({world.token_pattern}) d',
-                    weight_shape = f'v d c',
-                    d = network.dim, c = network.dim_in, **world.token_sizes),
-                torch.nn.RMSNorm(network.dim)
-            )
+        self.to_tokens = torch.nn.Sequential( # maybe keep vv out of c here for delayed mixing
+            EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) c',
+                weight_shape = f'v {world.patch_pattern} c', 
+                c = network.dim_in, **world.token_sizes, **world.patch_sizes),
+            EinMix(f'b ({world.token_pattern}) c -> b ({world.token_pattern}) d',
+                weight_shape = f'v d c',
+                d = network.dim, c = network.dim_in, **world.token_sizes),
+            torch.nn.RMSNorm(network.dim)
+        )
+        
         self.to_decoder = torch.nn.Sequential(
             torch.nn.RMSNorm(network.dim),
             torch.nn.Linear(network.dim, network.dim_out, bias = False),
@@ -96,7 +86,7 @@ class EinMask(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.latent_tokens, std = m.latent_tokens.size(-1) ** -0.5)
    
     def forward(self, fields: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
-        B = fields.size(0)
+        B, N = fields.size(0), self.src_positions.size(0)
         # tokenize and add position codes
         tokens = self.to_tokens(fields) + self.src_positions
 
@@ -117,7 +107,7 @@ class EinMask(torch.nn.Module):
         latents = self.to_decoder(latents)
 
         # create queries from mask tokens
-        tgt = einops.repeat(self.mask_token, 'd -> b n d', b = B, n = tokens.size(1))
+        tgt = einops.repeat(self.mask_token, 'd -> b n d', b = B, n = N)
         tgt = tgt + self.tgt_positions
 
         # cross-attention decoder
