@@ -36,14 +36,6 @@ class TrainerInterface:
     """
     These methods must be implemented for each experiment
     """
-
-    def create_loss(self):
-        """
-        Returns a loss function.
-        Will be available as self.loss_fn.
-        """
-        raise NotImplementedError()   
-
     def create_dataset(self):
         """
         Returns a tuple of (train_dl, val_dl).
@@ -203,9 +195,6 @@ class DistributedTrainer(TrainerInterface):
         self.create_seed()
 
     def setup_optimizer(self):
-        self.loss_fn = self.create_loss()
-        if isinstance(self.loss_fn, torch.nn.Module):
-            self.loss_fn.to(self.device) 
         self.optimizer = self.create_optimizer(self.model.named_parameters())
         self.scheduler = self.create_scheduler(self.optimizer)
         self.grad_scaler = GradScaler(enabled=self.cfg.mixed_precision)

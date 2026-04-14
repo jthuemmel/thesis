@@ -85,7 +85,7 @@ class NetworkConfig:
     num_write_blocks: Optional[int] = None
     num_cnn_blocks: Optional[int] = None
     num_cls: Optional[int] = None
-    num_tails: Optional[int] = None
+    num_tails: Optional[int] = 1
     num_encoder_heads: Optional[int] = None
     num_decoder_heads: Optional[int] = None
     dim_in: Optional[int] = None
@@ -129,7 +129,7 @@ class WorldConfig:
     field_sizes: dict
     patch_sizes: dict
     batch_size: int
-    ens_size: int = 1
+    ens_size: Optional[int] = None
     tau: int = 2
     offsets: dict = field(default_factory=lambda: {'vv': 1, 'tt': 2, 'hh': 2, 'ww': 2})
     kwargs: Optional[dict] = field(default_factory=lambda: {})
@@ -194,25 +194,24 @@ class TrainerConfig:
 
     # Optimization
     epochs: Optional[int] = 1
-
-    use_zero: bool = False
     lr: float = 1e-4
     beta1: float = 0.9
-    beta2: float = 0.99
+    beta2: float = 0.95
     weight_decay: float = 0.01
 
-    schedulers: Optional[list ] = None
+    schedulers: Optional[list] = None
     scheduler_step: str = "batch"
     
+    loss_kwargs: Optional[dict] = None
+
     use_ema: bool = False
     ema_decay: float = 0.9999
-    
-    spectral_loss_weight: float = 0.
+
+    use_zero: bool = False
     mixed_precision: bool = True
     clip_gradients: bool = True
     clip_value: float = 1.
-    
-    num_workers: int = 4
+    num_workers: int = 0
 
     # Paths
     picontrol_path: str | Path = field(default_factory=lambda: DATA_DIR / Path("CMIP6_LENS/CESM2/piControl/temp_ocean_1_2_grid/processed"))

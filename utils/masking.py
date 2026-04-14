@@ -1,27 +1,6 @@
 import torch
 import einops
-from itertools import permutations
 from utils.config import *
-
-# MASKING STRATEGIES
-class ForecastMasking(torch.nn.Module):
-    def __init__(self, world: WorldConfig):
-        super().__init__()
-        self.world = world
-        self.event_pattern = 't'
-        self.register_buffer("prefix_frames", torch.tensor(world.tau, dtype = torch.long))
-        self.register_buffer("total_frames", torch.tensor(world.token_sizes["t"], dtype = torch.long))
-    
-    def forward(self, shape: tuple, return_indices: bool = True):
-        mask = torch.zeros((self.total_frames,), device = self.total_frames.device)
-        mask[:self.prefix_frames] = 1
-        mask = einops.repeat(mask, f'{self.event_pattern} -> ({self.world.token_pattern})', **self.world.token_sizes)
-        if return_indices:
-            src = mask.nonzero(as_tuple=True)[0]
-            tgt = mask.bool().logical_not().nonzero(as_tuple=True)[0]
-            return src.expand(*shape,-1), tgt.expand(*shape,-1)
-        else:
-            return mask.expand(*shape, -1).bool(), mask.expand(*shape, -1).bool().logical_not()
 
 class MaskingMixture(torch.nn.Module):
     def __init__(self, 
@@ -39,8 +18,8 @@ class MaskingMixture(torch.nn.Module):
         self.tgt = BinaryMasking(world, rate_cfg= rate_cfg.get('tgt', {}))
 
         self.components = event_cfg.get('components', [{}])
-        mixture_weights = event_cfg.get('weights', torch.ones(len(self.components)))
-        self.register_buffer('mixture_weights', torch.as_tensor(mixture_weights))
+        mixture_weights = event_cfg.get('weights', None)
+        self.register_buffer('mixture_weights', torch.as_tensor(default(mixture_weights, torch.ones(len(self.components)))))
 
     def forward(self, B: int, rng: torch.Generator = None):
         idx = torch.multinomial(self.mixture_weights, 1, generator = rng).item()
@@ -55,7 +34,7 @@ class MaskingMixture(torch.nn.Module):
             prefix = einops.repeat(prefix, f't -> b ({self.world.token_pattern})', **self.world.token_sizes, b = B)
 
         src = self.src(B, conditional = prefix, rng=rng)
-        tgt = self.tgt(B, conditional = src.logical_not() if exists(prefix) else None, rng=rng)
+        tgt = self.tgt(B, conditional = src.logical_not(), rng=rng)
         return src, tgt
 
 class BinaryMasking(torch.nn.Module):
@@ -96,21 +75,21 @@ class BinaryMasking(torch.nn.Module):
             P += U.log().div(alpha)
         return P
 
-    def rate_prior(self, B: int, rng: torch.Generator = None):
-        a_min = self.rate_cfg.get('min', 0)
-        a_max = self.rate_cfg.get('max', 1)
-        if self.rate_cfg.get('stratify', False):
-            U = self.stratified_uniform_(B, rng)
-        elif self.rate_cfg.get('randomize', False):
-            U = self.uniform_((B,), rng)
-        else:
-            U = self.uniform_((1,), rng).expand(B,)
-        R = U * (a_max - a_min) + a_min
-        return R.mul(self.world.num_tokens).long().unsqueeze(-1)
+    def rate_prior(self, rng: torch.Generator = None):
+        R = torch.empty((1,), device = self.device)
+        torch.nn.init.trunc_normal_(
+            R, 
+            self.rate_cfg.get("mean", 0.5), 
+            self.rate_cfg.get("std", 1.),
+            self.rate_cfg.get("a", 0.),
+            self.rate_cfg.get("b", 1.),
+            generator = rng
+            )
+        return R.mul(self.world.num_tokens).long()
 
     def forward(self, B: int, conditional: torch.Tensor = None, rng: torch.Generator = None) -> torch.BoolTensor:
         B = B[0] if isinstance(B, tuple) else B
-        K = self.rate_prior(B, rng)
+        K = self.rate_prior(rng)
         P = self.event_prior(B, rng)
         if exists(conditional): P += conditional.type_as(P).clamp(min=1e-9).log()
         return self.binary_topk_(P, K)
