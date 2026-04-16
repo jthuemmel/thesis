@@ -11,7 +11,6 @@ import numpy as np
 from pathlib import Path
 from dataclasses import replace
 from omegaconf import OmegaConf
-from torch.distributed.optim import ZeroRedundancyOptimizer
 
 from utils.config import *
 from utils.dataset import *
@@ -34,27 +33,31 @@ def count_parameters(model):
 class Experiment(DistributedTrainer):
     # PROPERTIES
     @property
-    def cfg(self):
+    def cfg(self) -> TrainerConfig:
         return self._cfg.trainer
     
     @property
-    def data_cfg(self):
+    def data_cfg(self) -> DatasetConfig:
         return self._cfg.data
 
     @property
-    def model_cfg(self):
+    def model_cfg(self) -> NetworkConfig:
         return self._cfg.model
     
     @property
-    def world(self):
+    def world(self) -> WorldConfig:
         return self._cfg.world
     
     @property
-    def use_fair_crps(self):
+    def objective(self) -> ObjectiveConfig:
+        return self._cfg.objective
+
+    @property
+    def use_fair_crps(self) -> bool:
         return default(self.world.ens_size, 1) > 1
     
     # DATA
-    def lens_data(self):
+    def lens_data(self) -> NinoData:
         if not hasattr(self, "_lens_data"):
             lens_config = self.data_cfg
             lens_config = replace(lens_config, 
@@ -64,7 +67,7 @@ class Experiment(DistributedTrainer):
             self._lens_data = MultifileNinoDataset(self.cfg.lens_path, lens_config, self.rank, self.world_size)
         return self._lens_data       
 
-    def godas_data(self):
+    def godas_data(self) -> NinoData:
         if not hasattr(self, "_godas_data"):
             godas_config = self.data_cfg
             godas_config = replace(godas_config, 
@@ -74,7 +77,7 @@ class Experiment(DistributedTrainer):
             self._godas_data = NinoData(self.cfg.godas_path, godas_config)
         return self._godas_data
 
-    def picontrol_data(self):
+    def picontrol_data(self) -> NinoData:
         if not hasattr(self, "_picontrol_data"):
             picontrol_config = self.data_cfg
             picontrol_config = replace(picontrol_config, 
@@ -83,21 +86,26 @@ class Experiment(DistributedTrainer):
             self._picontrol_data = NinoData(self.cfg.picontrol_path, picontrol_config)
         return self._picontrol_data
 
-    def oras5_data(self):
+    def oras5_data(self) -> NinoData:
         if not hasattr(self, "_oras5_data"):
             oras5_config = self.data_cfg
             oras5_config = replace(oras5_config, time_slice = {"start": "1980", "stop": "2020", "step": None})
             self._oras5_data = NinoData(self.cfg.oras5_path, oras5_config)
         return self._oras5_data
 
-    def create_dataset(self):
+    def create_dataset(self) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
         # instantiate datasets
         self.train_dataset = self.lens_data()
-        self.val_dataset = self.godas_data() if self.data_cfg.eval_data == "godas" else self.picontrol_data()
+        self.val_dataset = self.picontrol_data()
 
-        # create land-sea mask
-        self._val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
-        self._train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
+        # create land-sea masks
+        val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
+        self._val_lsm = einops.repeat(val_lsm, f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
+        
+        train_lsm = torch.logical_not(self.train_dataset.land_sea_mask.to(device= self.device, dtype=torch.bool))
+        self._train_lsm = einops.repeat(train_lsm, f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
 
         # dataloaders
         train_dl = torch.utils.data.DataLoader(
@@ -119,23 +127,36 @@ class Experiment(DistributedTrainer):
             )
         return train_dl, val_dl
     
+    def create_testset(self) -> torch.utils.data.DataLoader:
+        # instantiate dataset
+        self.test_dataset = self.godas_data()
+
+        # create land-sea mask
+        test_lsm = torch.logical_not(self.test_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
+        self._test_lsm = einops.repeat(test_lsm, f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
+                             **self.world.token_sizes, **self.world.patch_sizes)
+
+        # dataloader
+        return torch.utils.data.DataLoader(
+            self.test_dataset,
+            batch_size=self.world.batch_size,
+            num_workers=self.cfg.num_workers,
+            drop_last=True,
+            shuffle=False,
+            pin_memory=True,
+            )
+
     # SETUP
-    def setup_misc(self):
+    def setup_misc(self) -> None:
         self.step_counter = 0
         self.create_prior()
 
-    def create_prior(self):
+    def create_prior(self) -> None:
         prefix = torch.zeros((self.world.token_sizes["t"],), device = self.device, dtype = torch.bool)
         prefix[:self.world.tau] = True
         self.frcst_prefix = einops.repeat(prefix, f't -> ({self.world.token_pattern})', **self.world.token_sizes)
         
-        self.prior = MaskingMixture(
-            world= self.world,
-            event_cfg = self._cfg.objective.event_cfg,
-            rate_cfg = self._cfg.objective.rate_cfg,
-            ).to(self.device)
-        
-    def create_job_name(self):
+    def create_job_name(self) -> None:
         if exists(self.cfg.job_name):
             base_name = str(self.cfg.job_name).replace('/', '_')
         else:
@@ -144,23 +165,13 @@ class Experiment(DistributedTrainer):
         self.cfg.job_name = self.job_name # enables resuming from config by using the job name
     
     def create_optimizer(self, named_params):
-        if self.cfg.use_zero:
-            optimizer = ZeroRedundancyOptimizer(
-                [{'params': p} for n, p in named_params],
-                torch.optim.AdamW,
-                lr=self.cfg.lr,
-                weight_decay=self.cfg.weight_decay,
-                betas=(self.cfg.beta1, self.cfg.beta2)
-            )
-        else:
-            optimizer = torch.optim.AdamW(
+        return torch.optim.AdamW(
                 named_params,
                 lr=self.cfg.lr,
                 weight_decay=self.cfg.weight_decay,
                 betas=(self.cfg.beta1, self.cfg.beta2),
                 fused=True
             )
-        return optimizer
 
     def create_scheduler(self, optimizer):
         schedulers = []
@@ -207,20 +218,18 @@ class Experiment(DistributedTrainer):
         )
         return scheduler
 
-    def create_model(self):
+    def create_model(self) -> torch.nn.Module:
         model = EinMask(network=self.model_cfg, world=self.world)
-
-        # if exists(self.cfg.stage1_id):
-        #     vae_path = Path(self.cfg.model_dir) / self.cfg.stage1_id / 'best.pth'
-        #     vae = EinVAE(self.model_cfg.dim_in, self.world)
-        #     vae.load_state_dict(torch.load(vae_path)['model_state'])
-        #     model.tokenizer.load_state_dict(vae.state_dict())
-        #     model.tokenizer.requires_grad_(False)
-        #     print("Loaded VAE")
-        #model = EinVAE(self.model_cfg.dim_in, self.world)
         return model
 
-    # LOSS
+    @property
+    def land_sea_mask(self) -> torch.BoolTensor:
+        return self._train_lsm if self.mode == "train" else self._val_lsm
+
+    @property
+    def total_epochs(self) -> int:
+        return max(1, self.total_steps // len(self.train_dl))
+    
     @property
     def per_variable_weights(self) -> torch.FloatTensor:
         weights = {
@@ -239,64 +248,79 @@ class Experiment(DistributedTrainer):
                              f"(v vv) -> {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes)
     
-    @property
-    def land_sea_mask(self) -> torch.BoolTensor:
-        lsm = self._train_lsm if self.mode == "train" else self._val_lsm
-        return einops.repeat(lsm, 
-                             f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes)
+    # MASKING
+    def sample_normal_rates_(self, mean: float, std: float, a: float = 0., b: float = 1.):
+        return torch.nn.init.trunc_normal_(
+            torch.empty((1,), device = self.device), 
+            mean = mean, std = std, a = a, b = b, generator = self.generator
+            ).mul(self.world.num_tokens).long()
+
+    def sample_weighted_reservoir(self, num_samples: int):
+        P = torch.rand((num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
+        for dim, alpha in self.objective.event_cfg.items():
+            if not (exists(alpha) and dim in self.world.layout): continue
+            U = torch.rand((num_samples, self.world.token_sizes[dim]), device=self.device, generator=self.generator)
+            U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
+            P += U.log().div(alpha)
+        return P
     
-    def node_crps(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
-        score = f_kernel_crps(observation=obs, ensemble=ens, fair = self.use_fair_crps)
-        loss = (score * self.per_variable_weights)[mask].mean()
-        return loss
+    def sample_antithetic_weighted_reservoir(self, num_samples: int):
+        P1, P2 = torch.rand((2, num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
+        for dim, alpha in self.objective.event_cfg.items():
+            if not (exists(alpha) and dim in self.world.layout): continue
+            U = torch.rand((num_samples, self.world.token_sizes[dim]), device=self.device, generator=self.generator)
+            U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
+            P1 += U.log().div(alpha)
+            P2 += (1 - U).log().div(alpha)
+        return P1, P2
 
-    def spectral_crps(self, ens: torch.Tensor, obs: torch.Tensor, **kwargs):
-        w_v = self.per_variable_weights.mean(dim = (-1, -2, -3))
-        with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
-            e_fft = torch.fft.rfftn(ens.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
-            o_fft = torch.fft.rfftn(obs.float(), dim = (-1, -2, -3))
-        score = f_kernel_crps(observation=o_fft, ensemble= e_fft, fair = self.use_fair_crps).mean(dim=(-1, -2, -3)) #[B, V]
-        return score.mul(w_v).mean()
-    
-    def loss_fn(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
-        w_spectral = self.cfg.spectral_loss_weight
-        if w_spectral > 0:
-            spectral_loss = self.spectral_crps(ens = ens, obs = obs, mask = mask)
-            node_loss = self.node_crps(ens = ens, obs = obs, mask = mask)
-            loss = w_spectral * spectral_loss + node_loss  
-        else:
-            loss = self.node_crps(ens = ens, obs = obs, mask = mask)
-        return loss
-    
-    #FORWARD
-    @property
-    def total_epochs(self):
-        return max(1, self.total_steps // len(self.train_dl))
+    def sample_masks(self, num_samples: int):
+        # get config options
+        reservoir_mode = self.objective.kwargs.get('reservoir_mode', 'shared')  # shared | antithetic | independent
+        src_rate_cfg = self.objective.rate_cfg.src
+        tgt_rate_cfg = self.objective.rate_cfg.get('tgt', None)
 
-    def sample_masks(self, B: int):
-        # time-weighted reservoir sampler
-        base_factor = torch.rand((B, self.world.num_tokens), generator = self.generator, device = self.device).clamp(1e-5)
-        time_factor = torch.rand((B, self.world.token_sizes['t']), generator = self.generator, device = self.device).clamp(1e-5)
-        time_factor = einops.repeat(time_factor, f'b t -> b ({self.world.token_pattern})', **self.world.token_sizes)
+        # get reservoir weights
+        if reservoir_mode == 'antithetic':
+            src_weights, tgt_weights = self.sample_antithetic_weighted_reservoir(num_samples)
+        elif reservoir_mode == 'independent':
+            src_weights = self.sample_weighted_reservoir(num_samples)
+            tgt_weights = self.sample_weighted_reservoir(num_samples)
+        else:  # shared
+            src_weights = self.sample_weighted_reservoir(num_samples)
+            tgt_weights = src_weights
 
-        weights = base_factor.log() + time_factor.log().div(self.world.kwargs.get('alpha', 1.))
-        reservoir = weights.argsort(descending=True, dim = -1)
-        
-        # choose K elements
-        rs = torch.nn.init.trunc_normal_(torch.empty((1,), device = self.device), **self._cfg.objective.rate_cfg)
-        K = rs.mul(self.world.num_tokens).long()
-        visible = reservoir.argsort().lt(K)
-        masked = visible.logical_not()
-        return visible, masked
+        # sample src rate
+        K_src = self.sample_normal_rates_(**src_rate_cfg)
 
+        # choose K elements from src reservoir
+        src_reservoir = src_weights.argsort(descending=True)
+        src = src_reservoir.argsort(descending=False).lt(K_src)
+
+        # boolean complement if no tgt rate is specified
+        if tgt_rate_cfg is None:
+            return src, ~src
+
+        # else sample tgt rate
+        K_tgt = self.sample_normal_rates_(**tgt_rate_cfg)
+
+        # maybe condition on src mask
+        if self.objective.kwargs.get('condition_on_src', False):
+            tgt_weights = tgt_weights + src.float().clamp(1e-9).log()
+
+        # select from tgt reservoir
+        tgt_reservoir = tgt_weights.argsort(descending= self.objective.kwargs.get('tgt_descending', True))
+        tgt = tgt_reservoir.argsort(descending=False).lt(K_tgt)
+
+        return src, tgt
+
+    # FORWARD METHODS
     def forward_step(self, batch_idx, batch):        
         # sample masks
         visible, masked = self.sample_masks(batch.size(0))
         
         # foward model
-        mu, sigma = self.model(batch, visible)
-        sigma = torch.nn.functional.softplus(sigma)
+        prediction = self.model(batch, visible)
         
         # sea-only mask
         mask = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
@@ -304,12 +328,14 @@ class Experiment(DistributedTrainer):
         mask = torch.logical_and(mask, self.land_sea_mask)
 
         # loss
+        mu, sigma = prediction
+        sigma = torch.nn.functional.softplus(sigma)
         loss = f_gaussian_crps(batch, mu, sigma).mul(self.per_variable_weights)[mask].mean()
 
         #track metrics
         metrics = {'loss' : loss.item(),
-                   'acc': self.compute_acc(mu[mask], batch[mask]).item(),
-                   'rmse': self.compute_rmse(mu[mask], batch[mask]).item(),
+                   'acc': self.compute_acc(mu[mask], batch[mask]),
+                   'rmse': self.compute_rmse(mu[mask], batch[mask]),
                    'ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
                    }
         self.log_metrics(metrics)
@@ -320,24 +346,25 @@ class Experiment(DistributedTrainer):
     
     def frcst_step(self, batch_idx, batch):
         visible = self.frcst_prefix.expand(batch.size(0), -1)
-        mu, sigma = self.model(batch, visible)
-        sigma = torch.nn.functional.softplus(sigma)
+        prediction = self.model(batch, visible)
         
         # sea-only mask
         mask = einops.repeat(visible.logical_not(), f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
                              **self.world.token_sizes, **self.world.patch_sizes)
         mask = torch.logical_and(mask, self.land_sea_mask)
+
+        # gaussian loss
+        mu, sigma = prediction
+        mu = mu * self.land_sea_mask
+        sigma = torch.nn.functional.softplus(sigma)
         loss = f_gaussian_crps(batch, mu, sigma)[mask].mean()
 
         metrics = {'frcst_loss' : loss.item(),
-                   'frcst_acc': self.compute_acc(mu[mask], batch[mask]).item(),
-                   'frcst_rmse': self.compute_rmse(mu[mask], batch[mask]).item(),
+                   'frcst_acc': self.compute_acc(mu[mask], batch[mask]),
+                   'frcst_rmse': self.compute_rmse(mu[mask], batch[mask]),
                    'frcst_ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
                    }
         self.log_metrics(metrics)
-
-        mu = mu * self.land_sea_mask
-
         return mu, sigma
 
     #EVAL
@@ -418,7 +445,6 @@ class Experiment(DistributedTrainer):
         plt.savefig(self.model_dir / "skill.png")
         plt.close()
 
-
     def write_to_disk(self, data: xr.Dataset):
         path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
         data.to_zarr(path, mode = "w")
@@ -476,7 +502,7 @@ class Experiment(DistributedTrainer):
             tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
             pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
             rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            ssr = self.xr_spread_skill(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
+            ssr = self.xr_spread_skill_ens(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
             
             self.current_metrics.log_metric(f"{var}_pcc", pcc.item())
             self.current_metrics.log_metric(f"{var}_ssr", ssr.item())
@@ -501,13 +527,15 @@ class Experiment(DistributedTrainer):
         for lag in [3, 9, 15, 18, 21]:
             self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).item())
             self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).item())
+            self.current_metrics.log_metric(f"nino4_pcc_{lag}", nino4_pcc.sel(lag = lag).item())
+            self.current_metrics.log_metric(f"nino4_rmse_{lag}", nino4_rmse.sel(lag = lag).item())
         
     def log_metrics(self, metrics: dict, task: str = None):
         for key, val in metrics.items():
             name = f"{task}_{key}" if exists(task) and task != 'prior' else key
             self.current_metrics.log_metric(name, val)
-
-    def compute_metrics(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
+    
+    def compute_metrics_torch(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
         ens = ens[mask]
         obs = obs[mask]
         metrics = {
@@ -520,14 +548,13 @@ class Experiment(DistributedTrainer):
         }
         return metrics
 
-
     @staticmethod
     def get_nino4(da: xr.DataArray):
-        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])
     
     @staticmethod
     def get_nino34(da: xr.DataArray):
-        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])#.rolling(time = 3).mean()
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])
 
     @staticmethod
     def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
@@ -540,7 +567,7 @@ class Experiment(DistributedTrainer):
         return np.sqrt(((pred - obs) ** 2).mean(dim))
 
     @staticmethod
-    def xr_spread_skill(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
+    def xr_spread_skill_ens(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
         K = pred.sizes["ens"]
         correction = math.sqrt((K + 1) / K)
         mean = pred.mean("ens")
@@ -549,35 +576,35 @@ class Experiment(DistributedTrainer):
         return correction * (spread / skill)
     
     @staticmethod
-    def compute_acc(pred, obs, eps = 1e-5):
-        return (pred * obs).nansum() / (pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt() + eps)
+    def compute_acc(pred, obs, eps = 1e-5)-> float:
+        return (pred * obs).nansum().div(pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt() + eps).item()
     
     @staticmethod
-    def compute_rmse(pred, obs):
-        return (pred - obs).pow(2).nanmean().sqrt()
+    def compute_rmse(pred, obs)-> float:
+        return (pred - obs).pow(2).nanmean().sqrt().item()
     
     @staticmethod
-    def compute_crps(pred, obs, fair: bool = True):
+    def compute_crps_ens(pred, obs, fair: bool = True)-> float:
         crps = f_kernel_crps(observation=obs, ensemble=pred, fair = fair)
-        return crps.nanmean()
+        return crps.nanmean().item()
     
     @staticmethod
-    def compute_ign(pred, obs, eps = 1e-5):
+    def compute_ign_ens(pred, obs, eps = 1e-5)-> float:
         ign = f_gaussian_ignorance(observation=obs, mu=pred.mean(-1), sigma=pred.std(-1) + eps)
-        return ign.nanmean()
+        return ign.nanmean().item()
     
     @staticmethod
-    def compute_spread(pred):
-        return pred.var(-1).mean().sqrt()
+    def compute_spread_ens(pred)-> float:
+        return pred.var(-1).mean().sqrt().item()
 
     @staticmethod
-    def compute_spread_skill(pred, obs, eps = 1e-5):
+    def compute_spread_skill_ens(pred, obs, eps = 1e-5) -> float:
         K = pred.shape[-1]
         correction = math.sqrt((K + 1) / K)
         mean = pred.mean(-1)
         spread = pred.var(-1).mean().sqrt()
         skill = (obs - mean).pow(2).mean().sqrt() + eps
-        return correction * (spread / skill)
+        return (spread / skill).mul(correction).item()
 
 def main():
     parser = argparse.ArgumentParser(description="Train a MIN model")

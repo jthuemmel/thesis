@@ -123,6 +123,8 @@ class DatasetConfig:
 class ObjectiveConfig:
     rate_cfg: dict = field(default_factory=lambda: {})
     event_cfg: dict = field(default_factory=lambda: {})
+    kwargs: dict = field(default_factory=lambda: {})
+    epsilon: float = 1e-5
     
 @dataclass
 class WorldConfig:
