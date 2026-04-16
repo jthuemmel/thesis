@@ -86,14 +86,15 @@ class EinMask(torch.nn.Module):
             torch.nn.init.trunc_normal_(m.latent_tokens, std = m.latent_tokens.size(-1) ** -0.5)
    
     def forward(self, fields: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
-        B, N = fields.size(0), self.src_positions.size(0)
+        B = fields.size(0)
+        
         # tokenize and add position codes
         tokens = self.to_tokens(fields) + self.src_positions
 
         # select visible
         src = einops.rearrange(tokens[visible], '(b m) ... -> b m ...', b = B)
 
-        # pack latents
+        # pad with latent tokens
         latents = einops.repeat(self.latent_tokens, 'z d -> b z d', b = B)
         latents, shape = einops.pack([src, latents], 'b * d')
 
@@ -106,9 +107,9 @@ class EinMask(torch.nn.Module):
             _, latents = einops.unpack(latents, shape, 'b * d')
         latents = self.to_decoder(latents)
 
-        # create queries from mask tokens
-        tgt = einops.repeat(self.mask_token, 'd -> b n d', b = B, n = N)
-        tgt = tgt + self.tgt_positions
+        # create queries from position codes and add mask token
+        tgt = einops.repeat(self.tgt_positions, 'n d -> b n d', b = B)
+        tgt = tgt + self.mask_token
 
         # cross-attention decoder
         for write in self.decoder:
