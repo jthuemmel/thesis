@@ -219,7 +219,7 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self) -> torch.nn.Module:
-        model = EinMask(network=self.model_cfg, world=self.world)
+        model = EinAR(network=self.model_cfg, world=self.world)
         return model
 
     @property
@@ -315,7 +315,46 @@ class Experiment(DistributedTrainer):
         return src, tgt
 
     # FORWARD METHODS
-    def forward_step(self, batch_idx, batch):        
+    def forward_step(self, batch_idx, batch, step: str = 'train'):
+        loss, mu, sigma = self.ar_step(batch_idx, batch)
+        if step == 'frcst':
+            return mu, sigma
+        else:
+            return loss
+    
+    def ar_step(self, batch_idx, batch):        
+        # steps
+        steps = 1 if self.mode == 'train' and self.step_counter < 2500 else 4
+
+        # work around field size being per step
+        mask = einops.repeat(self.land_sea_mask, f'v t h w -> b v (s t) h w', b = batch.size(0), s = steps)
+        w_v = einops.repeat(self.per_variable_weights, f'v t h w -> b v (s t) h w', b = batch.size(0), s = steps)
+
+        # split batch
+        T = self.world.field_sizes['t']
+        src, tgt = batch[:, :, :T], batch[:, :, T: (steps + 1) * T]
+
+        # forward
+        prediction = self.model(src, steps)
+        
+        # loss
+        mu, sigma = prediction
+        sigma = torch.nn.functional.softplus(sigma)
+        loss = f_gaussian_crps(tgt, mu, sigma).mul(w_v)[mask].mean()
+
+        #track metrics
+        metrics = {'loss' : loss.item(),
+                   'acc': self.compute_acc(mu[mask], tgt[mask]),
+                   'rmse': self.compute_rmse(mu[mask], tgt[mask]),
+                   'ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - tgt[mask]).pow(2).mean().sqrt()).item(),
+                   }
+        self.log_metrics(metrics)
+
+        # update step counter if training
+        self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
+        return loss, mu, sigma
+    
+    def masked_step(self, batch_idx, batch):        
         # sample masks
         visible, masked = self.sample_masks(batch.size(0))
         
@@ -342,7 +381,7 @@ class Experiment(DistributedTrainer):
 
         # update step counter if training
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
-        return loss
+        return loss, mu, sigma
     
     def frcst_step(self, batch_idx, batch):
         visible = self.frcst_prefix.expand(batch.size(0), -1)
@@ -365,12 +404,12 @@ class Experiment(DistributedTrainer):
                    'frcst_ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
                    }
         self.log_metrics(metrics)
-        return mu, sigma
+        return loss, mu, sigma
 
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        self.evaluate_frcst()
+        #self.evaluate_frcst()
 
     def evaluate_frcst(self):
         self.switch_mode(train=False)
@@ -381,7 +420,7 @@ class Experiment(DistributedTrainer):
             batch = batch.to(self.device)
             with torch.no_grad():
                 with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                    mu, sigma = self.frcst_step(batch_idx, batch)
+                    mu, sigma = self.forward_step(batch_idx, batch, 'frcst')
                     samples.append(self.get_xarray_dataset(batch_idx, obs = batch.cpu(), pred = mu[..., None].cpu()))
 
         ds = xr.concat(samples, dim = "time")
