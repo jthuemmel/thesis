@@ -324,7 +324,7 @@ class Experiment(DistributedTrainer):
     
     def ar_step(self, batch_idx, batch):        
         # steps
-        steps = 1 if self.mode == 'train' and self.step_counter < 2500 else 4
+        steps = 1 if self.mode == 'train' and self.step_counter < self.objective.kwargs.get('pre_steps', 1) else self.world.tau
 
         # work around field size being per step
         mask = einops.repeat(self.land_sea_mask, f'v t h w -> b v (s t) h w', b = batch.size(0), s = steps)
