@@ -1,4 +1,36 @@
 
+def ar_step(self, batch_idx, batch):        
+        # steps
+        steps = 1 if self.mode == 'train' and self.step_counter < self.objective.kwargs.get('pre_steps', 1) else self.world.tau
+
+        # work around field size being per step
+        mask = einops.repeat(self.land_sea_mask, f'v t h w -> b v (s t) h w', b = batch.size(0), s = steps)
+        w_v = einops.repeat(self.per_variable_weights, f'v t h w -> b v (s t) h w', b = batch.size(0), s = steps)
+
+        # split batch
+        T = self.world.field_sizes['t']
+        src, tgt = batch[:, :, :T], batch[:, :, T: (steps + 1) * T]
+
+        # forward
+        prediction = self.model(src, steps)
+        
+        # loss
+        mu, sigma = prediction
+        sigma = torch.nn.functional.softplus(sigma)
+        loss = f_gaussian_crps(tgt, mu, sigma).mul(w_v)[mask].mean()
+
+        #track metrics
+        metrics = {'loss' : loss.item(),
+                   'acc': self.compute_acc(mu[mask], tgt[mask]),
+                   'rmse': self.compute_rmse(mu[mask], tgt[mask]),
+                   'ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - tgt[mask]).pow(2).mean().sqrt()).item(),
+                   }
+        self.log_metrics(metrics)
+
+        # update step counter if training
+        self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
+        return loss, mu, sigma
+
 # MAE TOK
 # def forward(self, fields: torch.FloatTensor, visible: torch.BoolTensor) -> torch.FloatTensor:
 #         B = fields.size(0)

@@ -16,6 +16,25 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
+def init_sincos_positions(dim: int, world: WorldConfig):
+    # integer indices
+    coordinates = torch.stack(torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape), dim = -1)
+    # log wavelengths
+    log_wavelengths = torch.as_tensor(world.token_shape).log()
+    # only encode shape dimensions with actual size
+    valid = log_wavelengths > 0
+    log_wavelengths = log_wavelengths[valid]
+    coordinates = coordinates[:, valid]
+    # space the frequencies according to the required number of bands
+    negative_spacing = torch.linspace(0, -1, dim // (coordinates.size(-1) * 2))
+    # calculate the sin/cos embeddings:
+    frequencies = torch.exp(negative_spacing * log_wavelengths[..., None])
+    angles = torch.einsum("n i, i d -> n i d", coordinates, frequencies) # overflows fp16, be careful
+    positions = einops.rearrange([angles.sin(), angles.cos()], 'two n i d -> n (two i d)')
+    # avoid uneven dimensions by zero-padding
+    positions = torch.nn.functional.pad(positions, (0, dim - positions.size(-1))) 
+    return positions
+
 class DropPath(torch.nn.Module):
     def __init__(self, drop_prob: float = 0.):
         super().__init__()
