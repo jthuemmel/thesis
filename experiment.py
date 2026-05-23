@@ -219,7 +219,7 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self) -> torch.nn.Module:
-        model = EinAR(network=self.model_cfg, world=self.world)
+        model = EinMask(network=self.model_cfg, world=self.world)
         return model
 
     @property
@@ -316,10 +316,11 @@ class Experiment(DistributedTrainer):
 
     # FORWARD METHODS
     def forward_step(self, batch_idx, batch, step: str = 'train'):
-        loss, mu, sigma = self.masked_step(batch_idx, batch)
         if step == 'frcst':
+            loss, mu, sigma = self.frcst_step(batch_idx, batch)
             return mu, sigma
         else:
+            loss, mu, sigma = self.masked_step(batch_idx, batch)
             return loss
 
     def masked_step(self, batch_idx, batch):        
@@ -491,7 +492,7 @@ class Experiment(DistributedTrainer):
                 },
             )
             arrays.append(data_array)
-        ds = xr.merge(arrays)
+        ds = xr.merge(arrays, compat = 'no_conflicts')
         return ds
 
     def get_xr_lsm(self, data: xr.Dataset):
