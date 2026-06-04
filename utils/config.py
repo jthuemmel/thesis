@@ -137,22 +137,22 @@ class WorldConfig:
     kwargs: Optional[dict] = field(default_factory=lambda: {})
 
     # derived fields
-    layout: tuple = field(init=False)
-    token_sizes: dict = field(init=False)
-    kernel_sizes: dict = field(init=False)
+    layout: tuple = field(default_factory=lambda: ())
+    token_sizes: dict = field(default_factory=lambda: {})
+    kernel_sizes: dict = field(default_factory=lambda: {})
 
-    token_shape: tuple = field(init=False)
-    field_shape: tuple = field(init=False)
-    patch_shape: tuple = field(init=False)
+    token_shape: tuple = field(default_factory=lambda: ())
+    field_shape: tuple = field(default_factory=lambda: ())
+    patch_shape: tuple = field(default_factory=lambda: ())
     
-    num_tokens: int = field(init=False)
-    num_elements: int = field(init=False)
-    dim_tokens: int = field(init=False)
+    num_tokens: int = field(default_factory=lambda: -1)
+    num_elements: int = field(default_factory=lambda: -1)
+    dim_tokens: int = field(default_factory=lambda: -1)
 
-    field_pattern: str = field(init=False)
-    token_pattern: str = field(init=False)
-    patch_pattern: str = field(init=False)
-    flat_pattern: str = field(init=False)
+    field_pattern: str = field(default_factory=lambda: '')
+    token_pattern: str = field(default_factory=lambda: '')
+    patch_pattern: str = field(default_factory=lambda: '')
+    flat_pattern: str = field(default_factory=lambda: '')
 
     def __post_init__(self):
         self.layout = tuple(self.field_sizes.keys())
@@ -242,7 +242,7 @@ class MTMConfig:
         return cls(
             trainer=TrainerConfig(**cfg.trainer),
             data=DatasetConfig(**cfg.data),
-            model =  NetworkConfig(**cfg.model),
+            model=NetworkConfig(**cfg.model),
             world=WorldConfig(**cfg.world),
             objective=ObjectiveConfig(**cfg.objective),
         )
