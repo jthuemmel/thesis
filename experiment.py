@@ -264,6 +264,24 @@ class Experiment(DistributedTrainer):
             P += U.log().div(alpha)
         return P
     
+    def sample_block_noise(self, K: int, num_samples: int):
+        d = torch.arange(1, K + 1, device = self.device)
+        d = d[K % d == 0]
+        idx = torch.multinomial(1 / d, 1, generator= self.generator)
+        KK = d[idx]
+        U = torch.rand((num_samples, K // KK), device= self.device, generator= self.generator)
+        U = einops.repeat(U, f'... k -> ... (k kk)', kk = KK, k = K // KK)
+        return U
+    
+    def sample_weighted_reservoir_blocks(self, num_samples: int):
+        P = torch.rand((num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
+        for dim, alpha in self.objective.event_cfg.items():
+            if not (exists(alpha) and dim in self.world.layout): continue
+            U = self.sample_block_noise(self.world.token_sizes[dim], num_samples)
+            U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
+            P += U.log().div(alpha)
+        return P
+    
     def sample_antithetic_weighted_reservoir(self, num_samples: int):
         P1, P2 = torch.rand((2, num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
         for dim, alpha in self.objective.event_cfg.items():
@@ -286,6 +304,9 @@ class Experiment(DistributedTrainer):
         elif reservoir_mode == 'independent':
             src_weights = self.sample_weighted_reservoir(num_samples)
             tgt_weights = self.sample_weighted_reservoir(num_samples)
+        elif reservoir_mode == 'blocks':
+            src_weights = self.sample_weighted_reservoir_blocks(num_samples)
+            tgt_weights = src_weights
         else:  # shared
             src_weights = self.sample_weighted_reservoir(num_samples)
             tgt_weights = src_weights
