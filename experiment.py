@@ -265,9 +265,10 @@ class Experiment(DistributedTrainer):
         return P
     
     def sample_block_noise(self, K: int, num_samples: int):
+        block_weight = self.objective.kwargs.get('block_weight', 1.)
         d = torch.arange(1, K + 1, device = self.device)
         d = d[K % d == 0]
-        idx = torch.multinomial(1 / d, 1, generator= self.generator)
+        idx = torch.multinomial(1 / d.pow(block_weight), 1, generator= self.generator)
         KK = d[idx]
         U = torch.rand((num_samples, K // KK), device= self.device, generator= self.generator)
         U = einops.repeat(U, f'... k -> ... (k kk)', kk = KK, k = K // KK)

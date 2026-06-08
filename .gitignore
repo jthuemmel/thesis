@@ -8,6 +8,7 @@
 /runs/
 /scripts/
 /scratch/
+/ai/
 *.npz
 *.npy
 *.pth
