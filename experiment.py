@@ -55,6 +55,10 @@ class Experiment(DistributedTrainer):
         return self._cfg.objective
 
     @property
+    def use_ens(self) -> bool:
+        return self.world.kwargs.get('ensemble', True)
+
+    @property
     def use_fair_crps(self) -> bool:
         return default(self.world.ens_size, 1) > 1
     
@@ -331,8 +335,6 @@ class Experiment(DistributedTrainer):
         return samples, visible
 
     def masked_step(self, batch_idx, batch):
-        use_ens = self.world.kwargs.get('ensemble', True)
-
         # sample masks
         visible, masked = self.sample_masks(batch.size(0))
 
@@ -344,7 +346,7 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, **self.world.patch_sizes)
         mask = torch.logical_and(mask, self.land_sea_mask)
 
-        if use_ens:
+        if self.use_ens:
             # samples: (B, V, T, H, W, E)
             samples = samples * self.land_sea_mask[..., None]
             loss = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps
@@ -364,8 +366,6 @@ class Experiment(DistributedTrainer):
         return loss, samples, visible
 
     def frcst_step(self, batch_idx, batch):
-        use_ens = self.world.kwargs.get('ensemble', True)
-
         visible = self.frcst_prefix.expand(batch.size(0), -1)
 
         # forward model — rng is accepted by both EinMask and EinMask_ENS
@@ -376,7 +376,7 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, **self.world.patch_sizes)
         mask = torch.logical_and(mask, self.land_sea_mask)
 
-        if use_ens:
+        if self.use_ens:
             # samples: (B, V, T, H, W, E)
             samples = samples * self.land_sea_mask[..., None]
             loss = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps)[mask].mean()
@@ -402,7 +402,6 @@ class Experiment(DistributedTrainer):
             self.evaluate_step('masked')
 
     def evaluate_step(self, step: str = 'frcst'):
-        use_ens = self.world.kwargs.get('ensemble', True)
         self.switch_mode(train=False)
         if not exists(self.val_dl):
             return
@@ -412,7 +411,7 @@ class Experiment(DistributedTrainer):
             with torch.no_grad():
                 with torch.amp.autocast(device_type=self.device.type, enabled=self.cfg.mixed_precision):
                     samples, visible = self.forward_step(batch_idx, batch, step)
-                    if use_ens:
+                    if self.use_ens:
                         results.append(self.get_xarray_dataset_ens(
                             batch_idx, obs=batch.cpu(), samples=samples.cpu(), visible=visible.cpu()))
                     else:
@@ -427,7 +426,7 @@ class Experiment(DistributedTrainer):
         )
         ds = ds.sel(lat=slice(-20., 20.), lon=slice(90, 270))
 
-        if use_ens:
+        if self.use_ens:
             self.get_nino_metrics_ens(ds)
             self.get_field_metrics_ens(ds)
             if self.is_root:
