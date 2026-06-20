@@ -38,7 +38,7 @@ class EinMask_ENS(torch.nn.Module):
             EinMix(f'b ({world.token_pattern}) d -> b {world.field_pattern}',
                    weight_shape = f'v {world.patch_pattern} d',
                    d = DO, **world.patch_sizes, **world.token_sizes),
-            #GaussianSmoothing3D(world.field_shape[0], kernel_size= 5, sigma= 1.),
+            GaussianSmoothing3D(world.field_shape[0], kernel_size= 5, sigma= 1.),
         )
 
         self.to_decoder = torch.nn.Sequential(

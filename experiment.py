@@ -56,7 +56,7 @@ class Experiment(DistributedTrainer):
 
     @property
     def use_ens(self) -> bool:
-        return self.world.kwargs.get('ensemble', True)
+        return self.world.kwargs.get('ensemble', False)
 
     @property
     def use_fair_crps(self) -> bool:
@@ -535,7 +535,7 @@ class Experiment(DistributedTrainer):
         ne = self.xr_ne(pred, obs, space).mean('time', skipna=True).values
         sdav = float(np.nanmean(self.xr_sdav(obs, space).mean('time', skipna=True).values))
         lags = pred['step'].values - pred['step'].values[0] + 1
-        rmax = np.nanmax([sdav, info.max(), ne.max()]) * 1.1
+        rmax = np.nanmax([sdav, np.nanmax(info), np.nanmax(ne)]) * 1.1
         fig, ax = plt.subplots(figsize=(7.5, 7.5))
         th = np.linspace(0, np.pi / 2, 200)
         for acc in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]:
@@ -885,7 +885,7 @@ class Experiment(DistributedTrainer):
     def xr_kernel_crps(pred: xr.DataArray, obs: xr.DataArray, fair: bool = False) -> xr.DataArray:
         E = pred.sizes['ens']
         coef = -1 / (E * (E - 1)) if fair else -1 / (E**2)
-        mae = (pred - obs).abs().mean('ens', skipna=True)
+        mae = np.abs(pred - obs).mean('ens', skipna=True)
         def _pairwise(p):
             total = np.zeros(p.shape[:-1], dtype=np.float32)
             for i in range(E):
