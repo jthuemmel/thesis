@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import xarray as xr
 import numpy as np
 
+from scipy.special import erf
+
 from pathlib import Path
 from dataclasses import replace
 from omegaconf import OmegaConf
@@ -126,36 +128,11 @@ class Experiment(DistributedTrainer):
             pin_memory=True,
             )
         return train_dl, val_dl
-    
-    def create_testset(self) -> torch.utils.data.DataLoader:
-        # instantiate dataset
-        self.test_dataset = self.godas_data()
-
-        # create land-sea mask
-        test_lsm = torch.logical_not(self.test_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
-        self._test_lsm = einops.repeat(test_lsm, f"1 (h hh) (w ww) -> {self.world.field_pattern}", 
-                             **self.world.token_sizes, **self.world.patch_sizes)
-
-        # dataloader
-        return torch.utils.data.DataLoader(
-            self.test_dataset,
-            batch_size=self.world.batch_size,
-            num_workers=self.cfg.num_workers,
-            drop_last=True,
-            shuffle=False,
-            pin_memory=True,
-            )
 
     # SETUP
     def setup_misc(self) -> None:
         self.step_counter = 0
-        self.create_prior()
 
-    def create_prior(self) -> None:
-        prefix = torch.zeros((self.world.token_sizes["t"],), device = self.device, dtype = torch.bool)
-        prefix[:self.world.tau] = True
-        self.frcst_prefix = einops.repeat(prefix, f't -> ({self.world.token_pattern})', **self.world.token_sizes)
-        
     def create_job_name(self) -> None:
         if exists(self.cfg.job_name):
             base_name = str(self.cfg.job_name).replace('/', '_')
@@ -219,8 +196,9 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self) -> torch.nn.Module:
-        model = EinMask(network=self.model_cfg, world=self.world)
-        return model
+        if self.world.kwargs.get('ensemble', True):
+            return EinMask_ENS(network=self.model_cfg, world=self.world)
+        return EinMask(network=self.model_cfg, world=self.world)
 
     @property
     def land_sea_mask(self) -> torch.BoolTensor:
@@ -249,6 +227,12 @@ class Experiment(DistributedTrainer):
                              **self.world.token_sizes, **self.world.patch_sizes)
     
     # MASKING
+    @property
+    def frcst_prefix(self) -> None:
+        prefix = torch.zeros((self.world.token_sizes["t"],), device = self.device, dtype = torch.bool)
+        prefix[:self.world.tau] = True
+        return einops.repeat(prefix, f't -> ({self.world.token_pattern})', **self.world.token_sizes)
+        
     def sample_normal_rates_(self, mean: float, std: float, a: float = 0., b: float = 1.):
         return torch.nn.init.trunc_normal_(
             torch.empty((1,), device = self.device), 
@@ -339,296 +323,608 @@ class Experiment(DistributedTrainer):
     # FORWARD METHODS
     def forward_step(self, batch_idx, batch, step: str = 'train'):
         if step == 'frcst':
-            loss, mu, sigma = self.frcst_step(batch_idx, batch)
-            return mu, sigma
+            loss, samples, visible = self.frcst_step(batch_idx, batch)
         else:
-            loss, mu, sigma = self.masked_step(batch_idx, batch)
+            loss, samples, visible = self.masked_step(batch_idx, batch)
+        if step == 'train':
             return loss
+        return samples, visible
 
-    def masked_step(self, batch_idx, batch):        
+    def masked_step(self, batch_idx, batch):
+        use_ens = self.world.kwargs.get('ensemble', True)
+
         # sample masks
         visible, masked = self.sample_masks(batch.size(0))
-        
-        # foward model
-        prediction = self.model(batch, visible)
-        
+
+        # forward model — rng is accepted by both EinMask and EinMask_ENS
+        samples = self.model(batch, visible, rng=self.generator)
+
         # sea-only mask
-        mask = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
+        mask = einops.repeat(masked, f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
                              **self.world.token_sizes, **self.world.patch_sizes)
         mask = torch.logical_and(mask, self.land_sea_mask)
 
-        # loss
-        mu, sigma = prediction
-        sigma = torch.nn.functional.softplus(sigma)
-        loss = f_gaussian_crps(batch, mu, sigma).mul(self.per_variable_weights)[mask].mean()
+        if use_ens:
+            # samples: (B, V, T, H, W, E)
+            samples = samples * self.land_sea_mask[..., None]
+            loss = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps
+                                 ).mul(self.per_variable_weights)[mask].mean()
+            metrics = {'loss' : loss.item(), **self.compute_metrics_torch_ens(samples, batch, mask)}
+        else:
+            # samples: (2, B, V, T, H, W) — unpack mu/sigma heads
+            mu, sigma = samples
+            mu = mu * self.land_sea_mask
+            sigma = torch.nn.functional.softplus(sigma)
+            loss = f_gaussian_crps(batch, mu, sigma).mul(self.per_variable_weights)[mask].mean()
+            metrics = {'loss' : loss.item(), **self.compute_metrics_torch_mve(mu, sigma, batch, mask)}
+            samples = torch.stack([mu, sigma])
 
-        #track metrics
-        metrics = {'loss' : loss.item(),
-                   'acc': self.compute_acc(mu[mask], batch[mask]),
-                   'rmse': self.compute_rmse(mu[mask], batch[mask]),
-                   'ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
-                   }
         self.log_metrics(metrics)
-
-        # update step counter if training
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
-        return loss, mu, sigma
-    
+        return loss, samples, visible
+
     def frcst_step(self, batch_idx, batch):
+        use_ens = self.world.kwargs.get('ensemble', True)
+
         visible = self.frcst_prefix.expand(batch.size(0), -1)
-        prediction = self.model(batch, visible)
-        
-        # sea-only mask
-        mask = einops.repeat(visible.logical_not(), f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}", 
+
+        # forward model — rng is accepted by both EinMask and EinMask_ENS
+        samples = self.model(batch, visible, rng=self.generator)
+
+        # sea-only mask (forecast region only)
+        mask = einops.repeat(visible.logical_not(), f"b ({self.world.token_pattern}) -> b {self.world.field_pattern}",
                              **self.world.token_sizes, **self.world.patch_sizes)
         mask = torch.logical_and(mask, self.land_sea_mask)
 
-        # gaussian loss
-        mu, sigma = prediction
-        mu = mu * self.land_sea_mask
-        sigma = torch.nn.functional.softplus(sigma)
-        loss = f_gaussian_crps(batch, mu, sigma)[mask].mean()
+        if use_ens:
+            # samples: (B, V, T, H, W, E)
+            samples = samples * self.land_sea_mask[..., None]
+            loss = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps)[mask].mean()
+            step_metrics = self.compute_metrics_torch_ens(samples, batch, mask)
+        else:
+            # samples: (2, B, V, T, H, W) — unpack mu/sigma heads
+            mu, sigma = samples
+            mu = mu * self.land_sea_mask
+            sigma = torch.nn.functional.softplus(sigma)
+            loss = f_gaussian_crps(batch, mu, sigma)[mask].mean()
+            step_metrics = self.compute_metrics_torch_mve(mu, sigma, batch, mask)
+            samples = torch.stack([mu, sigma])
 
-        metrics = {'frcst_loss' : loss.item(),
-                   'frcst_acc': self.compute_acc(mu[mask], batch[mask]),
-                   'frcst_rmse': self.compute_rmse(mu[mask], batch[mask]),
-                   'frcst_ssr': (sigma[mask].pow(2).mean().sqrt() / (mu[mask] - batch[mask]).pow(2).mean().sqrt()).item(),
-                   }
+        metrics = {'frcst_loss' : loss.item(), **{f'frcst_{k}' : v for k, v in step_metrics.items()}}
         self.log_metrics(metrics)
-        return loss, mu, sigma
+        return loss, samples, visible
 
     #EVAL
     def evaluate_epoch(self):
         super().evaluate_epoch()
-        self.evaluate_frcst()
+        self.evaluate_step('frcst')
+        if self.world.kwargs.get('eval_masked', False):
+            self.evaluate_step('masked')
 
-    def evaluate_frcst(self):
+    def evaluate_step(self, step: str = 'frcst'):
+        use_ens = self.world.kwargs.get('ensemble', True)
         self.switch_mode(train=False)
         if not exists(self.val_dl):
             return
-        samples = []
+        results = []
         for batch_idx, batch in enumerate(self.val_dl):
             batch = batch.to(self.device)
             with torch.no_grad():
-                with torch.amp.autocast(device_type = self.device.type, enabled=self.cfg.mixed_precision):
-                    mu, sigma = self.forward_step(batch_idx, batch, 'frcst')
-                    samples.append(self.get_xarray_dataset(batch_idx, obs = batch.cpu(), pred = mu[..., None].cpu()))
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.cfg.mixed_precision):
+                    samples, visible = self.forward_step(batch_idx, batch, step)
+                    if use_ens:
+                        results.append(self.get_xarray_dataset_ens(
+                            batch_idx, obs=batch.cpu(), samples=samples.cpu(), visible=visible.cpu()))
+                    else:
+                        mu, sigma = samples
+                        results.append(self.get_xarray_dataset_mve(
+                            batch_idx, obs=batch.cpu(), mu=mu.cpu(), sigma=sigma.cpu(), visible=visible.cpu()))
 
-        ds = xr.concat(samples, dim = "time")
-        ds = ds.sel(lat = slice(-20., 20.), lon = slice(90, 270))
-        self.get_nino_metrics(ds)
-        self.get_field_metrics(ds)
+        ds = xr.concat(results, dim='time')
+        ds['lsm'] = xr.DataArray(
+            np.bool_(self.val_dataset.land_sea_mask[0]),
+            coords={'lat' : self.val_dataset.dataset.lat, 'lon' : self.val_dataset.dataset.lon}
+        )
+        ds = ds.sel(lat=slice(-20., 20.), lon=slice(90, 270))
 
-        if self.is_root:
-            self.make_eval_plots(ds)
+        if use_ens:
+            self.get_nino_metrics_ens(ds)
+            self.get_field_metrics_ens(ds)
+            if self.is_root:
+                self.make_eval_plots_ens(ds)
+        else:
+            self.get_nino_metrics_mve(ds)
+            self.get_field_metrics_mve(ds)
+            if self.is_root:
+                self.make_eval_plots_mve(ds)
 
         if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
             self.write_to_disk(ds)
 
-    def make_eval_plots(self, ds: xr.Dataset):
-        # SAMPLES
-        plt.figure(figsize=(12,12))
-        plt.subplot(321)
-        ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20).mean('ens').plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        plt.subplot(322)
-        ds[f"temp_ocn_0a_tgt"].isel(time = 0, lag = 20).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        # plt.subplot(323)
-        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 0).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        # plt.subplot(324)
-        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 1).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        # plt.subplot(325)
-        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 2).plot(vmin=-2, vmax = 2, cmap= 'bwr')
-        # plt.subplot(326)
-        # ds[f"temp_ocn_0a_pred"].isel(time = 0, lag = 20, ens = 3).plot(vmin=-2, vmax = 2, cmap= 'bwr')
+    def make_eval_plots_ens(self, ds: xr.Dataset):
+        history = self.world.tau * self.world.patch_sizes['tt']
+        valid = ~ds['temp_ocn_0a_visible'].astype(bool) & ~ds['lsm']
+        pred = ds['temp_ocn_0a_pred'].where(valid).isel(step=slice(history, None))
+        obs = ds['temp_ocn_0a_obs'].where(valid).isel(step=slice(history, None))
+        pred_mean = pred.mean('ens', skipna=True)
+        self.plot_sample_ens(pred, obs, 20)
+        self.plot_rank_hist(pred, obs, [1, 7, 13, 19])
+        self.plot_skill(pred_mean, obs)
+        self.plot_info_noise(pred_mean, obs)
+
+    def make_eval_plots_mve(self, ds: xr.Dataset):
+        history = self.world.tau * self.world.patch_sizes['tt']
+        valid = ~ds['temp_ocn_0a_visible'].astype(bool) & ~ds['lsm']
+        mu = ds['temp_ocn_0a_pred_mu'].where(valid).isel(step=slice(history, None))
+        sigma = ds['temp_ocn_0a_pred_sigma'].where(valid).isel(step=slice(history, None))
+        obs = ds['temp_ocn_0a_obs'].where(valid).isel(step=slice(history, None))
+        self.plot_sample_mve(mu, sigma, 20)
+        self.plot_skill(mu, obs)
+        self.plot_info_noise(mu, obs)
+
+    def plot_sample_ens(self, pred: xr.DataArray, obs: xr.DataArray, step_fc: int):
+        E = pred.sizes['ens']
+        E_plot = min(4, E)
+        n_panels = 2 + E_plot
+        ncols = 2
+        nrows = math.ceil(n_panels / ncols)
+        kw = dict(vmin=-2, vmax=2, cmap='bwr')
+        plt.figure(figsize=(12, 4 * nrows))
+        plt.subplot(nrows, ncols, 1)
+        pred.isel(time=0, step=step_fc).mean('ens', skipna=True).plot(**kw)
+        plt.title('ens mean')
+        plt.subplot(nrows, ncols, 2)
+        obs.isel(time=0, step=step_fc).plot(**kw)
+        plt.title('obs')
+        for i in range(E_plot):
+            plt.subplot(nrows, ncols, 3 + i)
+            pred.isel(time=0, step=step_fc, ens=i).plot(**kw)
+            plt.title(f'member {i}')
+        plt.tight_layout()
         plt.savefig(self.model_dir / "test_sample.png")
         plt.close()
 
-        #RANK HIST
-        # plt.figure(figsize=(12,4))
-        # E = len(ds.ens)
-        # ens = ds[f"temp_ocn_0a_pred"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, E)
-        # obs = ds[f"temp_ocn_0a_tgt"].sel(lag = [1, 7, 13, 19]).values.reshape(-1, 1)
-        # rank_counts = np.bincount(np.sum(ens < obs, axis= -1), minlength= E + 1) / ens.shape[0]
-        # plt.bar(np.arange(E + 1), rank_counts, alpha = 0.5)
-        # plt.hlines(1 / (E + 1), 0, E, color="red", linestyle="dashed", linewidth=1)
-        # plt.ylabel('Frequency')
-        # plt.xlabel("Rank")
-        # plt.savefig(self.model_dir / "rank_hist.png")
-        # plt.close()
+    def plot_rank_hist(self, pred: xr.DataArray, obs: xr.DataArray, step_lags: list):
+        E = pred.sizes['ens']
+        ens_vals = pred.isel(step=step_lags).values.reshape(-1, E)
+        obs_vals = obs.isel(step=step_lags).values.reshape(-1, 1)
+        valid_rows = ~np.isnan(ens_vals).any(axis=-1) & ~np.isnan(obs_vals[:, 0])
+        ens_vals, obs_vals = ens_vals[valid_rows], obs_vals[valid_rows]
+        rank_counts = np.bincount(np.sum(ens_vals < obs_vals, axis=-1), minlength=E + 1) / ens_vals.shape[0]
+        plt.figure(figsize=(8, 4))
+        plt.bar(np.arange(E + 1), rank_counts, alpha=0.5)
+        plt.hlines(1 / (E + 1), 0, E, color='red', linestyle='dashed', linewidth=1)
+        plt.ylabel('Frequency')
+        plt.xlabel('Rank')
+        plt.tight_layout()
+        plt.savefig(self.model_dir / "rank_hist.png")
+        plt.close()
 
-        # ACC vs LAG
-        plt.figure(figsize=(12,4))
-        nino34_tgt, nino34_pred = self.get_nino34(ds["temp_ocn_0a_tgt"]), self.get_nino34(ds["temp_ocn_0a_pred"].mean('ens'))
-        nino4_tgt, nino4_pred = self.get_nino4(ds["temp_ocn_0a_tgt"]), self.get_nino4(ds["temp_ocn_0a_pred"].mean('ens'))
-        nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
-        nino4_pcc = self.xr_pcc(nino4_pred, nino4_tgt, ("time",))
-        pcc = self.xr_pcc(ds["temp_ocn_0a_pred"].mean('ens'), ds["temp_ocn_0a_tgt"], ('lat', 'lon')).mean(('time'))
-        plt.plot(ds.lag, nino34_pcc, label = 'nino3.4')
-        plt.plot(ds.lag, nino4_pcc, label = 'nino4')
-        plt.plot(ds.lag, pcc, label = 'SSTa')
+    def plot_skill(self, pred: xr.DataArray, obs: xr.DataArray):
+        lags_axis = pred['step'].values - pred['step'].values[0] + 1
+        nino34_pcc = self.xr_pcc(self.get_nino34(pred), self.get_nino34(obs), ('time',))
+        nino4_pcc = self.xr_pcc(self.get_nino4(pred), self.get_nino4(obs), ('time',))
+        pcc = self.xr_pcc(pred, obs, ('lat', 'lon')).mean('time', skipna=True)
+        plt.figure(figsize=(12, 4))
+        plt.plot(lags_axis, nino34_pcc.values, label='nino3.4')
+        plt.plot(lags_axis, nino4_pcc.values, label='nino4')
+        plt.plot(lags_axis, pcc.values, label='SSTa')
         plt.ylim(0, 1)
-        plt.hlines(0.5, ds.lag[0], ds.lag[-1], colors='r', linestyles='dashed')
+        plt.hlines(0.5, lags_axis[0], lags_axis[-1], colors='r', linestyles='dashed')
         plt.legend()
-        plt.xlabel("Lag")
-        plt.ylabel("Correlation")
+        plt.xlabel('Lag')
+        plt.ylabel('Correlation')
         plt.tight_layout()
         plt.savefig(self.model_dir / "skill.png")
         plt.close()
 
+    def plot_sample_mve(self, mu: xr.DataArray, sigma: xr.DataArray, step_fc: int):
+        plt.figure(figsize=(12, 4))
+        plt.subplot(121)
+        mu.isel(time=0, step=step_fc).plot(vmin=-2, vmax=2, cmap='bwr')
+        plt.title('pred mu')
+        plt.subplot(122)
+        sigma.isel(time=0, step=step_fc).plot(vmin=0, cmap='viridis')
+        plt.title('pred sigma')
+        plt.tight_layout()
+        plt.savefig(self.model_dir / "mu_sigma.png")
+        plt.close()
+
+    def plot_info_noise(self, pred: xr.DataArray, obs: xr.DataArray):
+        space = ('lat', 'lon')
+        info = self.xr_info(pred, obs, space).mean('time', skipna=True).values
+        ne = self.xr_ne(pred, obs, space).mean('time', skipna=True).values
+        sdav = float(np.nanmean(self.xr_sdav(obs, space).mean('time', skipna=True).values))
+        lags = pred['step'].values - pred['step'].values[0] + 1
+        rmax = np.nanmax([sdav, info.max(), ne.max()]) * 1.1
+        fig, ax = plt.subplots(figsize=(7.5, 7.5))
+        th = np.linspace(0, np.pi / 2, 200)
+        for acc in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]:
+            a = np.arccos(acc)
+            ax.plot([0, rmax * np.sin(a)], [0, rmax * np.cos(a)], ':', color="skyblue", lw=0.6, zorder=0)
+            ax.text(rmax * np.sin(a), rmax * np.cos(a), f"{acc:g}", fontsize=7, color="dimgray")
+        for r in np.linspace(rmax / 6, rmax, 6):
+            ax.plot(r * np.sin(th), r * np.cos(th), ':', color="lightgray", lw=0.5, zorder=0)
+        ax.plot(sdav * np.sin(th), sdav * np.cos(th), 'k--', lw=1, zorder=1)
+        semi = np.linspace(0, np.pi, 200)
+        ax.plot((sdav / 2) * np.sin(semi), sdav / 2 + (sdav / 2) * np.cos(semi), 'k--', lw=1, zorder=1)
+        ax.plot(0, sdav, 'k^', ms=9, zorder=3)
+        colors = plt.colormaps["viridis"](np.linspace(0, 1, len(lags)))
+        ax.plot(ne, info, '-', color="0.4", lw=0.8, zorder=2)
+        for x, y, lg, c in zip(ne, info, lags, colors):
+            ax.scatter(x, y, color=c, s=45, zorder=4, edgecolor="k", lw=0.4)
+            ax.annotate(f"{lg}", (x, y), textcoords="offset points", xytext=(5, 4), fontsize=7)
+        ax.set_xlim(0, rmax)
+        ax.set_ylim(0, rmax)
+        ax.set_aspect("equal")
+        ax.set_xlabel("Noise")
+        ax.set_ylabel("Information")
+        plt.tight_layout()
+        plt.savefig(self.model_dir / "info_noise.png")
+        plt.close()
+
     def write_to_disk(self, data: xr.Dataset):
         path = self.model_dir / f"{self.data_cfg.eval_data}_eval.zarr"
-        data.to_zarr(path, mode = "w")
+        data.to_zarr(path, mode='w')
 
-    def get_xarray_dataset(self, batch_idx, pred, obs):
-        #meta data
+    def get_xarray_dataset_mve(self, batch_idx, obs, mu, sigma, visible):
         meta_data = self.val_dataset.dataset
         time, lat, lon = meta_data.time, meta_data.lat, meta_data.lon
-        ens = np.arange(pred.shape[-1])
-        tau = self.world.tau
-        T, tt = self.world.token_sizes["t"], self.world.patch_sizes["tt"]
-        lag = np.arange(1, 1 + ((T - tau) * tt))
-        history = tau * tt
-
-        # variables
+        T, tt = self.world.token_sizes['t'], self.world.patch_sizes['tt']
+        step = np.arange(T * tt)
+        vis_field = einops.repeat(
+            visible,
+            f'b ({self.world.token_pattern}) -> b {self.world.field_pattern}',
+            **self.world.token_sizes, **self.world.patch_sizes
+        )
         arrays = []
         for v, var in enumerate(self.data_cfg.variables):
             if var not in self.data_cfg.eval_variables:
                 continue
-            
-            std = self.val_dataset._stds.sel(variable = var).values
-            p = pred[:, v, history:].float().detach().cpu().numpy() * std
-            o = obs[:, v, history:].float().detach().cpu().numpy() * std
-
-            #create xarray
-            data_array = xr.Dataset(
-                data_vars = {
-                    f"{var}_pred": (["time", "lag", "lat", "lon", "ens"], p),
-                    f"{var}_tgt": (["time", "lag", "lat", "lon"], o),
+            std = self.val_dataset._stds.sel(variable=var).values.astype(np.float32)
+            arrays.append(xr.Dataset(
+                data_vars={
+                    f'{var}_obs' :        (['time', 'step', 'lat', 'lon'], obs[:, v].numpy() * std),
+                    f'{var}_pred_mu' :    (['time', 'step', 'lat', 'lon'], mu[:, v].numpy() * std),
+                    f'{var}_pred_sigma' : (['time', 'step', 'lat', 'lon'], sigma[:, v].numpy() * std),
+                    f'{var}_visible' :    (['time', 'step', 'lat', 'lon'], vis_field[:, v].numpy()),
                 },
-                coords = {
-                    "time": time[batch_idx * self.world.batch_size: (batch_idx + 1) * self.world.batch_size],
-                    "lag": lag,
-                    "lat": lat,
-                    "lon": lon,
-                    "ens": ens
+                coords={
+                    'time' : time[batch_idx * self.world.batch_size : (batch_idx + 1) * self.world.batch_size],
+                    'step' : step,
+                    'lat' :  lat,
+                    'lon' :  lon,
+                }
+            ))
+        return xr.merge(arrays, compat='no_conflicts')
+
+    def get_xarray_dataset_ens(self, batch_idx, obs, samples, visible):
+        meta_data = self.val_dataset.dataset
+        time, lat, lon = meta_data.time, meta_data.lat, meta_data.lon
+        T, tt = self.world.token_sizes['t'], self.world.patch_sizes['tt']
+        step = np.arange(T * tt)
+        ens = np.arange(samples.shape[-1])
+        vis_field = einops.repeat(
+            visible,
+            f'b ({self.world.token_pattern}) -> b {self.world.field_pattern}',
+            **self.world.token_sizes, **self.world.patch_sizes
+        )
+        arrays = []
+        for v, var in enumerate(self.data_cfg.variables):
+            if var not in self.data_cfg.eval_variables:
+                continue
+            std = self.val_dataset._stds.sel(variable=var).values.astype(np.float32)
+            arrays.append(xr.Dataset(
+                data_vars={
+                    f'{var}_obs' :     (['time', 'step', 'lat', 'lon'],       obs[:, v].numpy() * std),
+                    f'{var}_pred' :    (['time', 'step', 'lat', 'lon', 'ens'], samples[:, v].numpy() * std),
+                    f'{var}_visible' : (['time', 'step', 'lat', 'lon'],        vis_field[:, v].numpy()),
                 },
-            )
-            arrays.append(data_array)
-        ds = xr.merge(arrays, compat = 'no_conflicts')
-        return ds
+                coords={
+                    'time' : time[batch_idx * self.world.batch_size : (batch_idx + 1) * self.world.batch_size],
+                    'step' : step,
+                    'lat' :  lat,
+                    'lon' :  lon,
+                    'ens' :  ens,
+                }
+            ))
+        return xr.merge(arrays, compat='no_conflicts')
 
-    def get_xr_lsm(self, data: xr.Dataset):
-        if "sftlf" in data:
-            lsm = data["sftlf"]
-        else:
-            lsm = data[self.data_cfg.variables[0]].isel(time=0).isnull()
-            lsm = lsm.drop_vars(["time", "month"], errors="ignore")
-        return lsm
-
-    def get_field_metrics(self, eval_data: xr.Dataset):
+    def get_field_metrics_ens(self, eval_data: xr.Dataset):
         for var in self.data_cfg.variables:
             if var not in self.data_cfg.eval_variables:
                 continue
-            tgt, pred = eval_data[f"{var}_tgt"], eval_data[f'{var}_pred']
-            pcc = self.xr_pcc(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            rmse = self.xr_rmse(pred.mean('ens'), tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            ssr = self.xr_spread_skill_ens(pred, tgt, ('lat', 'lon')).mean(('time', 'lag'))
-            
-            self.current_metrics.log_metric(f"{var}_pcc", pcc.item())
-            self.current_metrics.log_metric(f"{var}_ssr", ssr.item())
-            self.current_metrics.log_metric(f"{var}_rmse", rmse.item())
+            valid = ~eval_data[f'{var}_visible'].astype(bool) & ~eval_data['lsm']
+            pred = eval_data[f'{var}_pred'].where(valid)
+            obs = eval_data[f'{var}_obs'].where(valid)
+            pred_mean = pred.mean('ens', skipna=True)
+            pcc = self.xr_pcc(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            rmse = self.xr_rmse(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            ssr = self.xr_spread_skill_ens(pred, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            crps_ss = self.xr_crps_ss_ens(pred, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            acc = self.xr_acc(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            fi = self.xr_fi(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            info = self.xr_info(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            ie = self.xr_ie(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            ne = self.xr_ne(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            stde = self.xr_stde(pred_mean, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            self.current_metrics.log_metric(f'{var}_pcc', pcc.item())
+            self.current_metrics.log_metric(f'{var}_ssr', ssr.item())
+            self.current_metrics.log_metric(f'{var}_rmse', rmse.item())
+            self.current_metrics.log_metric(f'{var}_crps_ss', crps_ss.item())
+            self.current_metrics.log_metric(f'{var}_acc', acc.item())
+            self.current_metrics.log_metric(f'{var}_fi', fi.item())
+            self.current_metrics.log_metric(f'{var}_info', info.item())
+            self.current_metrics.log_metric(f'{var}_ie', ie.item())
+            self.current_metrics.log_metric(f'{var}_ne', ne.item())
+            self.current_metrics.log_metric(f'{var}_stde', stde.item())
 
-    def get_nino_metrics(self, eval_data: xr.Dataset):
-        nino34_tgt, nino34_pred = self.get_nino34(eval_data["temp_ocn_0a_tgt"]), self.get_nino34(eval_data["temp_ocn_0a_pred"]).mean("ens")
-        nino4_tgt, nino4_pred = self.get_nino4(eval_data["temp_ocn_0a_tgt"]), self.get_nino4(eval_data["temp_ocn_0a_pred"]).mean("ens")
-        
-        nino34_pcc = self.xr_pcc(nino34_pred, nino34_tgt, ("time",))
-        nino4_pcc = self.xr_pcc(nino4_pred, nino4_tgt, ("time",))
+    def get_field_metrics_mve(self, eval_data: xr.Dataset):
+        for var in self.data_cfg.variables:
+            if var not in self.data_cfg.eval_variables:
+                continue
+            valid = ~eval_data[f'{var}_visible'].astype(bool) & ~eval_data['lsm']
+            mu = eval_data[f'{var}_pred_mu'].where(valid)
+            sigma = eval_data[f'{var}_pred_sigma'].where(valid)
+            obs = eval_data[f'{var}_obs'].where(valid)
+            pcc = self.xr_pcc(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            rmse = self.xr_rmse(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            ssr = self.xr_spread_skill_mve(mu, sigma, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            crps = self.xr_gaussian_crps(mu, sigma, obs).mean(('lat', 'lon', 'time', 'step'), skipna=True)
+            crps_ss = self.xr_crps_ss(mu, sigma, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            acc = self.xr_acc(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            fi = self.xr_fi(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            info = self.xr_info(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            ie = self.xr_ie(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            ne = self.xr_ne(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            stde = self.xr_stde(mu, obs, ('lat', 'lon')).mean(('time', 'step'), skipna=True)
+            self.current_metrics.log_metric(f'{var}_pcc', pcc.item())
+            self.current_metrics.log_metric(f'{var}_ssr', ssr.item())
+            self.current_metrics.log_metric(f'{var}_rmse', rmse.item())
+            self.current_metrics.log_metric(f'{var}_crps', crps.item())
+            self.current_metrics.log_metric(f'{var}_crps_ss', crps_ss.item())
+            self.current_metrics.log_metric(f'{var}_acc', acc.item())
+            self.current_metrics.log_metric(f'{var}_fi', fi.item())
+            self.current_metrics.log_metric(f'{var}_info', info.item())
+            self.current_metrics.log_metric(f'{var}_ie', ie.item())
+            self.current_metrics.log_metric(f'{var}_ne', ne.item())
+            self.current_metrics.log_metric(f'{var}_stde', stde.item())
 
-        nino34_rmse = self.xr_rmse(nino34_pred, nino34_tgt, ("time",))
-        nino4_rmse = self.xr_rmse(nino4_pred, nino4_tgt, ("time",))
-
-        nino4_thresh_month =  1 + np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
+    def get_nino_metrics_ens(self, eval_data: xr.Dataset):
+        history = self.world.tau * self.world.patch_sizes['tt']
+        valid = ~eval_data['temp_ocn_0a_visible'].astype(bool) & ~eval_data['lsm']
+        pred = eval_data['temp_ocn_0a_pred'].where(valid).mean('ens', skipna=True)
+        obs = eval_data['temp_ocn_0a_obs'].where(valid)
+        nino34_pred = self.get_nino34(pred)
+        nino34_obs = self.get_nino34(obs)
+        nino4_pred = self.get_nino4(pred)
+        nino4_obs = self.get_nino4(obs)
+        nino34_pcc = self.xr_pcc(nino34_pred, nino34_obs, ('time',)).isel(step=slice(history, None))
+        nino4_pcc = self.xr_pcc(nino4_pred, nino4_obs, ('time',)).isel(step=slice(history, None))
+        nino34_rmse = self.xr_rmse(nino34_pred, nino34_obs, ('time',)).isel(step=slice(history, None))
+        nino4_rmse = self.xr_rmse(nino4_pred, nino4_obs, ('time',)).isel(step=slice(history, None))
+        nino4_thresh_month = 1 + np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
         nino34_thresh_month = 1 + np.argwhere(nino34_pcc.values > 0.5).max(initial=0)
-
         self.current_metrics.log_metric('nino4_pcc_month', float(nino4_thresh_month))
         self.current_metrics.log_metric('nino34_pcc_month', float(nino34_thresh_month))
-
         for lag in [3, 9, 15, 18, 21]:
-            self.current_metrics.log_metric(f"nino34_pcc_{lag}", nino34_pcc.sel(lag = lag).item())
-            self.current_metrics.log_metric(f"nino34_rmse_{lag}", nino34_rmse.sel(lag = lag).item())
-            self.current_metrics.log_metric(f"nino4_pcc_{lag}", nino4_pcc.sel(lag = lag).item())
-            self.current_metrics.log_metric(f"nino4_rmse_{lag}", nino4_rmse.sel(lag = lag).item())
+            self.current_metrics.log_metric(f'nino34_pcc_{lag}', nino34_pcc.isel(step=lag - 1).item())
+            self.current_metrics.log_metric(f'nino34_rmse_{lag}', nino34_rmse.isel(step=lag - 1).item())
+            self.current_metrics.log_metric(f'nino4_pcc_{lag}', nino4_pcc.isel(step=lag - 1).item())
+            self.current_metrics.log_metric(f'nino4_rmse_{lag}', nino4_rmse.isel(step=lag - 1).item())
+
+    def get_nino_metrics_mve(self, eval_data: xr.Dataset):
+        history = self.world.tau * self.world.patch_sizes['tt']
+        valid = ~eval_data['temp_ocn_0a_visible'].astype(bool) & ~eval_data['lsm']
+        mu = eval_data['temp_ocn_0a_pred_mu'].where(valid)
+        obs = eval_data['temp_ocn_0a_obs'].where(valid)
+        nino34_mu = self.get_nino34(mu)
+        nino34_obs = self.get_nino34(obs)
+        nino4_mu = self.get_nino4(mu)
+        nino4_obs = self.get_nino4(obs)
+        nino34_pcc = self.xr_pcc(nino34_mu, nino34_obs, ('time',)).isel(step=slice(history, None))
+        nino4_pcc = self.xr_pcc(nino4_mu, nino4_obs, ('time',)).isel(step=slice(history, None))
+        nino34_rmse = self.xr_rmse(nino34_mu, nino34_obs, ('time',)).isel(step=slice(history, None))
+        nino4_rmse = self.xr_rmse(nino4_mu, nino4_obs, ('time',)).isel(step=slice(history, None))
+        nino4_thresh_month = 1 + np.argwhere(nino4_pcc.values > 0.5).max(initial=0)
+        nino34_thresh_month = 1 + np.argwhere(nino34_pcc.values > 0.5).max(initial=0)
+        self.current_metrics.log_metric('nino4_pcc_month', float(nino4_thresh_month))
+        self.current_metrics.log_metric('nino34_pcc_month', float(nino34_thresh_month))
+        for lag in [3, 9, 15, 18, 21]:
+            self.current_metrics.log_metric(f'nino34_pcc_{lag}', nino34_pcc.isel(step=lag - 1).item())
+            self.current_metrics.log_metric(f'nino34_rmse_{lag}', nino34_rmse.isel(step=lag - 1).item())
+            self.current_metrics.log_metric(f'nino4_pcc_{lag}', nino4_pcc.isel(step=lag - 1).item())
+            self.current_metrics.log_metric(f'nino4_rmse_{lag}', nino4_rmse.isel(step=lag - 1).item())
         
     def log_metrics(self, metrics: dict, task: str = None):
         for key, val in metrics.items():
             name = f"{task}_{key}" if exists(task) and task != 'prior' else key
             self.current_metrics.log_metric(name, val)
     
-    def compute_metrics_torch(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor):
-        ens = ens[mask]
-        obs = obs[mask]
-        metrics = {
-            "crps": self.compute_crps(pred=ens, obs=obs, fair =  self.use_fair_crps).item(),
-            "ssr": self.compute_spread_skill(pred=ens, obs=obs).item(),
-            "ign": self.compute_ign(pred=ens, obs=obs).item(),
-            "spread": self.compute_spread(pred=ens).item(),
-            "acc": self.compute_acc(pred=ens.mean(-1), obs=obs).item(),
-            "rmse": self.compute_rmse(pred=ens.mean(-1), obs=obs).item(),
+    def compute_metrics_torch_ens(self, ens: torch.Tensor, obs: torch.Tensor, mask: torch.BoolTensor) -> dict:
+        ens = ens[mask]     # (N, E)
+        obs = obs[mask]     # (N,)
+        return {
+            'crps' :   self.compute_crps_ens(ens, obs, fair=self.use_fair_crps),
+            'ssr' :    self.compute_spread_skill_ens(ens, obs),
+            'ign' :    self.compute_ign_ens(ens, obs),
+            'spread' : self.compute_spread_ens(ens),
+            'acc' :    self.compute_acc(ens.mean(-1), obs),
+            'rmse' :   self.compute_rmse(ens.mean(-1), obs),
         }
-        return metrics
+
+    def compute_metrics_torch_mve(self, mu: torch.Tensor, sigma: torch.Tensor,
+                                  obs: torch.Tensor, mask: torch.BoolTensor) -> dict:
+        mu = mu[mask]
+        sigma = sigma[mask]
+        obs = obs[mask]
+        spread = sigma.pow(2).mean().sqrt()
+        return {
+            'crps' :   f_gaussian_crps(obs, mu, sigma).nanmean().item(),
+            'ign' :    f_gaussian_ignorance(obs, mu, sigma).nanmean().item(),
+            'spread' : spread.item(),
+            'ssr' :    (spread / (mu - obs).pow(2).mean().sqrt()).item(),
+            'acc' :    self.compute_acc(mu, obs),
+            'rmse' :   self.compute_rmse(mu, obs),
+        }
 
     @staticmethod
-    def get_nino4(da: xr.DataArray):
-        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])
-    
-    @staticmethod
-    def get_nino34(da: xr.DataArray):
-        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'])
+    def get_nino4(da: xr.DataArray) -> xr.DataArray:
+        return da.sel(lon=slice(160, 210), lat=slice(-5, 5)).mean(dim=['lon', 'lat'], skipna=True)
 
     @staticmethod
-    def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
-        num = (pred * obs).sum(dim)
-        denom = np.sqrt((pred**2).sum(dim)) * np.sqrt((obs**2).sum(dim))
+    def get_nino34(da: xr.DataArray) -> xr.DataArray:
+        return da.sel(lon=slice(190, 240), lat=slice(-5, 5)).mean(dim=['lon', 'lat'], skipna=True)
+
+    @staticmethod
+    def xr_pcc(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        num = (pred * obs).sum(dim, skipna=True)
+        denom = np.sqrt((pred**2).sum(dim, skipna=True)) * np.sqrt((obs**2).sum(dim, skipna=True))
         return num / denom
 
     @staticmethod
-    def xr_rmse(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
-        return np.sqrt(((pred - obs) ** 2).mean(dim))
+    def xr_rmse(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        return np.sqrt(((pred - obs)**2).mean(dim, skipna=True))
 
     @staticmethod
-    def xr_spread_skill_ens(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]):
-        K = pred.sizes["ens"]
+    def _debias(x: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        return x - x.mean(dim, skipna=True)
+
+    @staticmethod
+    def _winner(x: xr.DataArray, y: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        return (x * y).mean(dim, skipna=True)
+
+    def xr_acc(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+               debias: bool = True) -> xr.DataArray:
+        af = self._debias(pred, dim) if debias else pred
+        at = self._debias(obs, dim) if debias else obs
+        var_f = self._winner(af, af, dim)
+        var_t = self._winner(at, at, dim)
+        cov = self._winner(af, at, dim)
+        return cov / (np.sqrt(var_f) * np.sqrt(var_t))
+
+    def xr_fi(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+              debias: bool = True) -> xr.DataArray:
+        af = self._debias(pred, dim) if debias else pred
+        at = self._debias(obs, dim) if debias else obs
+        return self._winner(af, at, dim) / self._winner(at, at, dim)
+
+    def xr_info(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+                debias: bool = True) -> xr.DataArray:
+        fi = self.xr_fi(pred, obs, dim, debias)
+        at = self._debias(obs, dim) if debias else obs
+        return fi * np.sqrt(self._winner(at, at, dim))
+
+    def xr_ie(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+              debias: bool = True) -> xr.DataArray:
+        fi = self.xr_fi(pred, obs, dim, debias)
+        at = self._debias(obs, dim) if debias else obs
+        return np.abs(1 - fi) * np.sqrt(self._winner(at, at, dim))
+
+    def xr_ne(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+              debias: bool = True) -> xr.DataArray:
+        af = self._debias(pred, dim) if debias else pred
+        at = self._debias(obs, dim) if debias else obs
+        var_f = self._winner(af, af, dim)
+        var_t = self._winner(at, at, dim)
+        cov = self._winner(af, at, dim)
+        fi = cov / var_t
+        return np.sqrt(var_f - 2 * fi * cov + fi**2 * var_t)
+
+    def xr_stde(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+                debias: bool = True) -> xr.DataArray:
+        af = self._debias(pred, dim) if debias else pred
+        at = self._debias(obs, dim) if debias else obs
+        var_f = self._winner(af, af, dim)
+        var_t = self._winner(at, at, dim)
+        acc = self._winner(af, at, dim) / (np.sqrt(var_f) * np.sqrt(var_t))
+        return np.sqrt(var_t + var_f - 2 * np.sqrt(var_t) * np.sqrt(var_f) * acc)
+
+    def xr_sdav(self, obs: xr.DataArray, dim: tuple[str], debias: bool = True) -> xr.DataArray:
+        at = self._debias(obs, dim) if debias else obs
+        return np.sqrt(self._winner(at, at, dim))
+
+    @staticmethod
+    def xr_spread_skill_ens(pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        K = pred.sizes['ens']
         correction = math.sqrt((K + 1) / K)
-        mean = pred.mean("ens")
-        spread = np.sqrt(pred.var("ens").mean(dim))
-        skill = np.sqrt(((obs - mean) ** 2).mean(dim))
+        mean = pred.mean('ens', skipna=True)
+        spread = np.sqrt(pred.var('ens', skipna=True).mean(dim, skipna=True))
+        skill = np.sqrt(((obs - mean)**2).mean(dim, skipna=True))
         return correction * (spread / skill)
-    
+
     @staticmethod
-    def compute_acc(pred, obs, eps = 1e-5)-> float:
-        return (pred * obs).nansum().div(pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt() + eps).item()
-    
+    def xr_spread_skill_mve(mu: xr.DataArray, sigma: xr.DataArray,
+                            obs: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        var = (sigma**2).mean(dim, skipna=True)
+        mse = ((obs - mu)**2).mean(dim, skipna=True)
+        return np.sqrt(var / mse)
+
     @staticmethod
-    def compute_rmse(pred, obs)-> float:
+    def xr_gaussian_crps(mu: xr.DataArray, sigma: xr.DataArray,
+                         obs: xr.DataArray) -> xr.DataArray:
+        sqrtPi, sqrtTwo = math.sqrt(math.pi), math.sqrt(2)
+        sigma = sigma.clip(min=1e-6)
+        z = (obs - mu) / sigma
+        phi = np.exp(-z**2 / 2) / (sqrtTwo * sqrtPi)
+        return sigma * (z * xr.apply_ufunc(erf, z / sqrtTwo) + 2 * phi - 1 / sqrtPi)
+
+    @staticmethod
+    def xr_gaussian_ign(mu: xr.DataArray, sigma: xr.DataArray,
+                        obs: xr.DataArray) -> xr.DataArray:
+        sigma = sigma.clip(min=1e-6)
+        z = (obs - mu) / sigma
+        return 0.5 * math.log(2 * math.pi) + np.log(sigma) + 0.5 * z**2
+
+    def xr_crps_ss(self, mu: xr.DataArray, sigma: xr.DataArray,
+                   obs: xr.DataArray, dim: tuple[str]) -> xr.DataArray:
+        crps = self.xr_gaussian_crps(mu, sigma, obs).mean(dim, skipna=True)
+        clim = self.xr_gaussian_crps(xr.zeros_like(obs), xr.ones_like(obs), obs).mean(dim, skipna=True)
+        return 1 - crps / clim
+
+    @staticmethod
+    def xr_kernel_crps(pred: xr.DataArray, obs: xr.DataArray, fair: bool = False) -> xr.DataArray:
+        E = pred.sizes['ens']
+        coef = -1 / (E * (E - 1)) if fair else -1 / (E**2)
+        mae = (pred - obs).abs().mean('ens', skipna=True)
+        def _pairwise(p):
+            total = np.zeros(p.shape[:-1], dtype=np.float32)
+            for i in range(E):
+                total = total + np.sum(np.abs(p[..., i:i + 1] - p[..., i + 1:]), axis=-1)
+            return total
+        ens_var = xr.apply_ufunc(_pairwise, pred, input_core_dims=[['ens']])
+        return mae + coef * ens_var
+
+    def xr_crps_ss_ens(self, pred: xr.DataArray, obs: xr.DataArray, dim: tuple[str],
+                       fair: bool = False) -> xr.DataArray:
+        crps = self.xr_kernel_crps(pred, obs, fair=fair).mean(dim, skipna=True)
+        clim = self.xr_gaussian_crps(xr.zeros_like(obs), xr.ones_like(obs), obs).mean(dim, skipna=True)
+        return 1 - crps / clim
+
+    @staticmethod
+    def compute_acc(pred, obs, eps: float = 1e-5) -> float:
+        return (pred * obs).nansum().div(
+            pred.pow(2).nansum().sqrt() * obs.pow(2).nansum().sqrt() + eps).item()
+
+    @staticmethod
+    def compute_rmse(pred, obs) -> float:
         return (pred - obs).pow(2).nanmean().sqrt().item()
-    
+
     @staticmethod
-    def compute_crps_ens(pred, obs, fair: bool = True)-> float:
-        crps = f_kernel_crps(observation=obs, ensemble=pred, fair = fair)
-        return crps.nanmean().item()
-    
+    def compute_crps_ens(pred, obs, fair: bool = True) -> float:
+        return f_kernel_crps(observation=obs, ensemble=pred, fair=fair).nanmean().item()
+
     @staticmethod
-    def compute_ign_ens(pred, obs, eps = 1e-5)-> float:
-        ign = f_gaussian_ignorance(observation=obs, mu=pred.mean(-1), sigma=pred.std(-1) + eps)
-        return ign.nanmean().item()
-    
+    def compute_ign_ens(pred, obs, eps: float = 1e-5) -> float:
+        return f_gaussian_ignorance(observation=obs, mu=pred.mean(-1),
+                                    sigma=pred.std(-1) + eps).nanmean().item()
+
     @staticmethod
-    def compute_spread_ens(pred)-> float:
+    def compute_spread_ens(pred) -> float:
         return pred.var(-1).mean().sqrt().item()
 
     @staticmethod
-    def compute_spread_skill_ens(pred, obs, eps = 1e-5) -> float:
+    def compute_spread_skill_ens(pred, obs, eps: float = 1e-5) -> float:
         K = pred.shape[-1]
         correction = math.sqrt((K + 1) / K)
         mean = pred.mean(-1)
