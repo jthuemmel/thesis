@@ -16,14 +16,14 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
-def init_sincos_positions(dim: int, world: WorldConfig):
+def init_sincos_positions(dim: int, shape: tuple):
+    # wavelengths by dimension
+    wavelengths = torch.as_tensor(shape)
     # integer indices
-    coordinates = torch.stack(torch.unravel_index(indices = torch.arange(world.num_tokens), shape = world.token_shape), dim = -1)
-    # log wavelengths
-    log_wavelengths = torch.as_tensor(world.token_shape).log()
+    coordinates = torch.stack(torch.unravel_index(indices = torch.arange(wavelengths.prod()), shape = shape), dim = -1)
     # only encode shape dimensions with actual size
-    valid = log_wavelengths > 0
-    log_wavelengths = log_wavelengths[valid]
+    valid = wavelengths > 1
+    log_wavelengths = wavelengths[valid].log()
     coordinates = coordinates[:, valid]
     # space the frequencies according to the required number of bands
     negative_spacing = torch.linspace(0, -1, dim // (coordinates.size(-1) * 2))
