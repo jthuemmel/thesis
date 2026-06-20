@@ -67,11 +67,15 @@ class EinMask_ENS(torch.nn.Module):
                 torch.nn.init.zeros_(m.bias)
    
     def forward(self, fields: torch.FloatTensor, visible: torch.BoolTensor, rng: torch.Generator = None) -> torch.FloatTensor:
-        # expand position codes
-        coo = einops.repeat(self.position_codes, '... -> b ...', b = fields.size(0))
+        B, E = fields.size(0), default(self.world.ens_size, 1)
+
+        # ensemble expansion
+        fields = einops.repeat(fields, 'b ... -> (b e) ...', b = B, e = E)
+        visible = einops.repeat(visible, 'b ... -> (b e) ...', b = B, e = E)
+        coo = einops.repeat(self.position_codes, '... -> (b e) ...', b = B, e = E)
 
         # sample random noise
-        xi = self.random_field(tokens, rng)
+        xi = self.random_field(coo, rng)
 
         # tokenize and select visible
         obs = self.to_tokens(fields) + xi + coo
@@ -96,6 +100,7 @@ class EinMask_ENS(torch.nn.Module):
 
         # prediction head
         tgt = self.to_output(tgt)
+        tgt = einops.rearrange(tgt, '(b e) ... -> b ... e', b=B, e=E)
         return tgt
 
 class EinMask(torch.nn.Module):

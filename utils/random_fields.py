@@ -142,5 +142,5 @@ class RandomField(torch.nn.Module):
         )
         
     def forward(self, src: torch.Tensor, rng: torch.Generator = None):
-        grf = self.noise_generator(src.size(0), rng).to(src.dtype) # only batch dim rest is by config
+        grf = self.noise_generator((src.size(0),), rng).to(src.dtype) # only batch dim rest is by config
         return self.projection(grf)
