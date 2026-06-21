@@ -24,7 +24,7 @@ class EinMask_ENS(torch.nn.Module):
         self.position_codes = torch.nn.Parameter(init_sincos_positions(network.dim, shape = world.token_shape))
         
         # noise generator
-        self.random_field = RandomField(network, world)
+        self.random_field = RandomField(network, world) if world.ens_size > 1 else None
 
         # I/O
         self.to_tokens = torch.nn.Sequential(
@@ -35,9 +35,9 @@ class EinMask_ENS(torch.nn.Module):
         )
 
         self.to_output = torch.nn.Sequential(
-            EinMix(f'b ({world.token_pattern}) d -> b {world.field_pattern}',
-                   weight_shape = f'v {world.patch_pattern} d',
-                   d = DO, **world.patch_sizes, **world.token_sizes),
+            EinMix(f'b ({world.token_pattern}) d -> (b e) {world.field_pattern}',
+                   weight_shape = f'e v {world.patch_pattern} d',
+                   d = DO, e = default(network.num_tails, 1), **world.patch_sizes, **world.token_sizes),
             GaussianSmoothing3D(world.field_shape[0], kernel_size= 5, sigma= 1.),
         )
 
@@ -46,15 +46,17 @@ class EinMask_ENS(torch.nn.Module):
             torch.nn.RMSNorm(DO)
         )
         
-        # Encoder / Decoder
+        # Encoder / Predictor / Decoder
         self.encoder = torch.nn.ModuleList([
                 TransformerBlock(dim= network.dim, num_heads= network.num_encoder_heads, drop_path= network.drop_path) 
                 for _ in range(default(network.num_read_blocks, 1))
                 ])
         
+        self.predictor = TransformerBlock(dim= DO, num_heads= network.num_decoder_heads, dim_kv= network.dim)
+
         self.decoder = torch.nn.ModuleList([
-                TransformerBlock(dim= DO, num_heads= network.num_decoder_heads, dim_kv= network.dim) 
-                for _ in range(default(network.num_write_blocks, 1))
+                TransformerBlock(dim= DO, num_heads= network.num_decoder_heads) 
+                for _ in range(default(network.num_write_blocks, 0))
                 ])
         
         # weight initialization
@@ -75,7 +77,7 @@ class EinMask_ENS(torch.nn.Module):
         coo = einops.repeat(self.position_codes, '... -> (b e) ...', b = B, e = E)
 
         # sample random noise
-        xi = self.random_field(coo, rng)
+        xi = self.random_field(coo, rng) if E > 1 else 0
 
         # tokenize and select visible
         obs = self.to_tokens(fields) + xi + coo
@@ -93,10 +95,13 @@ class EinMask_ENS(torch.nn.Module):
         if self.network.kwargs.get('bottleneck', False):
             _, src = einops.unpack(src, ps, 'b * d')
 
-        # cross-attention decoder
+        # cross-attention predictor
         tgt = self.to_decoder(xi + coo)
+        tgt = self.predictor(tgt, src)
+
+        # self-attention decoder for refinement
         for write in self.decoder:
-            tgt = write(tgt, src)
+            tgt = write(tgt)
 
         # prediction head
         tgt = self.to_output(tgt)
@@ -139,10 +144,10 @@ class EinMask(torch.nn.Module):
             torch.nn.RMSNorm(network.dim)
         )
         
-        self.to_decoder = torch.nn.Sequential(
-            torch.nn.RMSNorm(network.dim),
-            torch.nn.Linear(network.dim, DO, bias = False),
-        )
+        # self.to_decoder = torch.nn.Sequential(
+        #     torch.nn.RMSNorm(network.dim),
+        #     torch.nn.Linear(network.dim, DO, bias = False),
+        # )
 
         self.to_output = torch.nn.Sequential(
             EinMix(f'b ({world.token_pattern}) d -> (k b) {world.field_pattern}',
@@ -152,12 +157,12 @@ class EinMask(torch.nn.Module):
             Rearrange('(k b) ... -> k b ...', k = network.num_tails)
         )
         
-        # Encoder / Decoder
+        # Encoder / Predictor / Decoder
         self.encoder = torch.nn.ModuleList([
                 TransformerBlock(dim= network.dim, num_heads= network.num_encoder_heads, drop_path= network.drop_path) 
                 for _ in range(default(network.num_read_blocks, 1))
                 ])
-        
+        self.predictor = TransformerBlock(dim= DO, num_heads= network.num_decoder_heads, dim_kv= network.dim)
         self.decoder = torch.nn.ModuleList([
                 TransformerBlock(dim= DO, num_heads= network.num_decoder_heads) 
                 for _ in range(default(network.num_write_blocks, 1))
@@ -196,11 +201,12 @@ class EinMask(torch.nn.Module):
         # project to decoder dim with optional bottleneck
         if self.network.kwargs.get('bottleneck', False):
             _, latents = einops.unpack(latents, shape, 'b * d')
-        latents = self.to_decoder(latents)
+        
+        tgt = self.predictor(tgt, latents)
 
-        # cross-attention decoder
+        # self-attention decoder
         for write in self.decoder:
-            tgt = write(tgt, latents)
+            tgt = write(tgt)
 
         # prediction head
         pred = self.to_output(tgt)
