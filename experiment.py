@@ -9,6 +9,7 @@ import xarray as xr
 import numpy as np
 
 from scipy.special import erf
+from matplotlib.lines import Line2D
 
 from pathlib import Path
 from dataclasses import replace
@@ -338,7 +339,7 @@ class Experiment(DistributedTrainer):
         # sample masks
         visible, masked = self.sample_masks(batch.size(0))
 
-        # forward model — rng is accepted by both EinMask and EinMask_ENS
+        # forward model
         samples = self.model(batch, visible, rng=self.generator)
 
         # sea-only mask
@@ -449,7 +450,8 @@ class Experiment(DistributedTrainer):
         self.plot_sample_ens(pred, obs, 20)
         self.plot_rank_hist(pred, obs, [1, 7, 13, 19])
         self.plot_skill(pred_mean, obs)
-        self.plot_info_noise(pred_mean, obs)
+        self.plot_monthly_init(pred, obs)
+        self.plot_info_noise_ens(pred, obs)
 
     def make_eval_plots_mve(self, ds: xr.Dataset):
         history = self.world.tau * self.world.patch_sizes['tt']
@@ -459,7 +461,8 @@ class Experiment(DistributedTrainer):
         obs = ds['temp_ocn_0a_obs'].where(valid).isel(step=slice(history, None))
         self.plot_sample_mve(mu, sigma, 20)
         self.plot_skill(mu, obs)
-        self.plot_info_noise(mu, obs)
+        self.plot_monthly_init(mu, obs, sigma=sigma)
+        self.plot_info_noise_mve(mu, obs)
 
     def plot_sample_ens(self, pred: xr.DataArray, obs: xr.DataArray, step_fc: int):
         E = pred.sizes['ens']
@@ -485,18 +488,102 @@ class Experiment(DistributedTrainer):
 
     def plot_rank_hist(self, pred: xr.DataArray, obs: xr.DataArray, step_lags: list):
         E = pred.sizes['ens']
-        ens_vals = pred.isel(step=step_lags).values.reshape(-1, E)
-        obs_vals = obs.isel(step=step_lags).values.reshape(-1, 1)
-        valid_rows = ~np.isnan(ens_vals).any(axis=-1) & ~np.isnan(obs_vals[:, 0])
-        ens_vals, obs_vals = ens_vals[valid_rows], obs_vals[valid_rows]
-        rank_counts = np.bincount(np.sum(ens_vals < obs_vals, axis=-1), minlength=E + 1) / ens_vals.shape[0]
-        plt.figure(figsize=(8, 4))
-        plt.bar(np.arange(E + 1), rank_counts, alpha=0.5)
-        plt.hlines(1 / (E + 1), 0, E, color='red', linestyle='dashed', linewidth=1)
-        plt.ylabel('Frequency')
-        plt.xlabel('Rank')
+        n = len(step_lags)
+        width = 0.8 / n
+        bins = np.arange(E + 1)
+        lags = pred['step'].isel(step=step_lags).values - pred['step'].values[0] + 1
+        colors = plt.colormaps['viridis'](np.linspace(0.2, 0.85, n))
+        nino4_pred = self.get_nino4(pred)
+        nino4_obs = self.get_nino4(obs)
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6))
+        for ax, (p, o) in zip(axes, [(pred, obs), (nino4_pred, nino4_obs)]):
+            for i, sl in enumerate(step_lags):
+                ens_v = p.isel(step=sl).values.reshape(-1, E)
+                obs_v = o.isel(step=sl).values.reshape(-1, 1)
+                valid = ~np.isnan(ens_v).any(-1) & ~np.isnan(obs_v[:, 0])
+                ens_v, obs_v = ens_v[valid], obs_v[valid]
+                ranks = np.bincount(np.sum(ens_v < obs_v, axis=-1), minlength=E + 1) / len(ens_v)
+                ax.bar(bins + i * width, ranks, width=width, alpha=0.8,
+                       color=colors[i], edgecolor='k', lw=0.4, label=f'Lag {lags[i]}')
+            ax.axhline(1 / (E + 1), color='red', linestyle='dashed', lw=1)
+            ax.set_xticks(bins + width * (n - 1) / 2)
+            ax.set_xticklabels(bins)
+            ax.set_ylabel('Frequency')
+        axes[0].set_title('SSTA Field')
+        axes[1].set_title('Nino4')
+        axes[1].set_xlabel('Rank')
+        axes[0].legend(ncol=n, loc='upper center', bbox_to_anchor=(0.5, -0.05), frameon=True)
         plt.tight_layout()
         plt.savefig(self.model_dir / "rank_hist.png")
+        plt.close()
+
+    def plot_monthly_init(self, pred: xr.DataArray, obs: xr.DataArray, sigma: xr.DataArray = None):
+        space = ('lat', 'lon')
+        mu = pred.mean('ens', skipna=True) if self.use_ens else pred
+        n_steps = obs.sizes['step']
+        step_ax = obs['step'].values - obs['step'].values[0] + 1
+        nino4_pred = self.get_nino4(pred)
+        nino4_obs = self.get_nino4(obs)
+        nino4_sigma = self.get_nino4(sigma) if sigma is not None else None
+        acc, info, crps_ss, ssr = (np.full((12, n_steps), np.nan) for _ in range(4))
+        acc_n, info_n, crps_ss_n, ssr_n = (np.full((12, n_steps), np.nan) for _ in range(4))
+        for m in range(1, 13):
+            mask = obs['time.month'] == m
+            if not bool(mask.any()):
+                continue
+            pred_m = pred.sel(time=mask)
+            mu_m = pred_m.mean('ens', skipna=True) if self.use_ens else pred_m
+            obs_m = obs.sel(time=mask)
+            nino4_pred_m = nino4_pred.sel(time=mask)
+            nino4_mu_m = nino4_pred_m.mean('ens', skipna=True) if self.use_ens else nino4_pred_m
+            nino4_obs_m = nino4_obs.sel(time=mask)
+            clim_mean = obs_m.mean('time', skipna=True)
+            clim_std = obs_m.std('time', skipna=True).clip(min=1e-6)
+            clim_mean_n = nino4_obs_m.mean('time', skipna=True)
+            clim_std_n = nino4_obs_m.std('time', skipna=True).clip(min=1e-6)
+            acc[m-1] = self.xr_acc(mu_m, obs_m, space).mean('time', skipna=True).values
+            info[m-1] = self.xr_ie(mu_m, obs_m, space).mean('time', skipna=True).values
+            acc_n[m-1] = self.xr_acc(nino4_mu_m, nino4_obs_m, ('time',)).values
+            info_n[m-1] = self.xr_ie(nino4_mu_m, nino4_obs_m, ('time',)).values
+            crps_clim = self.xr_gaussian_crps(clim_mean, clim_std, obs_m).mean(space + ('time',), skipna=True).values
+            crps_clim_n = self.xr_gaussian_crps(clim_mean_n, clim_std_n, nino4_obs_m).mean('time', skipna=True).values
+            if self.use_ens:
+                crps = self.xr_kernel_crps(pred_m, obs_m, fair=True).mean(space + ('time',), skipna=True).values
+                crps_n = self.xr_kernel_crps(nino4_pred_m, nino4_obs_m, fair=True).mean('time', skipna=True).values
+                ssr[m-1] = self.xr_spread_skill_ens(pred_m, obs_m, space).mean('time', skipna=True).values
+                ssr_n[m-1] = self.xr_spread_skill_ens(nino4_pred_m, nino4_obs_m, ('time',)).values
+            else:
+                sigma_m = sigma.sel(time=mask)
+                nino4_sigma_m = nino4_sigma.sel(time=mask)
+                crps = self.xr_gaussian_crps(mu_m, sigma_m, obs_m).mean(space + ('time',), skipna=True).values
+                crps_n = self.xr_gaussian_crps(nino4_mu_m, nino4_sigma_m, nino4_obs_m).mean('time', skipna=True).values
+                ssr[m-1] = self.xr_spread_skill_mve(mu_m, sigma_m, obs_m, space).mean('time', skipna=True).values
+                ssr_n[m-1] = self.xr_spread_skill_mve(nino4_mu_m, nino4_sigma_m, nino4_obs_m, ('time',)).values
+            crps_ss[m-1] = 1 - crps / crps_clim
+            crps_ss_n[m-1] = 1 - crps_n / crps_clim_n
+        months_str = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+        lev = np.linspace(0, 1, 11)
+        ssr_lev = np.linspace(0.5, 1.5, 11)
+        panels = [('ACC', lev, acc, acc_n),
+                  ('Information Error', lev, info, info_n),
+                  ('CRPS-SS', lev, crps_ss, crps_ss_n),
+                  ('SSR', ssr_lev, ssr, ssr_n)]
+        fig, axes = plt.subplots(4, 2, figsize=(15, 15))
+        for row, (label, levels, field, nino4) in enumerate(panels):
+            for col, (data, region) in enumerate(zip([field, nino4], ['SSTa', 'Nino4'])):
+                ax = axes[row, col]
+                filled = ax.contourf(data, cmap='coolwarm', levels=levels)
+                contours = ax.contour(data, levels=levels, colors='black')
+                ax.clabel(contours, inline=True, fontsize=9)
+                ax.set_ylabel('Init Month')
+                ax.set_xlabel('Lead Time (Months)')
+                ax.set_xticks(np.arange(0, n_steps, 3))
+                ax.set_xticklabels(step_ax[::3])
+                ax.set_yticks(np.arange(0, 12))
+                ax.set_yticklabels(months_str)
+                fig.colorbar(filled, ax=ax, label=f'{label} [{region}]')
+        plt.tight_layout()
+        plt.savefig(self.model_dir / "monthly_init.png")
         plt.close()
 
     def plot_skill(self, pred: xr.DataArray, obs: xr.DataArray):
@@ -529,14 +616,15 @@ class Experiment(DistributedTrainer):
         plt.savefig(self.model_dir / "mu_sigma.png")
         plt.close()
 
-    def plot_info_noise(self, pred: xr.DataArray, obs: xr.DataArray):
-        space = ('lat', 'lon')
-        info = self.xr_info(pred, obs, space).mean('time', skipna=True).values
-        ne = self.xr_ne(pred, obs, space).mean('time', skipna=True).values
-        sdav = float(np.nanmean(self.xr_sdav(obs, space).mean('time', skipna=True).values))
-        lags = pred['step'].values - pred['step'].values[0] + 1
-        rmax = np.nanmax([sdav, np.nanmax(info), np.nanmax(ne)]) * 1.1
-        fig, ax = plt.subplots(figsize=(7.5, 7.5))
+    def _info_noise_vals(self, p: xr.DataArray, o: xr.DataArray, dim: tuple) -> tuple:
+        info = self.xr_info(p, o, dim)
+        ne = self.xr_ne(p, o, dim)
+        if 'time' in info.dims:
+            info = info.mean('time', skipna=True)
+            ne = ne.mean('time', skipna=True)
+        return info.values, ne.values
+
+    def _draw_info_noise_bg(self, ax, sdav: float, rmax: float):
         th = np.linspace(0, np.pi / 2, 200)
         for acc in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]:
             a = np.arccos(acc)
@@ -548,16 +636,79 @@ class Experiment(DistributedTrainer):
         semi = np.linspace(0, np.pi, 200)
         ax.plot((sdav / 2) * np.sin(semi), sdav / 2 + (sdav / 2) * np.cos(semi), 'k--', lw=1, zorder=1)
         ax.plot(0, sdav, 'k^', ms=9, zorder=3)
-        colors = plt.colormaps["viridis"](np.linspace(0, 1, len(lags)))
-        ax.plot(ne, info, '-', color="0.4", lw=0.8, zorder=2)
-        for x, y, lg, c in zip(ne, info, lags, colors):
-            ax.scatter(x, y, color=c, s=45, zorder=4, edgecolor="k", lw=0.4)
-            ax.annotate(f"{lg}", (x, y), textcoords="offset points", xytext=(5, 4), fontsize=7)
         ax.set_xlim(0, rmax)
         ax.set_ylim(0, rmax)
         ax.set_aspect("equal")
         ax.set_xlabel("Noise")
         ax.set_ylabel("Information")
+
+    def plot_info_noise_mve(self, mu: xr.DataArray, obs: xr.DataArray):
+        space = ('lat', 'lon')
+        lags = obs['step'].values - obs['step'].values[0] + 1
+        nino4_mu = self.get_nino4(mu)
+        nino4_obs = self.get_nino4(obs)
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7.5))
+        for ax, (p, o, dim, title) in zip(axes, [
+            (mu, obs, space, 'SSTA Field'),
+            (nino4_mu, nino4_obs, ('time',), 'Nino4'),
+        ]):
+            info, ne = self._info_noise_vals(p, o, dim)
+            sdav_da = self.xr_sdav(o, dim)
+            sdav = np.nanmean(sdav_da.mean('time', skipna=True).values if 'time' in sdav_da.dims else sdav_da.values)
+            rmax = np.nanmax([sdav, np.nanmax(info), np.nanmax(ne)]) * 1.1
+            self._draw_info_noise_bg(ax, sdav, rmax)
+            colors = plt.colormaps["viridis"](np.linspace(0, 1, len(lags)))
+            ax.plot(ne, info, '-', color="0.4", lw=0.8, zorder=2)
+            for x, y, lg, c in zip(ne, info, lags, colors):
+                ax.scatter(x, y, color=c, s=45, zorder=4, edgecolor="k", lw=0.4)
+                ax.annotate(f"{lg}", (x, y), textcoords="offset points", xytext=(5, 4), fontsize=7)
+            ax.set_title(title)
+        plt.tight_layout()
+        plt.savefig(self.model_dir / "info_noise.png")
+        plt.close()
+
+    def plot_info_noise_ens(self, pred: xr.DataArray, obs: xr.DataArray):
+        space = ('lat', 'lon')
+        E_plot = min(4, pred.sizes['ens'])
+        cmaps = ['Reds', 'Blues', 'Greens', 'YlOrBr']
+        lags = obs['step'].values - obs['step'].values[0] + 1
+        nino4_pred = self.get_nino4(pred)
+        nino4_obs = self.get_nino4(obs)
+        pred_mean = pred.mean('ens')
+        nino4_pred_mean = nino4_pred.mean('ens')
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7.5))
+        for ax, (p, p_mean, o, dim, title) in zip(axes, [
+            (pred.isel(ens=slice(E_plot)), pred_mean, obs, space, 'SSTA Field'),
+            (nino4_pred.isel(ens=slice(E_plot)), nino4_pred_mean, nino4_obs, ('time',), 'Nino4'),
+        ]):
+            info, ne = self._info_noise_vals(p, o, dim)
+            info_mean, ne_mean = self._info_noise_vals(p_mean, o, dim)
+            sdav_da = self.xr_sdav(o, dim)
+            sdav = np.nanmean(sdav_da.mean('time', skipna=True).values if 'time' in sdav_da.dims else sdav_da.values)
+            rmax = np.nanmax([sdav, np.nanmax(info), np.nanmax(ne),
+                              np.nanmax(info_mean), np.nanmax(ne_mean)]) * 1.1
+            self._draw_info_noise_bg(ax, sdav, rmax)
+            for i in range(E_plot):
+                colors = plt.colormaps[cmaps[i]](np.linspace(0.8, 0.3, len(lags)))
+                ax.plot(ne[:, i], info[:, i], '-', color='0.4', lw=0.8, zorder=2)
+                for x, y, lg, c in zip(ne[:, i], info[:, i], lags, colors):
+                    ax.scatter(x, y, color=c, s=45, zorder=4, edgecolor='k', lw=0.4)
+                    ax.annotate(f'{lg}', (x, y), textcoords='offset points', xytext=(5, 4), fontsize=7)
+            mean_colors = plt.colormaps['viridis'](np.linspace(0, 1, len(lags)))
+            ax.plot(ne_mean, info_mean, '-', color='0.4', lw=0.8, zorder=2)
+            for x, y, lg, c in zip(ne_mean, info_mean, lags, mean_colors):
+                ax.scatter(x, y, color=c, s=60, zorder=5, edgecolor='k', lw=0.6, marker='D')
+                ax.annotate(f'{lg}', (x, y), textcoords='offset points', xytext=(5, 4), fontsize=7)
+            handles = [
+                Line2D([0], [0], marker='o', color='w',
+                       markerfacecolor=plt.colormaps[cmaps[i]](0.6), markersize=8, label=f'Member {i + 1}')
+                for i in range(E_plot)
+            ]
+            handles.append(Line2D([0], [0], marker='D', color='w',
+                                  markerfacecolor=plt.colormaps['viridis'](0.5),
+                                  markersize=9, label='Ensemble Mean'))
+            ax.legend(handles=handles, loc='upper right', fontsize=8)
+            ax.set_title(title)
         plt.tight_layout()
         plt.savefig(self.model_dir / "info_noise.png")
         plt.close()
