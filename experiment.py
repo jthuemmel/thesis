@@ -201,9 +201,7 @@ class Experiment(DistributedTrainer):
         return scheduler
 
     def create_model(self) -> torch.nn.Module:
-        if self.world.kwargs.get('ensemble', True):
-            return EinMask_ENS(network=self.model_cfg, world=self.world)
-        return EinMask(network=self.model_cfg, world=self.world)
+        return EinMask_ENS(network=self.model_cfg, world=self.world)
 
     @property
     def land_sea_mask(self) -> torch.BoolTensor:
@@ -350,15 +348,25 @@ class Experiment(DistributedTrainer):
         if self.use_ens:
             # samples: (B, V, T, H, W, E)
             samples = samples * self.land_sea_mask[..., None]
-            loss = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps
-                                 ).mul(self.per_variable_weights)[mask].mean()
+            crps = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps)
+            loss = crps.mul(self.per_variable_weights)[mask].mean()
+
+            # maybe spectral loss
+            spectral_weight = self.cfg.loss_kwargs.get('spectral_weight', 0.)
+            if spectral_weight > 0.:
+                with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
+                    e_fft = torch.fft.rfftn(samples.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
+                    o_fft = torch.fft.rfftn(batch.float(), dim = (-1, -2, -3))
+                spectral_crps = f_kernel_crps(o_fft, e_fft, self.use_fair_crps).mean()
+                loss = loss + spectral_crps * spectral_weight
+
             metrics = {'loss' : loss.item(), **self.compute_metrics_torch_ens(samples, batch, mask)}
         else:
-            # samples: (2, B, V, T, H, W) — unpack mu/sigma heads
-            mu, sigma = samples
-            mu = mu * self.land_sea_mask
-            sigma = torch.nn.functional.softplus(sigma)
-            loss = f_gaussian_crps(batch, mu, sigma).mul(self.per_variable_weights)[mask].mean()
+            # samples: (B, V, T, H, W, 2) — unpack mu/sigma heads
+            mu = samples[..., 0] * self.land_sea_mask
+            sigma = torch.nn.functional.softplus(samples[..., 1])
+            crps = f_gaussian_crps(batch, mu, sigma)
+            loss = crps.mul(self.per_variable_weights)[mask].mean()
             metrics = {'loss' : loss.item(), **self.compute_metrics_torch_mve(mu, sigma, batch, mask)}
             samples = torch.stack([mu, sigma])
 
@@ -383,10 +391,9 @@ class Experiment(DistributedTrainer):
             loss = f_kernel_crps(observation=batch, ensemble=samples, fair=self.use_fair_crps)[mask].mean()
             step_metrics = self.compute_metrics_torch_ens(samples, batch, mask)
         else:
-            # samples: (2, B, V, T, H, W) — unpack mu/sigma heads
-            mu, sigma = samples
-            mu = mu * self.land_sea_mask
-            sigma = torch.nn.functional.softplus(sigma)
+            # samples: (B, V, T, H, W, 2) — unpack mu/sigma heads
+            mu = samples[..., 0] * self.land_sea_mask
+            sigma = torch.nn.functional.softplus(samples[..., 1])
             loss = f_gaussian_crps(batch, mu, sigma)[mask].mean()
             step_metrics = self.compute_metrics_torch_mve(mu, sigma, batch, mask)
             samples = torch.stack([mu, sigma])
@@ -628,7 +635,7 @@ class Experiment(DistributedTrainer):
         th = np.linspace(0, np.pi / 2, 200)
         for acc in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]:
             a = np.arccos(acc)
-            ax.plot([0, rmax * np.sin(a)], [0, rmax * np.cos(a)], ':', color="skyblue", lw=0.6, zorder=0)
+            ax.plot([0, rmax * np.sin(a)], [0, rmax * np.cos(a)], ':', color="skyblue", lw=1.5 if acc == 0.5 else 0.6, zorder=0)
             ax.text(rmax * np.sin(a), rmax * np.cos(a), f"{acc:g}", fontsize=7, color="dimgray")
         for r in np.linspace(rmax / 6, rmax, 6):
             ax.plot(r * np.sin(th), r * np.cos(th), ':', color="lightgray", lw=0.5, zorder=0)
