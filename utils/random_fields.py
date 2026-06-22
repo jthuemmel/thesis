@@ -135,7 +135,7 @@ class RandomField(torch.nn.Module):
         self.projection = torch.nn.Sequential(
             EinMix(
                 pattern = f'... c t h w -> ... ({world.token_pattern}) d',
-                weight_shape = 'v c d',
+                weight_shape = 'd v c',
                 c = c, d = dim, **world.token_sizes,
             ),
             torch.nn.RMSNorm(dim)
