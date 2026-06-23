@@ -2,6 +2,7 @@ import torch
 import os
 import argparse
 import math
+import warnings
 import einops
 
 import matplotlib.pyplot as plt
@@ -21,6 +22,10 @@ from utils.trainer import *
 from utils.einmask import *
 from utils.masking import *
 from utils.loss_fn import *
+
+warnings.filterwarnings('ignore', message='Mean of empty slice', category=RuntimeWarning)
+warnings.filterwarnings('ignore', message='All-NaN slice encountered', category=RuntimeWarning)
+warnings.filterwarnings('ignore', message='Degrees of freedom <= 0 for slice', category=RuntimeWarning)
 
 ### HELPER FUNCTIONS
 def exists(val):
@@ -241,31 +246,25 @@ class Experiment(DistributedTrainer):
             torch.empty((1,), device = self.device), 
             mean = mean, std = std, a = a, b = b, generator = self.generator
             ).mul(self.world.num_tokens).long()
+    
+    def sample_noise(self, K: int, num_samples: int):
+        block_weight = self.objective.kwargs.get('block_weight', None)
+        if exists(block_weight):
+            d = torch.arange(1, K + 1, device = self.device)
+            d = d[K % d == 0]
+            idx = torch.multinomial(1 / d.pow(block_weight), 1, generator= self.generator)
+            KK = d[idx]
+            U = torch.rand((num_samples, K // KK), device= self.device, generator= self.generator)
+            U = einops.repeat(U, f'... k -> ... (k kk)', kk = KK, k = K // KK)
+        else:
+            U = torch.rand((num_samples, K), device=self.device, generator=self.generator)
+        return U
 
     def sample_weighted_reservoir(self, num_samples: int):
         P = torch.rand((num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
         for dim, alpha in self.objective.event_cfg.items():
             if not (exists(alpha) and dim in self.world.layout): continue
-            U = torch.rand((num_samples, self.world.token_sizes[dim]), device=self.device, generator=self.generator)
-            U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
-            P += U.log().div(alpha)
-        return P
-    
-    def sample_block_noise(self, K: int, num_samples: int):
-        block_weight = self.objective.kwargs.get('block_weight', 1.)
-        d = torch.arange(1, K + 1, device = self.device)
-        d = d[K % d == 0]
-        idx = torch.multinomial(1 / d.pow(block_weight), 1, generator= self.generator)
-        KK = d[idx]
-        U = torch.rand((num_samples, K // KK), device= self.device, generator= self.generator)
-        U = einops.repeat(U, f'... k -> ... (k kk)', kk = KK, k = K // KK)
-        return U
-    
-    def sample_weighted_reservoir_blocks(self, num_samples: int):
-        P = torch.rand((num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
-        for dim, alpha in self.objective.event_cfg.items():
-            if not (exists(alpha) and dim in self.world.layout): continue
-            U = self.sample_block_noise(self.world.token_sizes[dim], num_samples)
+            U = self.sample_noise(self.world.token_sizes[dim], num_samples)
             U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
             P += U.log().div(alpha)
         return P
@@ -274,7 +273,7 @@ class Experiment(DistributedTrainer):
         P1, P2 = torch.rand((2, num_samples, self.world.num_tokens), device=self.device, generator=self.generator).log()
         for dim, alpha in self.objective.event_cfg.items():
             if not (exists(alpha) and dim in self.world.layout): continue
-            U = torch.rand((num_samples, self.world.token_sizes[dim]), device=self.device, generator=self.generator)
+            U = self.sample_noise(self.world.token_sizes[dim], num_samples)
             U = einops.repeat(U, f'b {dim} -> b ({self.world.token_pattern})', **self.world.token_sizes)
             P1 += U.log().div(alpha)
             P2 += (1 - U).log().div(alpha)
@@ -292,9 +291,6 @@ class Experiment(DistributedTrainer):
         elif reservoir_mode == 'independent':
             src_weights = self.sample_weighted_reservoir(num_samples)
             tgt_weights = self.sample_weighted_reservoir(num_samples)
-        elif reservoir_mode == 'blocks':
-            src_weights = self.sample_weighted_reservoir_blocks(num_samples)
-            tgt_weights = src_weights
         else:  # shared
             src_weights = self.sample_weighted_reservoir(num_samples)
             tgt_weights = src_weights
@@ -437,12 +433,12 @@ class Experiment(DistributedTrainer):
         if self.use_ens:
             self.get_nino_metrics_ens(ds)
             self.get_field_metrics_ens(ds)
-            if self.is_root:
+            if self.is_root and self.is_best_epoch():
                 self.make_eval_plots_ens(ds)
         else:
             self.get_nino_metrics_mve(ds)
             self.get_field_metrics_mve(ds)
-            if self.is_root:
+            if self.is_root and self.is_best_epoch():
                 self.make_eval_plots_mve(ds)
 
         if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
@@ -454,7 +450,7 @@ class Experiment(DistributedTrainer):
         pred = ds['temp_ocn_0a_pred'].where(valid).isel(step=slice(history, None))
         obs = ds['temp_ocn_0a_obs'].where(valid).isel(step=slice(history, None))
         pred_mean = pred.mean('ens', skipna=True)
-        self.plot_sample_ens(pred, obs, 20)
+        self.plot_sample_ens(pred, obs, 19)
         self.plot_rank_hist(pred, obs, [1, 7, 13, 19])
         self.plot_skill(pred_mean, obs)
         self.plot_monthly_init(pred, obs)
@@ -466,7 +462,7 @@ class Experiment(DistributedTrainer):
         mu = ds['temp_ocn_0a_pred_mu'].where(valid).isel(step=slice(history, None))
         sigma = ds['temp_ocn_0a_pred_sigma'].where(valid).isel(step=slice(history, None))
         obs = ds['temp_ocn_0a_obs'].where(valid).isel(step=slice(history, None))
-        self.plot_sample_mve(mu, sigma, 20)
+        self.plot_sample_mve(mu, sigma, 19)
         self.plot_skill(mu, obs)
         self.plot_monthly_init(mu, obs, sigma=sigma)
         self.plot_info_noise_mve(mu, obs)
@@ -526,7 +522,6 @@ class Experiment(DistributedTrainer):
 
     def plot_monthly_init(self, pred: xr.DataArray, obs: xr.DataArray, sigma: xr.DataArray = None):
         space = ('lat', 'lon')
-        mu = pred.mean('ens', skipna=True) if self.use_ens else pred
         n_steps = obs.sizes['step']
         step_ax = obs['step'].values - obs['step'].values[0] + 1
         nino4_pred = self.get_nino4(pred)
@@ -635,7 +630,7 @@ class Experiment(DistributedTrainer):
         th = np.linspace(0, np.pi / 2, 200)
         for acc in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]:
             a = np.arccos(acc)
-            ax.plot([0, rmax * np.sin(a)], [0, rmax * np.cos(a)], ':', color="skyblue", lw=1.5 if acc == 0.5 else 0.6, zorder=0)
+            ax.plot([0, rmax * np.sin(a)], [0, rmax * np.cos(a)], ':', color="skyblue", lw=2.5 if acc == 0.5 else 0.6, zorder=0)
             ax.text(rmax * np.sin(a), rmax * np.cos(a), f"{acc:g}", fontsize=7, color="dimgray")
         for r in np.linspace(rmax / 6, rmax, 6):
             ax.plot(r * np.sin(th), r * np.cos(th), ':', color="lightgray", lw=0.5, zorder=0)
