@@ -16,46 +16,50 @@ class EinMask_ENS(torch.nn.Module):
 
         # default output dimension
         DO = default(network.dim_out, network.dim)
+        DN = default(network.dim_noise, network.dim)
         
         # learnable parameters
         self.latent_tokens = torch.nn.Parameter(torch.nn.init.trunc_normal_(torch.zeros(network.num_latents, network.dim), std = network.dim ** -0.5))
-        self.position_codes = torch.nn.Parameter(init_sincos_positions(network.dim, shape = world.token_shape))
+        self.src_positions = torch.nn.Parameter(init_sincos_positions(network.dim, shape = world.token_shape))
+        self.tgt_positions = torch.nn.Parameter(init_sincos_positions(DO, shape = world.token_shape))
         
-        # noise generator
-        self.random_field = RandomField(network, world) if default(world.ens_size, 1) > 1 else None
+        # maybe noise generator
+        if default(world.ens_size, 1) > 1:
+            self.random_field = RandomField(network, world)
+            self.noise_to_encoder = torch.nn.Sequential(torch.nn.Linear(DN, network.dim, bias = False), torch.nn.RMSNorm(network.dim))
+            self.noise_to_decoder = torch.nn.Sequential(torch.nn.Linear(DN, DO, bias = False), torch.nn.RMSNorm(DO))
+        else:
+            self.random_field = None
+            self.noise_to_decoder = torch.nn.Identity()
+            self.noise_to_encoder = torch.nn.Identity()
 
         # I/O
-        self.to_tokens = torch.nn.Sequential(
+        self.fields_to_tokens = torch.nn.Sequential(
             EinMix(f'b {world.field_pattern} -> b ({world.token_pattern}) c',
                 weight_shape = f'v {world.patch_pattern} c', 
                 c = network.dim, **world.token_sizes, **world.patch_sizes),
             torch.nn.RMSNorm(network.dim)
         )
 
-        self.to_fields = EinMix(f'b ({world.token_pattern}) d -> (b k) {world.field_pattern}',
+        self.tokens_to_fields = EinMix(f'b ({world.token_pattern}) d -> (b k) {world.field_pattern}',
                                 weight_shape = f'k v {world.patch_pattern} d', 
                                 d = DO, k = default(network.num_tails, 1), **world.patch_sizes, **world.token_sizes)
 
-        self.to_queries = torch.nn.Sequential(
-            torch.nn.Linear(network.dim, DO, bias = False),
-            torch.nn.RMSNorm(DO)
-        )
-
-        self.smoothing = GaussianSmoothing3D(world.field_shape[0], kernel_size= 5, sigma= 1.) if network.kwargs.get('smoothing', False) else torch.nn.Identity()
+        self.smoothing = GaussianSmoothing3D(world.field_shape[0], kernel_size= 5, sigma= 1., padding_mode= 'zeros')
         
-        # Encoder / Predictor / Decoder
+        # encoder / decoder
         self.encoder = torch.nn.ModuleList([
                 TransformerBlock(dim= network.dim, num_heads= network.num_encoder_heads, drop_path= network.drop_path) 
                 for _ in range(default(network.num_read_blocks, 1))
                 ])
         
-        self.predictor = TransformerBlock(dim= DO, num_heads= network.num_decoder_heads, dim_kv= network.dim)
-
         self.decoder = torch.nn.ModuleList([
                 TransformerBlock(dim= DO, num_heads= network.num_decoder_heads) 
-                for _ in range(default(network.num_write_blocks, 0))
+                for _ in range(default(network.num_write_blocks, 1))
                 ])
         
+        self.latent_to_decoder = torch.nn.Sequential(torch.nn.Linear(network.dim, DO, bias = False), torch.nn.RMSNorm(DO))
+
         # weight initialization
         self.apply(self.base_init)
         
@@ -71,41 +75,46 @@ class EinMask_ENS(torch.nn.Module):
         # ensemble expansion
         fields = einops.repeat(fields, 'b ... -> (b e) ...', b = B, e = E)
         visible = einops.repeat(visible, 'b ... -> (b e) ...', b = B, e = E)
-        coo = einops.repeat(self.position_codes, '... -> (b e) ...', b = B, e = E)
+        
+        # tokenize and add position codes
+        tokens = self.fields_to_tokens(fields) + self.src_positions
 
         # maybe sample random noise
-        xi = self.random_field(coo, rng) if exists(self.random_field) else 0.
+        noise = self.random_field(tokens, rng) if exists(self.random_field) else tokens.new_zeros((B * E, 1, 1))
 
-        # create queries 
-        queries = self.to_queries(coo + xi)
+        # add noise embedding and select visible
+        tokens = tokens + self.noise_to_encoder(noise)
+        src = einops.rearrange(tokens[visible], '(b m) ... -> b m ...', b = fields.size(0))
 
-        # tokenize and select visible
-        obs = self.to_tokens(fields) + coo + xi
-        obs = einops.rearrange(obs[visible], '(b m) ... -> b m ...', b = fields.size(0))
-        
         # pad with latent tokens
-        src = einops.repeat(self.latent_tokens, 'z d -> b z d', b = fields.size(0))
-        src, ps = einops.pack([obs, src], 'b * d')
+        latents = einops.repeat(self.latent_tokens, '... -> (b e) ...', b = B, e = E)
+        latents, ps = einops.pack([src, latents], 'b * d')
 
         # self-attention encoder
         for read in self.encoder:
-            src = read(src)
+            latents = read(latents)
 
-        # optional bottleneck
+        # maybe bottleneck
         if self.network.kwargs.get('bottleneck', False):
-            _, src = einops.unpack(src, ps, 'b * d')
+            _, latents = einops.unpack(latents, ps, 'b * d')
 
-        # cross-attention predictor
-        pred = self.predictor(queries, src)
+        # project to decoder dim
+        latents = self.latent_to_decoder(latents)
+        queries = self.noise_to_decoder(noise) + self.tgt_positions
 
-        # self-attention decoder for refinement
+        # flamingo decoder
         for write in self.decoder:
-            pred = write(pred)
+            queries = write(queries, torch.cat([queries, latents], dim = 1))
 
         # prediction head
-        pred = self.to_fields(pred)
-        pred = self.smoothing(pred)
-        return einops.rearrange(pred, '(b e) ... -> b ... e', b = B)
+        queries = self.tokens_to_fields(queries)
+
+        #maybe smoothing
+        if self.network.kwargs.get('smoothing', False):
+            queries = self.smoothing(queries)
+        
+        # reshape to ensemble last
+        return einops.rearrange(queries, '(b e) ... -> b ... e', b = B)
 
 class EinMask(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):

@@ -132,6 +132,7 @@ class GaussianSmoothing3D(torch.nn.Module):
         channels: int,
         kernel_size: int = 3,
         sigma: float = 0.7,
+        padding_mode: str = 'replicate'
     ):
         super().__init__()
         # gaussian kernels
@@ -146,7 +147,7 @@ class GaussianSmoothing3D(torch.nn.Module):
 
         # dw conv3d
         self.conv = torch.nn.Conv3d(channels, channels, kernel_size=kernel_size, 
-                                    padding= 'same', groups= channels, bias = False, padding_mode = 'replicate')
+                                    padding= 'same', groups= channels, bias = False, padding_mode = padding_mode)
         self.conv.weight = torch.nn.Parameter(w.expand_as(self.conv.weight).clone(), requires_grad = False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
