@@ -108,7 +108,13 @@ class Experiment(DistributedTrainer):
     def create_dataset(self) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
         # instantiate datasets
         self.train_dataset = self.lens_data()
-        self.val_dataset = self.picontrol_data()
+        
+        if self.data_cfg.eval_data == 'piControl':
+            self.val_dataset = self.picontrol_data()
+        elif self.data_cfg.eval_data == 'godas':
+            self.val_dataset = self.godas_data()
+        elif self.data_cfg.eval_data == 'oras5':
+            self.val_dataset = self.oras5_data()
 
         # create land-sea masks
         val_lsm = torch.logical_not(self.val_dataset.land_sea_mask.to(device=self.device, dtype=torch.bool))
@@ -349,7 +355,7 @@ class Experiment(DistributedTrainer):
 
             # maybe spectral loss
             spectral_weight = self.cfg.loss_kwargs.get('spectral_weight', 0.)
-            if spectral_weight > 0.:
+            if default(spectral_weight, 0.) > 0.:
                 with torch.amp.autocast(enabled = True, device_type = self.device.type, dtype = torch.float32):
                     e_fft = torch.fft.rfftn(samples.float(), dim = (-2, -3, -4)) #[B, V, ft, fh, fw, E]
                     o_fft = torch.fft.rfftn(batch.float(), dim = (-1, -2, -3))
@@ -366,7 +372,7 @@ class Experiment(DistributedTrainer):
             metrics = {'loss' : loss.item(), **self.compute_metrics_torch_mve(mu, sigma, batch, mask)}
             samples = torch.stack([mu, sigma])
 
-        self.log_metrics(metrics)
+        self.log_metrics(metrics, task = None)
         self.step_counter = self.step_counter + 1 if self.mode == 'train' else self.step_counter
         return loss, samples, visible
 
@@ -394,11 +400,16 @@ class Experiment(DistributedTrainer):
             step_metrics = self.compute_metrics_torch_mve(mu, sigma, batch, mask)
             samples = torch.stack([mu, sigma])
 
-        metrics = {'frcst_loss' : loss.item(), **{f'frcst_{k}' : v for k, v in step_metrics.items()}}
-        self.log_metrics(metrics)
+        metrics = {'loss' : loss.item(), **step_metrics}
+        self.log_metrics(metrics, task = 'frcst')
         return loss, samples, visible
 
     #EVAL
+    # def post_training(self):
+    #     _ = self.load_pretrained(self.best_path)
+    #     self.evaluate_epoch()
+    #     super().post_training()
+    
     def evaluate_epoch(self):
         super().evaluate_epoch()
         self.evaluate_step('frcst')
@@ -433,15 +444,15 @@ class Experiment(DistributedTrainer):
         if self.use_ens:
             self.get_nino_metrics_ens(ds)
             self.get_field_metrics_ens(ds)
-            if self.is_root and self.is_best_epoch():
+            if self.is_root:
                 self.make_eval_plots_ens(ds)
         else:
             self.get_nino_metrics_mve(ds)
             self.get_field_metrics_mve(ds)
-            if self.is_root and self.is_best_epoch():
+            if self.is_root:
                 self.make_eval_plots_mve(ds)
 
-        if self.is_root and self.current_epoch == self.total_epochs and self.cfg.save_eval:
+        if self.is_root and self.current_epoch == self.total_epochs + 1 and self.cfg.save_eval:
             self.write_to_disk(ds)
 
     def make_eval_plots_ens(self, ds: xr.Dataset):
