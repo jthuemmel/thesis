@@ -9,6 +9,8 @@
 /scripts/
 /scratch/
 /ai/
+/refs/
+.DS_Store
 *.npz
 *.npy
 *.pth
