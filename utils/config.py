@@ -123,6 +123,8 @@ class DatasetConfig:
 class ObjectiveConfig:
     rate_cfg: dict = field(default_factory=lambda: {})
     event_cfg: dict = field(default_factory=lambda: {})
+    kwargs: dict = field(default_factory=lambda: {})
+    epsilon: float = 1e-5
     
 @dataclass
 class WorldConfig:
@@ -135,22 +137,22 @@ class WorldConfig:
     kwargs: Optional[dict] = field(default_factory=lambda: {})
 
     # derived fields
-    layout: tuple = field(init=False)
-    token_sizes: dict = field(init=False)
-    kernel_sizes: dict = field(init=False)
+    layout: tuple = field(default_factory=lambda: ())
+    token_sizes: dict = field(default_factory=lambda: {})
+    kernel_sizes: dict = field(default_factory=lambda: {})
 
-    token_shape: tuple = field(init=False)
-    field_shape: tuple = field(init=False)
-    patch_shape: tuple = field(init=False)
+    token_shape: tuple = field(default_factory=lambda: ())
+    field_shape: tuple = field(default_factory=lambda: ())
+    patch_shape: tuple = field(default_factory=lambda: ())
     
-    num_tokens: int = field(init=False)
-    num_elements: int = field(init=False)
-    dim_tokens: int = field(init=False)
+    num_tokens: int = field(default_factory=lambda: -1)
+    num_elements: int = field(default_factory=lambda: -1)
+    dim_tokens: int = field(default_factory=lambda: -1)
 
-    field_pattern: str = field(init=False)
-    token_pattern: str = field(init=False)
-    patch_pattern: str = field(init=False)
-    flat_pattern: str = field(init=False)
+    field_pattern: str = field(default_factory=lambda: '')
+    token_pattern: str = field(default_factory=lambda: '')
+    patch_pattern: str = field(default_factory=lambda: '')
+    flat_pattern: str = field(default_factory=lambda: '')
 
     def __post_init__(self):
         self.layout = tuple(self.field_sizes.keys())
@@ -222,12 +224,45 @@ class TrainerConfig:
     
     
 @dataclass
+class EvaluationConfig:
+    # Dispatch
+    test_every: Optional[int] = None # dispatch the test battery every n training steps
+    test_data: Optional[List[str]] = None # datasets for the test battery, e.g. [godas, picontrol]
+    save_weights: bool = True # weights-only checkpoint at each test dispatch
+
+    # Pieces
+    variables: Optional[List[str]] = None # variables to score, None discovers from the eval dataset
+    full_variables: List[str] = field(default_factory=lambda: ['temp_ocn_0a']) # variables receiving the full piece set
+    num_members: int = 4 # members kept for the per-member info/noise sums
+    num_bands: int = 12 # zonal wavenumber bands
+    num_leads: int = 4 # lead bands on the monthly maps
+    pit_bins: int = 20
+    rel_bins: int = 30 # σ bins for the spread-reliability sums
+
+    # Regions
+    index_variable: str = 'temp_ocn_0a' # variable behind the index series
+    index_regions: List[str] = field(default_factory=lambda: ['nino34', 'nino4'])
+    column_regions: List[str] = field(default_factory=lambda: ['wwv', 'wwv_w', 'wwv_e'])
+    column_variables: List[str] = field(default_factory=lambda: ['temp_ocn_5a', 'temp_ocn_8a', 'temp_ocn_11a', 'temp_ocn_14a'])
+    regions: dict = field(default_factory=lambda: {
+        'nino34' : {'lon' : (190, 240), 'lat' : (-5, 5)},
+        'nino4' :  {'lon' : (160, 210), 'lat' : (-5, 5)},
+        'wwv' :    {'lon' : (120, 280), 'lat' : (-5, 5)},
+        'wwv_w' :  {'lon' : (120, 205), 'lat' : (-5, 5)},
+        'wwv_e' :  {'lon' : (205, 280), 'lat' : (-5, 5)},
+    })
+
+    kwargs: dict = field(default_factory=lambda: {})
+
+
+@dataclass
 class MTMConfig:
     trainer: TrainerConfig
     data: DatasetConfig
     model: NetworkConfig
     world: WorldConfig
     objective: ObjectiveConfig
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     @classmethod
     def from_omegaconf(cls, cfg: dict | OmegaConf):
@@ -240,7 +275,8 @@ class MTMConfig:
         return cls(
             trainer=TrainerConfig(**cfg.trainer),
             data=DatasetConfig(**cfg.data),
-            model =  NetworkConfig(**cfg.model),
+            model=NetworkConfig(**cfg.model),
             world=WorldConfig(**cfg.world),
             objective=ObjectiveConfig(**cfg.objective),
+            evaluation=EvaluationConfig(**cfg.get('evaluation', {})),
         )

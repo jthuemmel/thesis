@@ -113,6 +113,7 @@ class SphericalDiffusionNoise(torch.nn.Module):
 class RandomField(torch.nn.Module):
     def __init__(self, network: NetworkConfig, world: WorldConfig):
         super().__init__()
+        dim = default(network.dim_noise, network.dim)
         horizontal = torch.tensor(default(network.grf_horizontal, [512]), dtype = torch.float32)
         temporal = torch.tensor(default(network.grf_temporal, [1]), dtype = torch.float32)
         channels = int(default(network.grf_channels, 1))
@@ -133,13 +134,13 @@ class RandomField(torch.nn.Module):
 
         self.projection = torch.nn.Sequential(
             EinMix(
-                pattern = f'... c t h w -> ... {world.flat_token_pattern} d',
-                weight_shape = 'v c d',
-                c = c, d = network.dim, **world.token_sizes,
+                pattern = f'... c t h w -> ... ({world.token_pattern}) d',
+                weight_shape = 'd v c',
+                c = c, d = dim, **world.token_sizes,
             ),
-            torch.nn.LayerNorm(network.dim)
+            torch.nn.RMSNorm(dim)
         )
         
-    def forward(self, shape: tuple, rng: torch.Generator = None):
-        grf = self.noise_generator(shape, rng)
+    def forward(self, src: torch.Tensor, rng: torch.Generator = None):
+        grf = self.noise_generator((src.size(0),), rng).to(src.dtype) # only batch dim rest is by config
         return self.projection(grf)

@@ -16,6 +16,25 @@ def count_parameters(model):
 def get_weight_std(weight: torch.Tensor, dim: int = -1):
     return 1 / weight.size(dim)**0.5
 
+def init_sincos_positions(dim: int, shape: tuple):
+    # wavelengths by dimension
+    wavelengths = torch.as_tensor(shape)
+    # integer indices
+    coordinates = torch.stack(torch.unravel_index(indices = torch.arange(wavelengths.prod()), shape = shape), dim = -1)
+    # only encode shape dimensions with actual size
+    valid = wavelengths > 1
+    log_wavelengths = wavelengths[valid].log()
+    coordinates = coordinates[:, valid]
+    # space the frequencies according to the required number of bands
+    negative_spacing = torch.linspace(0, -1, dim // (coordinates.size(-1) * 2))
+    # calculate the sin/cos embeddings:
+    frequencies = torch.exp(negative_spacing * log_wavelengths[..., None])
+    angles = torch.einsum("n i, i d -> n i d", coordinates, frequencies) # overflows fp16, be careful
+    positions = einops.rearrange([angles.sin(), angles.cos()], 'two n i d -> n (two i d)')
+    # avoid uneven dimensions by zero-padding
+    positions = torch.nn.functional.pad(positions, (0, dim - positions.size(-1))) 
+    return positions
+
 class DropPath(torch.nn.Module):
     def __init__(self, drop_prob: float = 0.):
         super().__init__()
@@ -113,6 +132,7 @@ class GaussianSmoothing3D(torch.nn.Module):
         channels: int,
         kernel_size: int = 3,
         sigma: float = 0.7,
+        padding_mode: str = 'replicate'
     ):
         super().__init__()
         # gaussian kernels
@@ -127,7 +147,7 @@ class GaussianSmoothing3D(torch.nn.Module):
 
         # dw conv3d
         self.conv = torch.nn.Conv3d(channels, channels, kernel_size=kernel_size, 
-                                    padding= 'same', groups= channels, bias = False, padding_mode = 'replicate')
+                                    padding= 'same', groups= channels, bias = False, padding_mode = padding_mode)
         self.conv.weight = torch.nn.Parameter(w.expand_as(self.conv.weight).clone(), requires_grad = False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

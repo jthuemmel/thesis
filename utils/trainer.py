@@ -77,6 +77,12 @@ class TrainerInterface:
         """
         pass
 
+    def post_batch(self):
+        """
+        Called after every training batch, e.g. for step-based dispatches.
+        """
+        pass
+
 ### TRAINER CLASS ###
 class DistributedTrainer(TrainerInterface): 
 
@@ -374,7 +380,8 @@ class DistributedTrainer(TrainerInterface):
                 self.ema_model.update_parameters(self.model.module)
             #scheduler step
             if self.cfg.scheduler_step == "batch" and exists(self.scheduler):
-                self.scheduler.step()                
+                self.scheduler.step()
+            self.post_batch()
 
         if self.cfg.scheduler_step == "epoch" and exists(self.scheduler):
             self.scheduler.step()
